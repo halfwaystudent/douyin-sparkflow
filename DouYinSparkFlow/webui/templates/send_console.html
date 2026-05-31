@@ -374,14 +374,14 @@
               <thead>
                 <tr>
                   <th>目标</th>
-                  <th>scheduledAt</th>
+                  <th>计划/提示</th>
                 </tr>
               </thead>
               <tbody>
                 {% for item in account.unprocessed_targets[:5] %}
                 <tr>
                   <td>{{ item.target }}</td>
-                  <td>{{ item.scheduledAt or "-" }}</td>
+                  <td>{{ item.scheduleNote or item.scheduledAt or "-" }}</td>
                 </tr>
                 {% else %}
                 <tr>
@@ -409,14 +409,14 @@
                 <thead>
                   <tr>
                     <th>目标</th>
-                    <th>scheduledAt</th>
+                    <th>计划/提示</th>
                   </tr>
                 </thead>
                 <tbody>
                   {% for item in account.unprocessed_targets %}
                   <tr>
                     <td>{{ item.target }}</td>
-                    <td>{{ item.scheduledAt or "-" }}</td>
+                    <td>{{ item.scheduleNote or item.scheduledAt or "-" }}</td>
                   </tr>
                   {% endfor %}
                 </tbody>

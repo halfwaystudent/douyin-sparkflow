@@ -485,6 +485,7 @@ def _account_identity(user):
 
 
 def _scheduled_send_time(user, target_name, send_window, now):
+    """Return the deterministic planned send time for a target on the current day."""
     window_minutes = max(1, (send_window["endHour"] - send_window["startHour"]) * 60)
     start_of_window = now.replace(
         hour=send_window["startHour"],
@@ -496,6 +497,21 @@ def _scheduled_send_time(user, target_name, send_window, now):
     digest = hashlib.sha256(seed.encode("utf-8")).digest()
     offset_minutes = int.from_bytes(digest[:8], "big") % window_minutes
     return start_of_window + timedelta(minutes=offset_minutes)
+
+
+def _window_fallback_deadline(send_window, now):
+    """Return the last automatic retry check time for the current send window."""
+    return now.replace(
+        hour=send_window["endHour"],
+        minute=0,
+        second=0,
+        microsecond=0,
+    ) + timedelta(minutes=send_window["scheduleIntervalMinutes"])
+
+
+def _window_has_finished_for_today(send_window, now):
+    """Return True when both the configured window and fallback check have passed."""
+    return bool(send_window.get("enabled")) and now > _window_fallback_deadline(send_window, now)
 
 
 def _build_target_status(account, target_name, now, send_window):
@@ -515,6 +531,7 @@ def _build_target_status(account, target_name, now, send_window):
             "reason": "",
             "attemptCount": 0,
             "scheduledAt": "",
+            "scheduleNote": "",
         }
 
     failure_entry = failure_queue.get(target_name) or {}
@@ -530,9 +547,11 @@ def _build_target_status(account, target_name, now, send_window):
             "reason": str(failure_entry.get("reason") or ""),
             "attemptCount": int(failure_entry.get("attemptCount") or 0),
             "scheduledAt": "",
+            "scheduleNote": "",
         }
 
     scheduled_at = None
+    schedule_note = ""
     if send_window.get("enabled"):
         scheduled_at = _scheduled_send_time(account, target_name, send_window, now)
         if scheduled_at > now:
@@ -546,7 +565,10 @@ def _build_target_status(account, target_name, now, send_window):
                 "reason": "",
                 "attemptCount": 0,
                 "scheduledAt": scheduled_at.isoformat(timespec="seconds"),
+                "scheduleNote": "",
             }
+        if _window_has_finished_for_today(send_window, now):
+            schedule_note = "今天窗口已结束，明天自动发送或请手动补发"
 
     return {
         "target": target_name,
@@ -558,6 +580,7 @@ def _build_target_status(account, target_name, now, send_window):
         "reason": "",
         "attemptCount": 0,
         "scheduledAt": scheduled_at.isoformat(timespec="seconds") if scheduled_at else "",
+        "scheduleNote": schedule_note,
     }
 
 
