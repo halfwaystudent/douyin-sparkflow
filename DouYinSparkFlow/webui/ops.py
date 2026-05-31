@@ -420,6 +420,27 @@ def update_daily_schedule(time_string):
         return _empty_result(stderr=str(exc))
 
 
+def sync_daily_schedule_from_config():
+    """Ensure the enabled send window config is materialized into the mounted cron file."""
+    window = dict(get_config(force_reload=True).get("dailySendWindow") or {})
+    if not window.get("enabled"):
+        return subprocess.CompletedProcess(args=["sync-daily-schedule"], returncode=0, stdout="disabled", stderr="")
+    if not running_in_container() or not HOST_CRONTAB_PATH.parent.exists():
+        return subprocess.CompletedProcess(args=["sync-daily-schedule"], returncode=0, stdout="skipped", stderr="")
+
+    try:
+        time_string = _format_window_schedule(window)
+        current = HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace") if HOST_CRONTAB_PATH.exists() else ""
+        updated = replace_douyin_cron_schedule(current, time_string)
+        if current == updated:
+            return subprocess.CompletedProcess(args=["sync-daily-schedule"], returncode=0, stdout="unchanged", stderr="")
+        HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+        return subprocess.CompletedProcess(args=["sync-daily-schedule"], returncode=0, stdout="synced", stderr="")
+    except Exception as exc:
+        logger.error("sync_daily_schedule_from_config failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
 def current_daily_schedule():
     config = get_config(force_reload=True)
     window = dict(config.get("dailySendWindow") or {})
