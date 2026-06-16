@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import urllib.error
@@ -47,6 +48,7 @@ from webui.ops import (
     restart_proxy,
     run_task_now,
     run_unsent_retry_now,
+    sync_daily_schedule_from_config,
     update_daily_schedule,
 )
 
@@ -196,7 +198,16 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
 
 def create_app():
     settings = get_app_settings()
-    app = FastAPI(title="DouYin Spark Flow Admin")
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        """Synchronize configured startup state during the Web UI lifespan."""
+        result = sync_daily_schedule_from_config()
+        if getattr(result, "returncode", 1) != 0:
+            logger.warning("schedule startup sync failed: %s", getattr(result, "stderr", ""))
+        yield
+
+    app = FastAPI(title="DouYin Spark Flow Admin", lifespan=lifespan)
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings["session_secret"],
