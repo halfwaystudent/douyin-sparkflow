@@ -1,8 +1,64 @@
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+
+LEGACY_DOCKER_COMMAND_MARKERS = (
+    "docker ps --format",
+    "docker exec",
+)
+
+
+def migrate_legacy_line(line):
+    """Replace old Docker-in-Docker task commands with a local task runner."""
+    if not line.strip() or line.lstrip().startswith("#"):
+        return line
+    if not all(marker in line for marker in LEGACY_DOCKER_COMMAND_MARKERS):
+        return line
+
+    parts = line.split(maxsplit=5)
+    if len(parts) < 6:
+        return line
+
+    schedule = " ".join(parts[:5])
+    command = parts[5]
+    redirect_match = re.search(r"(\s+>>\s+\S+(?:\s+2>&1)?)\s*$", command)
+    redirect = redirect_match.group(1) if redirect_match else ""
+
+    if "SPARKFLOW_MANUAL_UNSENT_ONLY=1" in command:
+        env_prefix = (
+            "SPARKFLOW_TRIGGER_LABEL='unsent fallback' "
+            "SPARKFLOW_MANUAL_RUN=1 "
+            "SPARKFLOW_MANUAL_UNSENT_ONLY=1 "
+            "PYTHONUNBUFFERED=1"
+        )
+    else:
+        env_prefix = "SPARKFLOW_TRIGGER_LABEL='scheduled send'"
+
+    return f"{schedule} env {env_prefix} bash /app/scripts/run_scheduled_task.sh{redirect}"
+
+
+def migrate_legacy_crontab(path):
+    """Rewrite persisted legacy task lines once, preserving other cron entries."""
+    if not path.exists():
+        return False
+
+    raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    lines = raw.splitlines()
+    migrated_lines = [migrate_legacy_line(line) for line in lines]
+    if migrated_lines == lines:
+        return False
+
+    updated = "\n".join(migrated_lines)
+    if updated:
+        updated += "\n"
+    temporary = path.with_name(f".{path.name}.migration.tmp")
+    temporary.write_text(updated, encoding="utf-8")
+    temporary.replace(path)
+    return True
 
 
 def expand_field(field, minimum, maximum, current):
@@ -68,6 +124,8 @@ def read_crontab(path):
 
 def run_loop(crontab_path):
     crontab_path.parent.mkdir(parents=True, exist_ok=True)
+    if migrate_legacy_crontab(crontab_path):
+        print(f"[cron_runner] migrated legacy task commands in {crontab_path}", flush=True)
     last_minute_key = None
     print(f"[cron_runner] watching {crontab_path}", flush=True)
     while True:

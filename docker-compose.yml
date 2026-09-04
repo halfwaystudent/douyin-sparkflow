@@ -22,6 +22,9 @@ services:
       args:
         PLAYWRIGHT_BASE_IMAGE: ${PLAYWRIGHT_BASE_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/mcr.microsoft.com/playwright/python:v1.56.0-jammy}
         NODE_RUNTIME_IMAGE: ${NODE_RUNTIME_IMAGE:-node:22-bookworm-slim}
+        HTTP_PROXY: ${HTTP_PROXY_BUILD:-}
+        HTTPS_PROXY: ${HTTPS_PROXY_BUILD:-}
+        ALL_PROXY: ${ALL_PROXY_BUILD:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
     image: douyin-sparkflow:local
@@ -38,6 +41,7 @@ services:
       SPARKFLOW_LOGIN_DESKTOP_NOVNC_URL: http://login-desktop:6080
       SPARKFLOW_LOGIN_DESKTOP_NOVNC_WS_URL: ws://login-desktop:6080/websockify
       SPARKFLOW_SESSION_COOKIE_SECURE: ${SPARKFLOW_SESSION_COOKIE_SECURE:-0}
+      DOCKER_API_VERSION: ${DOCKER_API_VERSION:-}
     ports:
       - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-8787}:8787"
     command: python main.py --web --host 0.0.0.0 --port 8787
@@ -64,7 +68,7 @@ services:
       LOGIN_DESKTOP_STOP_AFTER_EXPORT_SECONDS: ${LOGIN_DESKTOP_STOP_AFTER_EXPORT_SECONDS:-60}
       LOGIN_DESKTOP_STATUS_CACHE_SECONDS: ${LOGIN_DESKTOP_STATUS_CACHE_SECONDS:-15}
 
-      LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-direct}
+      LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-auto}
       LOGIN_DESKTOP_PROXY: ${LOGIN_DESKTOP_PROXY:-http://proxy:7890}
       LOGIN_DESKTOP_PREFLIGHT_TIMEOUT_SECONDS: ${LOGIN_DESKTOP_PREFLIGHT_TIMEOUT_SECONDS:-15}
       LOGIN_DESKTOP_NETWORK_CACHE_SECONDS: ${LOGIN_DESKTOP_NETWORK_CACHE_SECONDS:-30}
@@ -85,7 +89,7 @@ services:
     container_name: douyin-scheduler
     restart: unless-stopped
     depends_on:
-      - web
+      - proxy
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       PYTHONUNBUFFERED: "1"
@@ -95,7 +99,6 @@ services:
       - ./DouYinSparkFlow/logs:/app/logs
       - ./state/cron:/host-spool-cron
       - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
-      - /var/run/docker.sock:/var/run/docker.sock
 
   task:
     image: douyin-sparkflow:local

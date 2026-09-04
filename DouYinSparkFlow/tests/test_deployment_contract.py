@@ -33,6 +33,18 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertTrue((SOURCE_ROOT / "config.example.json").is_file())
         self.assertIn("config.json", (SOURCE_ROOT / ".gitignore").read_text(encoding="utf-8"))
 
+    def test_scheduler_uses_local_task_runner_and_migrates_legacy_commands(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        runner_path = SOURCE_ROOT / "scripts" / "run_scheduled_task.sh"
+        runner = runner_path.read_text(encoding="utf-8")
+        cron_runner = (SOURCE_ROOT / "scripts" / "cron_runner.py").read_text(encoding="utf-8")
+        scheduler = compose.split("  scheduler:", 1)[1].split("\n  task:", 1)[0]
+
+        self.assertTrue(runner_path.is_file())
+        self.assertIn("python main.py --doTask", runner)
+        self.assertIn("migrate_legacy_crontab", cron_runner)
+        self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", scheduler)
+
     def test_compose_runtime_mounts_follow_least_privilege(self):
         text = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         web = text.split("  web:", 1)[1].split("\n  login-desktop:", 1)[0]
@@ -41,7 +53,7 @@ class DeploymentContractTests(unittest.TestCase):
 
         self.assertIn("/var/run/docker.sock:/var/run/docker.sock", web)
         self.assertIn(".:/opt/douyin-sparkflow", web)
-        self.assertIn("/var/run/docker.sock:/var/run/docker.sock", scheduler)
+        self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", scheduler)
         self.assertNotIn(".:/opt/douyin-sparkflow", scheduler)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", task)
         self.assertNotIn(".:/opt/douyin-sparkflow", task)
@@ -66,6 +78,23 @@ class DeploymentContractTests(unittest.TestCase):
 
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("*/20 "))
+
+    def test_legacy_cron_command_migrates_without_touching_schedule(self):
+        from scripts.cron_runner import migrate_legacy_line
+
+        legacy = (
+            "20 18 * * * /bin/bash -lc 'docker ps --format \"{{.Names}}\" | "
+            "grep douyin-web; docker exec douyin-web sh -lc \"cd /app && "
+            "env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 "
+            "python main.py --doTask\"' >> /var/log/douyin-sparkflow.log 2>&1"
+        )
+        migrated = migrate_legacy_line(legacy)
+
+        self.assertTrue(migrated.startswith("20 18 * * * "))
+        self.assertIn("run_scheduled_task.sh", migrated)
+        self.assertIn("SPARKFLOW_MANUAL_UNSENT_ONLY=1", migrated)
+        self.assertNotIn("docker ps", migrated)
+        self.assertNotIn("docker exec", migrated)
 
     def test_build_proxy_does_not_leak_into_runtime_and_runtime_proxy_is_explicit(self):
         dockerfile = (SOURCE_ROOT / "Dockerfile.server").read_text(encoding="utf-8")
@@ -101,6 +130,9 @@ class DeploymentContractTests(unittest.TestCase):
         windows = (REPO_ROOT / "deploy" / "install-local.ps1").read_text(encoding="utf-8")
         self.assertIn("runtime_config_backup", server)
         self.assertIn("Restored runtime config.json", server)
+        self.assertIn("remove_legacy_host_cron", server)
+        self.assertIn("host-crontab-", server)
+        self.assertIn("docker ps --format", server)
         self.assertNotIn("bash ./refresh_proxy.sh", windows)
         self.assertIn("Initialize-ProxyConfig", windows)
 
@@ -124,15 +156,15 @@ class DeploymentContractTests(unittest.TestCase):
         env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
         server = (SOURCE_ROOT / "login_desktop_server.py").read_text(encoding="utf-8")
         login_block = compose.split("  login-desktop:", 1)[1].split("  scheduler:", 1)[0]
-        self.assertIn("LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-direct}", login_block)
+        self.assertIn("LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-auto}", login_block)
         self.assertIn("LOGIN_DESKTOP_PROXY: ${LOGIN_DESKTOP_PROXY:-http://proxy:7890}", login_block)
         self.assertNotIn("HTTP_PROXY: http://proxy:7890", login_block)
-        self.assertIn("LOGIN_DESKTOP_PROXY_MODE=direct", env_example)
+        self.assertIn("LOGIN_DESKTOP_PROXY_MODE=auto", env_example)
         self.assertIn('candidates.append(("direct", None))', server)
         self.assertIn('candidates.append(("proxy", LOGIN_PROXY_SERVER))', server)
         self.assertIn('"--no-proxy-server"', server)
         self.assertIn('"/preflight"', server)
-        self.assertIn('LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-direct}', login_block)
+        self.assertIn('LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-auto}', login_block)
         dashboard = (SOURCE_ROOT / "webui" / "templates" / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn('name="douyin_network_mode"', dashboard)
         self.assertIn('name="douyin_proxy_url"', dashboard)

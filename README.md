@@ -238,8 +238,8 @@ LOGIN_DESKTOP_BIND_ADDRESS=127.0.0.1
 LOGIN_DESKTOP_WEB_PORT=8788
 LOGIN_DESKTOP_PUBLIC_URL=/login-desktop/proxy/vnc.html?autoconnect=1&resize=scale&view_only=0&path=login-desktop/proxy/websockify
 
-# 登录浏览器默认直连；Mihomo 仅作为高级选项
-LOGIN_DESKTOP_PROXY_MODE=direct
+# 登录浏览器默认先直连抖音，直连失败时再尝试 Mihomo
+LOGIN_DESKTOP_PROXY_MODE=auto
 LOGIN_DESKTOP_PROXY=http://proxy:7890
 
 
@@ -252,7 +252,7 @@ PROXY_SUB_URL=
 ```
 
 
-默认抖音业务网络使用直连。登录、好友刷新和浏览器发送会显式禁用环境代理，避免未配置的 Mihomo 影响正常使用。高级用户可在 Web UI「系统设置」中选择 Mihomo 并填写代理地址；登录浏览器仍可通过 `LOGIN_DESKTOP_PROXY_MODE=proxy` 强制使用代理。
+登录、好友刷新和发送任务默认都采用“直连优先，Mihomo 回退”的网络策略。`LOGIN_DESKTOP_PROXY_MODE=auto` 时，登录浏览器先直连 `creator.douyin.com`，直连预检失败后才使用 `LOGIN_DESKTOP_PROXY`。好友刷新和续火花任务也会在任务开始前选择可用出口；发送动作开始后不会因响应不明确而盲目切换代理重发。没有配置有效订阅时，Mihomo 仅提供 DIRECT-only 配置，回退不会凭空产生代理节点。
 
 
 #### `config.example.json` 与 `config.json` - 应用配置
@@ -303,6 +303,12 @@ PROXY_SUB_URL=
 - **proxy**: Mihomo 代理服务（可选）
 - **scheduler**: 发送窗口定时调度服务
 - **task**: 一次性发送任务服务
+
+定时任务由 `scheduler` 容器直接运行 `/app/main.py --doTask`，不再通过
+`docker ps` 和 `docker exec` 控制 `web` 容器，因此 scheduler 不需要挂载宿主机
+Docker socket。旧部署中已经写入的共享定时文件，会在 scheduler 启动时自动迁移；
+服务器更新脚本还会备份并清理宿主机 root crontab 中旧的 Docker 发送任务，避免两套
+定时器同时运行。
 
 #### 快速部署
 
@@ -393,6 +399,10 @@ mode: rule
 ```
 
 如果 `PROXY_SUB_URL` 不为空，`refresh_proxy.sh` 会下载订阅并更新本地配置；如果为空，则生成 DIRECT-only 配置。不要在 Git 中提交包含订阅 token 的 `proxy/config.yaml`。首次部署不要跳过初始化步骤直接执行 `docker compose up -d`，否则 Docker 可能把缺失的配置文件创建成目录。
+
+如果宿主机 Docker Engine 较旧，Web 容器中的 Docker 运维功能可能需要显式指定
+`DOCKER_API_VERSION`。默认留空即可；只有确认宿主机 API 版本后，才在 `.env` 中设置，
+例如 `DOCKER_API_VERSION=1.43`。
 
 
 ### 默认网络安全

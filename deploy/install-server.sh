@@ -130,6 +130,40 @@ read_env_value() {
   grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2- || true
 }
 
+remove_legacy_host_cron() {
+  local current_file filtered_file backup_dir backup_file
+  current_file="$(mktemp)"
+  filtered_file="$(mktemp)"
+
+  if ! run_root crontab -l > "$current_file" 2>/dev/null; then
+    rm -f "$current_file" "$filtered_file"
+    return
+  fi
+
+  awk '
+    function is_legacy_sparkflow_job(line) {
+      return line ~ /main\.py --doTask/ \
+        && line ~ /docker ps --format/ \
+        && line ~ /docker exec/ \
+        && line ~ /douyin-web/
+    }
+    !is_legacy_sparkflow_job($0) { print }
+  ' "$current_file" > "$filtered_file"
+
+  if cmp -s "$current_file" "$filtered_file"; then
+    rm -f "$current_file" "$filtered_file"
+    return
+  fi
+
+  backup_dir="$APP_ROOT/backups"
+  backup_file="$backup_dir/host-crontab-$(date +%Y%m%d-%H%M%S).bak"
+  run_root mkdir -p "$backup_dir"
+  run_root cp "$current_file" "$backup_file"
+  run_root crontab "$filtered_file"
+  rm -f "$current_file" "$filtered_file"
+  log "Removed legacy Docker-based SparkFlow host cron jobs; backup: $backup_file"
+}
+
 write_default_cron() {
   local cron_file="$APP_ROOT/state/cron/root"
   if [ -s "$cron_file" ]; then
@@ -139,9 +173,9 @@ write_default_cron() {
     echo "DEFAULT_SCHEDULE=$DEFAULT_SCHEDULE will be saved to .env. The initial cron file uses the built-in 10:00-18:00/20m schedule; adjust it from the Web UI after first login." >&2
   fi
   cat > /tmp/douyin-sparkflow-cron <<'CRON'
-*/20 10-17 * * * cd /app && python main.py --doTask >> /app/logs/app.log 2>&1
-0 18 * * * cd /app && python main.py --doTask >> /app/logs/app.log 2>&1
-20 18 * * * cd /app && env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 PYTHONUNBUFFERED=1 python main.py --doTask >> /app/logs/app.log 2>&1
+*/20 10-17 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
+0 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
+20 18 * * * env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 PYTHONUNBUFFERED=1 SPARKFLOW_TRIGGER_LABEL='unsent fallback' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
 CRON
   run_root cp /tmp/douyin-sparkflow-cron "$cron_file"
   rm -f /tmp/douyin-sparkflow-cron
@@ -156,7 +190,7 @@ prepare_runtime_files() {
   set_env_value "$env_file" "APP_ROOT" "$APP_ROOT"
   set_env_value "$env_file" "DEFAULT_SCHEDULE" "$DEFAULT_SCHEDULE"
 
-  for key in TZ WEB_BIND_ADDRESS WEB_PORT SPARKFLOW_SESSION_COOKIE_SECURE LOGIN_DESKTOP_BIND_ADDRESS LOGIN_DESKTOP_WEB_PORT LOGIN_DESKTOP_PUBLIC_URL PROXY_BIND_ADDRESS PROXY_HTTP_PORT PROXY_CONTROLLER_PORT PROXY_SUB_URL PROXY_USER_AGENT PLAYWRIGHT_BASE_IMAGE NODE_RUNTIME_IMAGE HTTP_PROXY_BUILD HTTPS_PROXY_BUILD ALL_PROXY_BUILD PIP_INDEX_URL PIP_TRUSTED_HOST; do
+  for key in TZ WEB_BIND_ADDRESS WEB_PORT SPARKFLOW_SESSION_COOKIE_SECURE DOCKER_API_VERSION LOGIN_DESKTOP_BIND_ADDRESS LOGIN_DESKTOP_WEB_PORT LOGIN_DESKTOP_PUBLIC_URL PROXY_BIND_ADDRESS PROXY_HTTP_PORT PROXY_CONTROLLER_PORT PROXY_SUB_URL PROXY_USER_AGENT PLAYWRIGHT_BASE_IMAGE NODE_RUNTIME_IMAGE HTTP_PROXY_BUILD HTTPS_PROXY_BUILD ALL_PROXY_BUILD PIP_INDEX_URL PIP_TRUSTED_HOST; do
     if [ -n "${!key:-}" ]; then
       set_env_value "$env_file" "$key" "${!key}"
     fi
@@ -245,6 +279,7 @@ main() {
   ensure_docker
   prepare_repo
   prepare_runtime_files
+  remove_legacy_host_cron
   compose_up
   print_summary
 }

@@ -305,7 +305,8 @@ class WebUiSafetyTests(unittest.TestCase):
             self.assertIn("*/20 10-17 * * *", text)
             self.assertIn("0 18 * * *", text)
             self.assertIn("20 18 * * *", text)
-            self.assertIn("docker exec", text)
+            self.assertIn("run_scheduled_task.sh", text)
+            self.assertNotIn("docker exec", text)
 
     def test_overview_api_requires_authentication_and_disables_cache(self):
         client = TestClient(app_module.app)

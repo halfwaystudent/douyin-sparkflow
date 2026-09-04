@@ -101,4 +101,9 @@ docker compose exec login-desktop curl -fsS http://127.0.0.1:18090/preflight
 docker compose logs -f scheduler
 ```
 
+正常情况下可以看到 `scheduled send start` 和 `scheduled send exit rc=0`。
+如果仍看到 `docker ps` 或 `docker exec`，说明定时文件还是旧格式；重启 scheduler
+后会自动迁移共享定时文件。使用服务器更新脚本时，还会清理宿主机 root crontab 中
+旧的 Docker 发送任务，防止同一时间运行两遍。
+
 如果只是少量目标失败，先使用 **补发未成功目标**，不要直接补发全部对象。

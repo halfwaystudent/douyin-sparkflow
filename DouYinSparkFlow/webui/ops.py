@@ -23,6 +23,7 @@ TASK_SCHEDULE_MARKERS = (
     "docker compose run --rm task",
     "docker compose run --rm douyin",
     "main.py --doTask",
+    "run_scheduled_task.sh",
 )
 HOST_CRONTAB_PATH = Path("/host-spool-cron/root")
 WINDOWED_SCHEDULE_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})/(\d+)m$", re.IGNORECASE)
@@ -199,20 +200,9 @@ def _compose_env_args(extra_env=None):
 
 def build_scheduled_task_command(extra_env=None, trigger_label="scheduled send"):
     if running_in_container():
-        task_command = _with_env_prefix("python main.py --doTask", extra_env)
-        return (
-            "/bin/bash -lc 'timestamp=$(date -Iseconds); "
-            f"echo \"[AUTO_TRIGGER] $timestamp {trigger_label} start\"; "
-            "container=$(docker ps --format \"{{.Names}}\" | "
-            "grep -E \"^(douyin-web-hostfix|douyin-web)$\" | head -n 1); "
-            "if [ -z \"$container\" ]; then "
-            "echo \"[AUTO_TRIGGER] $timestamp no matching container found\"; "
-            "exit 1; "
-            "fi; "
-            "echo \"[AUTO_TRIGGER] $timestamp container=$container\"; "
-            "docker exec \"$container\" sh -lc "
-            f"\"cd /app && {task_command}\"'"
-        )
+        task_env = dict(extra_env or {})
+        task_env["SPARKFLOW_TRIGGER_LABEL"] = trigger_label
+        return _with_env_prefix("bash /app/scripts/run_scheduled_task.sh", task_env)
     if compose_file_path():
         compose_root_quoted = shlex.quote(str(compose_root()))
         compose_env_args = _compose_env_args(extra_env)

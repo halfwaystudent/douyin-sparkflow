@@ -61,11 +61,11 @@ def _douyin_network_mode():
 
 
 def douyin_network_modes():
-    # Direct is the default; Mihomo is used only when explicitly selected.
+    # Direct is the default; Mihomo is the fallback unless explicitly selected.
     mode = _douyin_network_mode()
     if mode == "mihomo":
         return ("mihomo",)
-    return ("direct",)
+    return ("direct", "mihomo")
 
 
 def _douyin_browser_proxy(network_mode=None):
