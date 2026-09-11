@@ -644,6 +644,20 @@
     }
   };
 
+  // The cache holds {id, name} records, where id is the 抖音号. Caches written by
+  // older versions hold bare nicknames, so both shapes are accepted; a friend the
+  // page could not resolve an id for is offered by name.
+  const normalizeFriend = (entry) => {
+    if (entry && typeof entry === "object") {
+      const id = String(entry.id || "").trim();
+      const name = String(entry.name || "").trim();
+      if (!id && !name) return null;
+      return { id, name: name || id, value: id || name, label: id ? `${name || id} · ${id}` : name || id };
+    }
+    const value = String(entry || "").trim();
+    return value ? { id: "", name: value, value, label: value } : null;
+  };
+
   document.querySelectorAll(".friend-picker").forEach((picker) => {
     const accountId = picker.dataset.accountId;
     const refreshUrl = picker.dataset.refreshUrl;
@@ -655,7 +669,7 @@
     const list = picker.querySelector(".friend-picker-list");
     const summary = picker.querySelector(".friend-picker-summary");
     const status = picker.querySelector(".friend-picker-status");
-    let friends = parseJson(`friends-cache-${accountId}`);
+    let friends = parseJson(`friends-cache-${accountId}`).map(normalizeFriend).filter(Boolean);
     let selected = new Set(parseJson(`selected-targets-${accountId}`));
 
     const parseTargets = (value) =>
@@ -667,7 +681,21 @@
           .filter(Boolean),
       )];
 
-    const combined = () => [...new Set([...selected, ...friends])];
+    const combined = () => {
+      const byValue = new Map();
+      friends.forEach((friend) => {
+        if (!byValue.has(friend.value)) byValue.set(friend.value, friend);
+      });
+      // A stored target the last refresh did not list still needs a row, otherwise
+      // it would look unchecked and be silently dropped on the next save.
+      selected.forEach((value) => {
+        if (!byValue.has(value)) {
+          const match = friends.find((friend) => friend.name === value);
+          byValue.set(value, match ? { ...match, value } : { id: "", name: value, value, label: value });
+        }
+      });
+      return [...byValue.values()];
+    };
 
     const syncTextarea = () => {
       if (textarea) textarea.value = [...selected].join("\n");
@@ -675,31 +703,35 @@
 
     const render = () => {
       const query = String(search?.value || "").trim().toLowerCase();
-      const names = combined().filter((name) =>
-        name.toLowerCase().includes(query),
+      const all = combined();
+      const entries = all.filter(
+        (friend) =>
+          !query ||
+          friend.name.toLowerCase().includes(query) ||
+          friend.id.toLowerCase().includes(query),
       );
       if (summary) summary.textContent = `已选 ${selected.size} 人`;
       list.innerHTML = "";
-      if (!names.length) {
+      if (!entries.length) {
         const empty = document.createElement("div");
         empty.className = "friend-picker-empty";
-        empty.textContent = combined().length
+        empty.textContent = all.length
           ? "没有匹配的好友。"
           : "点击“刷新好友列表”后再选择目标。";
         list.appendChild(empty);
         return;
       }
-      names.forEach((name) => {
+      entries.forEach((friend) => {
         const label = document.createElement("label");
-        label.className = `friend-option${selected.has(name) ? " selected" : ""}`;
+        label.className = `friend-option${selected.has(friend.value) ? " selected" : ""}`;
         const text = document.createElement("span");
-        text.textContent = name;
+        text.textContent = friend.label;
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
-        checkbox.checked = selected.has(name);
+        checkbox.checked = selected.has(friend.value);
         checkbox.addEventListener("change", () => {
-          if (checkbox.checked) selected.add(name);
-          else selected.delete(name);
+          if (checkbox.checked) selected.add(friend.value);
+          else selected.delete(friend.value);
           syncTextarea();
           render();
         });
@@ -726,7 +758,7 @@
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "刷新失败");
-        friends = data.friends || [];
+        friends = (data.friends || []).map(normalizeFriend).filter(Boolean);
         if (status) status.textContent = data.message || "好友列表已刷新";
         render();
       } catch (error) {

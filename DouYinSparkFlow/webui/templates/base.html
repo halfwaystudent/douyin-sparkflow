@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark light">
     <title>{% block title %}续火花{% endblock %}</title>
-    <link rel="stylesheet" href="/static/app.css?v=20260824">
+    <link rel="stylesheet" href="/static/app.css?v={{ static_version('app.css') }}">
   </head>
   <body data-page="{% block page_key %}dashboard{% endblock %}">
     <header class="mobile-topbar">
@@ -138,8 +138,8 @@
       </div>
     </dialog>
 
-    <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20260824"></script>
+    <script defer src="/static/lucide.min.js?v={{ static_version('lucide.min.js') }}"></script>
+    <script defer src="/static/app.js?v={{ static_version('app.js') }}"></script>
     {% block scripts %}{% endblock %}
   </body>
 </html>

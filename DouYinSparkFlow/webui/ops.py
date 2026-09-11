@@ -751,6 +751,38 @@ def _friend_index_status(account, target_name):
     }
 
 
+def _target_label(account, target_name, friend_index_status):
+    """The nickname to show for a target.
+
+    A target is stored as the friend's 抖音号 so that a rename cannot break
+    sending, but a bare number tells the person reading the console nothing.
+    Both the friend index and the last friend refresh already recorded which
+    抖音号 belongs to which nickname, so the readable name is available without
+    changing how a target is stored or matched.
+    """
+    visible_name = str(friend_index_status.get("visibleName") or "").strip()
+    if visible_name:
+        return visible_name
+
+    marker = f"douyin_id:{target_name}"
+    for entry in (account.get("friend_index") or {}).values():
+        if marker in list((entry or {}).get("stableKeys") or []):
+            name = str((entry or {}).get("visibleName") or "").strip()
+            if name:
+                return name
+
+    for entry in account.get("friends_cache") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("id") or "").strip() != target_name:
+            continue
+        name = str(entry.get("name") or "").strip()
+        if name:
+            return name
+
+    return target_name
+
+
 def _account_blocked_target_status(item, account_failure):
     blocked_item = dict(item)
     affected_targets = set(account_failure.get("affectedTargets") or [])
@@ -782,8 +814,10 @@ def _scheduled_send_time(user, target_name, send_window, now):
 
 
 def _base_target_status(account, target_name, now):
+    friend_index = _friend_index_status(account, target_name)
     return {
         "target": target_name,
+        "targetLabel": _target_label(account, target_name, friend_index),
         "status": "",
         "message": "",
         "sentAt": "",
@@ -792,7 +826,7 @@ def _base_target_status(account, target_name, now):
         "reason": "",
         "attemptCount": 0,
         "scheduledAt": "",
-        "friendIndex": _friend_index_status(account, target_name),
+        "friendIndex": friend_index,
         "confirmationLevel": "",
         "confirmationSource": "",
         "confirmationDetail": "",

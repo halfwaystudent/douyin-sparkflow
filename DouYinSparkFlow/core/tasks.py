@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import random
-import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +17,7 @@ from core.browser import (
     sanitize_profile_name,
     select_douyin_network_mode,
 )
+from core.friends import FriendIdentityCollector, normalize_friend_name
 from core.msg_builder import build_message, build_message_candidates
 from core.protocol_dispatch import run_protocol_tasks
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
@@ -50,11 +50,9 @@ def _safe_name(value):
 
 
 def _normalize_target_name(value):
-    raw = unicodedata.normalize("NFKC", str(value or ""))
-    for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        raw = raw.replace(token, "")
-    raw = raw.replace("\xa0", " ")
-    return " ".join(raw.split()).strip()
+    # Shared with core.friends so a nickname scraped from the chat list compares
+    # equal to the same nickname the user_detail API reported.
+    return normalize_friend_name(value)
 
 
 def _current_run_mode():
@@ -1045,11 +1043,22 @@ def _target_display_name(target):
     return str(target or "").strip()
 
 
-def _build_normalized_target_map(targets):
+def _build_normalized_target_map(targets, id_to_name=None):
+    """Map each target onto the nickname the friend list will show for it.
+
+    A target is normally the friend's 抖音号, which never changes.  The chat list
+    only ever shows nicknames, so a stored 抖音号 is resolved to whatever the
+    friend is called today; a friend the API has not answered for keeps the
+    stored value and is matched by name, exactly as before.
+    """
+    id_to_name = id_to_name or {}
     normalized_targets = {}
     for target in targets or []:
         display_name = _target_display_name(target)
-        normalized_name = _normalize_target_name(display_name)
+        if not display_name:
+            continue
+        current_name = str(id_to_name.get(display_name) or "").strip()
+        normalized_name = _normalize_target_name(current_name or display_name)
         if normalized_name:
             normalized_targets[normalized_name] = display_name
     return normalized_targets
@@ -1327,15 +1336,22 @@ async def _extract_friend_stable_keys(element):
     return sorted(stable_keys)
 
 
-async def _extract_friend_record(element):
+async def _extract_friend_record(element, collector=None):
     display_name = await _extract_friend_display_name(element)
     normalized_name = _normalize_target_name(display_name)
     if not normalized_name:
         return None
+    stable_keys = await _extract_friend_stable_keys(element)
+    douyin_id = ""
+    if collector:
+        douyin_id = str(collector.name_to_id.get(normalized_name) or "").strip()
+        if douyin_id:
+            stable_keys = sorted(set(stable_keys) | {f"douyin_id:{douyin_id}"})
     return {
         "visibleName": display_name,
         "normalizedName": normalized_name,
-        "stableKeys": await _extract_friend_stable_keys(element),
+        "douyinId": douyin_id,
+        "stableKeys": stable_keys,
     }
 
 
@@ -1350,7 +1366,11 @@ async def _first_scrollable_friends_element(page, selectors):
     return "", None
 
 
-async def scroll_and_select_user(page, user, account_name, targets, friend_scan_config=None, index_targets=None):
+async def scroll_and_select_user(page, user, account_name, targets, friend_scan_config=None, index_targets=None, collector=None):
+    # Resolves a stored 抖音号 to the nickname the friend wears today. Callers that
+    # already attached one at page creation hand it in so the first user_detail
+    # response is not missed.
+    collector = collector or FriendIdentityCollector().attach(page)
     friends_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
     target_selectors = (
         '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
@@ -1412,11 +1432,11 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
 
     await asyncio.sleep(2)
 
-    normalized_targets = _build_normalized_target_map(targets)
-    normalized_index_targets = _build_normalized_target_map(index_targets or targets)
+    normalized_targets = {}
+    normalized_index_targets = {}
     found_usernames = set()
-    remaining_targets = set(normalized_targets)
-    remaining_index_targets = set(normalized_index_targets)
+    remaining_targets = set()
+    remaining_index_targets = set()
     friend_index = {}
     scan_started_at = asyncio.get_running_loop().time()
     last_new_friend_at = scan_started_at
@@ -1430,6 +1450,22 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
         ready_timeout_seconds,
         empty_grace_seconds,
     )
+
+    def refresh_target_maps():
+        """Resolve stored 抖音号 targets against the nicknames seen so far.
+
+        user_detail answers keep arriving while the list scrolls, so a target that
+        was unresolvable on an early pass becomes resolvable later.  Rebuilding
+        from found_usernames keeps exactly one key per target.
+        """
+        normalized = _build_normalized_target_map(targets, collector.id_to_name)
+        normalized_index = _build_normalized_target_map(index_targets or targets, collector.id_to_name)
+        return (
+            normalized,
+            normalized_index,
+            {key for key in normalized if key not in found_usernames},
+            {key for key in normalized_index if key not in found_usernames},
+        )
 
     def missing_target_names():
         return sorted(normalized_targets[item] for item in remaining_targets)
@@ -1447,6 +1483,8 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
         )
 
     while True:
+        await collector.drain()
+        normalized_targets, normalized_index_targets, remaining_targets, remaining_index_targets = refresh_target_maps()
         now_monotonic = asyncio.get_running_loop().time()
         if now_monotonic - scan_started_at > max_scan_seconds:
             persist_index(False)
@@ -1480,7 +1518,7 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
         clicked_delivery_target = False
 
         for element in target_elements:
-            friend_record = await _extract_friend_record(element)
+            friend_record = await _extract_friend_record(element, collector)
             if not friend_record:
                 continue
 
@@ -2482,6 +2520,10 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
 
     try:
         page = await context.new_page()
+        # Attach before navigating: the chat page asks user_detail for its friends
+        # as soon as the conversation list renders, and that reply is the only
+        # place a stable 抖音号 for a friend appears.
+        friend_identity = FriendIdentityCollector().attach(page)
         try:
             await retry_operation(
                 "open creator home",
@@ -2534,6 +2576,7 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
                 targets,
                 friend_scan_config,
                 index_targets=index_targets,
+                collector=friend_identity,
             ):
                 yielded_targets.add(target_name)
                 message = ""

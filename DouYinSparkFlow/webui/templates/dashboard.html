@@ -409,8 +409,9 @@
               </div>
               <label>
                 <span>搜索好友</span>
-                <input class="friend-search-input" type="search" placeholder="输入昵称筛选">
+                <input class="friend-search-input" type="search" placeholder="输入昵称或抖音号筛选">
               </label>
+              <p class="muted compact">勾选后记录的是抖音号，好友改名也不影响续火花。</p>
               <p class="muted compact friend-picker-summary">已选 0 人</p>
               <div class="friend-picker-list"></div>
               <script type="application/json" id="friends-cache-{{ account.unique_id }}">{{ account.friends_cache|default([], true)|tojson }}</script>

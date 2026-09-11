@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark light">
     <title>登录 | 续火花控制台</title>
-    <link rel="stylesheet" href="/static/app.css?v=20260710">
+    <link rel="stylesheet" href="/static/app.css?v={{ static_version('app.css') }}">
   </head>
   <body class="login-page">
     <aside class="login-brand-panel">
@@ -77,7 +77,7 @@
       </section>
     </main>
 
-    <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20260710"></script>
+    <script defer src="/static/lucide.min.js?v={{ static_version('lucide.min.js') }}"></script>
+    <script defer src="/static/app.js?v={{ static_version('app.js') }}"></script>
   </body>
 </html>

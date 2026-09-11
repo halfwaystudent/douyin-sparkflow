@@ -96,6 +96,24 @@ DEBUG_ARTIFACTS_DIR = BASE_DIR.parent / "logs" / "debug_artifacts"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
+def static_asset_version(name):
+    """Cache-busting token for a bundled asset, derived from the file itself.
+
+    The stamp used to be written by hand, which silently kept serving an old
+    app.js after the friend refresh API changed its reply shape — and an old
+    picker script reading the new reply crashes on the first friend.  Reading
+    mtime and size means the token can never be forgotten.
+    """
+    try:
+        stat = (STATIC_DIR / name).stat()
+    except OSError:
+        return "0"
+    return f"{int(stat.st_mtime)}-{stat.st_size}"
+
+
+templates.env.globals["static_version"] = static_asset_version
+
+
 def _dedupe_targets(values):
     seen = set()
     result = []

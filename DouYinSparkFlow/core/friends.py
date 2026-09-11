@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import unicodedata
 
 from core.browser import douyin_network_modes, get_browser
 
@@ -8,15 +9,25 @@ logger = logging.getLogger(__name__)
 
 
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
+# The chat list DOM carries no identifier for a friend row, but the page resolves
+# every conversation it renders through this JSON API.  Its reply holds the stable
+# ShortId (the 抖音号 the user reads off a profile) next to the current nickname,
+# which is what makes a friend survivable across renames.
+FRIEND_USER_DETAIL_API = "/aweme/v1/creator/im/user_detail/"
+# The reply lands within a second of the rows rendering; a request still pending
+# after this long is treated as never arriving so a scan loop cannot stall on it.
+FRIEND_ID_DRAIN_SECONDS = 1.0
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
 # child indexes change frequently.  Keep semantic/current selectors first, with
-# the historical XPath selectors last for older page variants.
+# the historical XPath selectors last for older page variants.  Every selector
+# requires a name element: without it a "row" is only a tab badge or a date, and
+# scraping its text would invent friends that do not exist.
 FRIEND_ROW_SELECTORS = (
     '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
     '#sub-app li.semi-list-item:has([class*="item-header-name-"])',
     'xpath=//*[@id="sub-app"]//div[contains(@class, "semi-list-item-body") and .//*[contains(@class, "item-header-name-")]]',
-    'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]//div[contains(@class, "semi-list-item-body semi-list-item-body-flex-start")]',
+    'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]//div[contains(@class, "semi-list-item-body semi-list-item-body-flex-start") and .//*[contains(@class, "item-header-name-")]]',
 )
 SCROLLABLE_FRIENDS_SELECTORS = (
     '#sub-app [role="grid"]',
@@ -66,6 +77,123 @@ NON_LOGIN_DIALOG_CLOSE_SELECTORS = (
 FRIEND_LIST_EMPTY_ROUNDS = 6
 FRIEND_LIST_EMPTY_WAIT_SECONDS = 1.5
 FRIEND_LIST_READY_TIMEOUT_SECONDS = 60
+LOGIN_REQUIRED_TEXTS = (
+    "扫码登录",
+    "验证码登录",
+    "密码登录",
+    "登录/注册",
+    "请登录",
+    "身份验证",
+    "安全验证",
+    "环境异常",
+)
+
+
+def normalize_friend_name(value):
+    """Fold a displayed nickname into a comparable key."""
+    raw = unicodedata.normalize("NFKC", str(value or ""))
+    for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        raw = raw.replace(token, "")
+    raw = raw.replace("\xa0", " ")
+    return " ".join(raw.split()).strip()
+
+
+def friend_record(douyin_id, name):
+    """One friend as the picker and the sender both need it.
+
+    ``id`` is the 抖音号: stable across renames, and the only thing worth storing
+    as a target.  ``name`` is the current nickname, kept for recognition only.
+    """
+    return {"id": str(douyin_id or "").strip(), "name": str(name or "").strip()}
+
+
+class FriendIdentityCollector:
+    """Learn 抖音号 <-> 昵称 from the chat page's own user_detail API.
+
+    Listening is the only way to get a stable id: the rendered friend row exposes
+    neither a data attribute nor a link.  The nickname is read live at the same
+    time, so callers can map a stored 抖音号 onto whatever the friend is called
+    today.  Responses arrive asynchronously, hence :meth:`drain` before reading.
+    """
+
+    def __init__(self):
+        self.id_to_name = {}
+        self.name_to_id = {}
+        self._pending = set()
+
+    def attach(self, page):
+        def on_response(response):
+            try:
+                url = response.url
+            except Exception:
+                return
+            if FRIEND_USER_DETAIL_API not in url:
+                return
+            task = asyncio.ensure_future(self._consume(response))
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
+
+        page.on("response", on_response)
+        return self
+
+    async def _consume(self, response):
+        try:
+            payload = await response.json()
+        except Exception as exc:
+            logger.debug("Ignoring unreadable friend user_detail response: %s", exc)
+            return
+        self.absorb(payload)
+
+    def absorb(self, payload):
+        if not isinstance(payload, dict):
+            return
+        for item in payload.get("user_list") or []:
+            if not isinstance(item, dict):
+                continue
+            # The profile lives under "user": {"ShortId": 抖音号, "nickname": 昵称}.
+            # Some replies also carry the nickname alongside user_id, so both
+            # placements are accepted.
+            profile = item.get("user") or {}
+            douyin_id = str(profile.get("ShortId") or item.get("ShortId") or "").strip()
+            name = str(profile.get("nickname") or item.get("nickname") or "").strip()
+            if not douyin_id or not name:
+                continue
+            self.id_to_name[douyin_id] = name
+            self.name_to_id[normalize_friend_name(name)] = douyin_id
+
+    async def drain(self, timeout=FRIEND_ID_DRAIN_SECONDS):
+        while self._pending:
+            pending = set(self._pending)
+            await asyncio.wait(pending, timeout=timeout)
+            if pending == self._pending:
+                return
+
+    def records(self):
+        return [friend_record(douyin_id, name) for douyin_id, name in self.id_to_name.items()]
+
+
+def build_friend_records(names, collector=None):
+    """Merge scraped nicknames with the ids the API resolved.
+
+    Friends the API has not answered for keep an empty ``id`` so the picker can
+    still offer them by name; the sender falls back to name matching for those.
+    """
+    records = []
+    seen_names = set()
+    for douyin_id, name in (collector.id_to_name.items() if collector else ()):
+        normalized = normalize_friend_name(name)
+        if not normalized or normalized in seen_names:
+            continue
+        seen_names.add(normalized)
+        records.append(friend_record(douyin_id, name))
+
+    for name in names or []:
+        normalized = normalize_friend_name(name)
+        if not normalized or normalized in seen_names:
+            continue
+        seen_names.add(normalized)
+        records.append(friend_record("", name))
+    return records
 
 
 def update_collection_progress(new_names_count, no_more_visible, scroll_moved, idle_rounds, stuck_rounds, idle_limit=5, stuck_limit=2):
@@ -75,7 +203,24 @@ def update_collection_progress(new_names_count, no_more_visible, scroll_moved, i
     return should_stop, next_idle_rounds, next_stuck_rounds
 
 
+async def _login_prompt_marker(page):
+    try:
+        sample = await page.evaluate("() => (document.body.innerText || '').slice(0, 2000)")
+    except Exception:
+        return ""
+    for marker in LOGIN_REQUIRED_TEXTS:
+        if marker in str(sample):
+            return marker
+    return ""
+
+
 async def _ensure_logged_in(page):
+    """Raise an actionable error when the stored session is dead.
+
+    Without this the chat page renders its tab bar and nothing else, and the
+    caller reports a 60s "list did not become ready" timeout instead of the
+    re-login the user actually needs to perform.
+    """
     for selector in LOGIN_MASK_SELECTORS:
         try:
             locator = page.locator(selector).first
@@ -85,6 +230,10 @@ async def _ensure_logged_in(page):
             raise
         except Exception:
             continue
+
+    marker = await _login_prompt_marker(page)
+    if marker:
+        raise RuntimeError(f"账号登录已失效，请重新扫码登录（页面出现“{marker}”）")
 
 
 async def _dismiss_non_login_dialogs(page):
@@ -179,6 +328,10 @@ async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY
             if locator:
                 return selector, locator
 
+        # An expired session renders the tab bar with no rows at all, which is
+        # otherwise indistinguishable from a slow list.
+        await _ensure_logged_in(page)
+
         loading_selector, _ = await _first_visible_locator(page, LOADING_SELECTORS)
         if loading_selector:
             await asyncio.sleep(FRIEND_LIST_EMPTY_WAIT_SECONDS)
@@ -210,11 +363,13 @@ async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOU
     raise RuntimeError("chat page did not load within timeout")
 
 
-async def collect_friend_names(page):
+async def collect_friend_names(page, collector=None):
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
     if not target_locator:
+        if collector:
+            await collector.drain()
         return []
 
     found_names = []
@@ -240,16 +395,17 @@ async def collect_friend_names(page):
                     continue
                 if name:
                     break
-            if not name:
-                try:
-                    name = (await element.inner_text(timeout=1000)).splitlines()[0].strip()
-                except Exception:
-                    continue
+            # Every row selector guarantees a name element, so a row without one
+            # is not a friend row.  Falling back to the row's own text here used
+            # to scrape tab badges and dates ("5", "01-01") as if they were people.
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
             found_names.append(name)
             new_names_count += 1
+
+        if collector:
+            await collector.drain()
 
         no_more_selector, _ = await _first_visible_locator(page, NO_MORE_SELECTORS)
         if no_more_selector:
@@ -309,6 +465,33 @@ async def collect_friend_names(page):
             return found_names
 
 
+async def collect_friends(page, collector):
+    """Return ``[{"id": 抖音号, "name": 昵称}]`` for the account's friends.
+
+    The rendered rows are the fallback, not the source of truth: when the SPA
+    renders its tab bar but never paints the list, whatever the user_detail API
+    already answered for is still a usable friend list.
+    """
+    try:
+        names = await collect_friend_names(page, collector)
+    except RuntimeError as exc:
+        await collector.drain()
+        text = str(exc).lower()
+        if any(marker in text for marker in ("login", "cookie", "scan", "登录", "扫码")):
+            raise
+        if collector.id_to_name:
+            logger.warning(
+                "Friend list rows never rendered (%s); returning %s friends resolved from the user_detail API",
+                exc,
+                len(collector.id_to_name),
+            )
+            return collector.records()
+        raise
+
+    await collector.drain()
+    return build_friend_records(names, collector)
+
+
 async def _fetch_account_friends_once(account, network_mode):
     cookies = list(account.get("cookies") or [])
     playwright = browser = context = page = None
@@ -319,10 +502,16 @@ async def _fetch_account_friends_once(account, network_mode):
         context.set_default_timeout(120000)
         page = await context.new_page()
         await context.add_cookies(cookies)
+        collector = FriendIdentityCollector().attach(page)
         await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
         await asyncio.sleep(1)
 
-        friends = await collect_friend_names(page)
+        friends = await collect_friends(page, collector)
+        logger.info(
+            "Friend refresh identified %s friends (%s with a 抖音号)",
+            len(friends),
+            sum(1 for item in friends if item.get("id")),
+        )
         return friends
     except RuntimeError:
         raise

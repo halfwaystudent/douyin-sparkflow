@@ -189,7 +189,7 @@
               {% for item in account.unconfirmed_targets %}
               <article class="target-record">
                 <div class="target-record-main">
-                  <strong>{{ item.target }}</strong>
+                  <strong title="{{ item.target }}">{{ item.targetLabel }}</strong>
                   <small>{{ item.categoryLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
                 </div>
                 <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
@@ -207,7 +207,7 @@
               {% for item in account.failed_targets %}
               <article class="target-record">
                 <div class="target-record-main">
-                  <strong>{{ item.target }}</strong>
+                  <strong title="{{ item.target }}">{{ item.targetLabel }}</strong>
                   <small>{{ item.categoryLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
                 </div>
                 <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or "未记录失败原因" }}</div>
@@ -223,7 +223,7 @@
               {% for item in account.account_blocked_targets %}
               <article class="target-record">
                 <div class="target-record-main">
-                  <strong>{{ item.target }}</strong>
+                  <strong title="{{ item.target }}">{{ item.targetLabel }}</strong>
                   <small>受账号异常影响</small>
                 </div>
                 <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or item.categoryLabel }}</div>
@@ -247,7 +247,7 @@
               {% for item in account.confirmed_targets %}
               <article class="target-record">
                 <div class="target-record-main">
-                  <strong>{{ item.target }}</strong>
+                  <strong title="{{ item.target }}">{{ item.targetLabel }}</strong>
                   <small>{{ item.confirmationLabel }}</small>
                 </div>
                 <div class="target-message" title="{{ item.message or '' }}">{{ item.message or "未保存消息正文" }}</div>
@@ -256,7 +256,7 @@
                   method="post"
                   action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
                   data-confirm-title="标记为待核验"
-                  data-confirm="将把“{{ item.target }}”的今日强确认记录改为待核验并加入补发队列。确认继续吗？"
+                  data-confirm="将把“{{ item.targetLabel }}”的今日强确认记录改为待核验并加入补发队列。确认继续吗？"
                   data-confirm-accept="标记待核验"
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -275,7 +275,7 @@
               {% for item in waiting_targets %}
               <article class="target-record">
                 <div class="target-record-main">
-                  <strong>{{ item.target }}</strong>
+                  <strong title="{{ item.target }}">{{ item.targetLabel }}</strong>
                   <small>{% if item.status == "pending" %}等待计划时间{% else %}尚未处理{% endif %}</small>
                 </div>
                 <div class="target-message">好友索引：{% if item.friendIndex.seen %}已记录{% else %}尚未记录{% endif %}</div>
