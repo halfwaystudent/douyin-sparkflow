@@ -119,7 +119,7 @@ if ($ProxySubUrl) {
     Set-EnvValue -Path ".env" -Key "PROXY_SUB_URL" -Value $ProxySubUrl
 }
 
-New-Item -ItemType Directory -Force -Path "proxy", "state/cron", "state/login-profile", "state/browser-profiles", "DouYinSparkFlow/logs" | Out-Null
+New-Item -ItemType Directory -Force -Path "proxy", "state/cron", "state/login-api", "state/login-profile", "state/browser-profiles", "DouYinSparkFlow/logs" | Out-Null
 if (-not (Test-Path "proxy/config.yaml")) {
     Copy-Item "proxy/config.example.yaml" "proxy/config.yaml"
 }

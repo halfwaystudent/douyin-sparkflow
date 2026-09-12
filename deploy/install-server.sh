@@ -210,6 +210,7 @@ prepare_runtime_files() {
   run_root mkdir -p \
     "$APP_ROOT/proxy" \
     "$APP_ROOT/state/cron" \
+    "$APP_ROOT/state/login-api" \
     "$APP_ROOT/state/login-profile" \
     "$APP_ROOT/state/browser-profiles" \
     "$APP_ROOT/DouYinSparkFlow/logs"

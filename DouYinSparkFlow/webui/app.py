@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import urllib.error
@@ -27,9 +28,8 @@ from utils.config import (
     get_userData,
     normalize_unique_id,
     save_app_settings,
-    save_config,
-    save_userData,
-    upsert_user_account,
+    update_config,
+    update_user_data,
 )
 from webui.auth import (
     bootstrap_admin_password,
@@ -42,13 +42,11 @@ from webui.auth import (
     issue_session,
     update_admin_password,
     validate_csrf,
-    verify_password,
 )
 from webui.users import (
     UserStoreError,
     account_by_ref,
     account_by_unique_id,
-    all_assigned_refs,
     can_access_account,
     create_web_user,
     delete_web_user,
@@ -263,6 +261,20 @@ def login_desktop_novnc_ws_url() -> str:
     return str(os.getenv("SPARKFLOW_LOGIN_DESKTOP_NOVNC_WS_URL") or "ws://login-desktop:6080/websockify")
 
 
+def login_desktop_api_headers():
+    token = str(os.getenv("SPARKFLOW_LOGIN_DESKTOP_API_TOKEN") or "").strip()
+    if not token:
+        token_file = str(
+            os.getenv("SPARKFLOW_LOGIN_DESKTOP_API_TOKEN_FILE") or ""
+        ).strip()
+        if token_file:
+            try:
+                token = Path(token_file).read_text(encoding="utf-8").strip()
+            except OSError:
+                token = ""
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def fetch_login_desktop_asset(asset_path: str, query: str = ""):
     safe_path = quote(str(asset_path or "vnc.html").lstrip("/"), safe="/._-")
     url = f"{login_desktop_novnc_http_url()}/{safe_path}"
@@ -284,7 +296,7 @@ def fetch_login_desktop_asset(asset_path: str, query: str = ""):
 def call_login_desktop(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20) -> dict:
     url = f"{login_desktop_api_url()}{path}"
     data = None
-    headers = {}
+    headers = login_desktop_api_headers()
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"
@@ -355,34 +367,55 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
     if not unique_id or not username or not cookies:
         raise RuntimeError("Exported login result is incomplete")
 
-    accounts, _ = ensure_account_refs(get_userData(force_reload=True))
+    def mutate(accounts):
+        for item in accounts:
+            if not str(item.get("account_ref", "")).strip():
+                item["account_ref"] = f"acc-{uuid.uuid4().hex}"
 
-    if relogin_account_ref or relogin_unique_id:
-        target = account_by_ref(accounts, relogin_account_ref) if relogin_account_ref else find_account(accounts, relogin_unique_id)
-        if not target:
-            raise RuntimeError("Target account not found for relogin")
-        target["unique_id"] = unique_id
-        target["username"] = username
-        target["cookies"] = cookies
-        target.setdefault("enabled", True)
-        _dedupe_account_records(accounts, unique_id=unique_id, keep_ref=target.get("account_ref", ""))
-        save_userData(accounts)
-        return target, "updated"
+        if relogin_account_ref or relogin_unique_id:
+            target = (
+                account_by_ref(accounts, relogin_account_ref)
+                if relogin_account_ref
+                else find_account(accounts, relogin_unique_id)
+            )
+            if not target:
+                raise RuntimeError("Target account not found for relogin")
+            target["unique_id"] = unique_id
+            target["username"] = username
+            target["cookies"] = cookies
+            target.setdefault("enabled", True)
+            _dedupe_account_records(
+                accounts,
+                unique_id=unique_id,
+                keep_ref=target.get("account_ref", ""),
+            )
+            return dict(target), "updated", True
 
-    existing = find_account(accounts, unique_id)
-    if existing:
-        existing["username"] = username
-        existing["cookies"] = cookies
-        existing.setdefault("enabled", True)
-        _dedupe_account_records(accounts, unique_id=unique_id, keep_ref=existing.get("account_ref", ""))
-        save_userData(accounts)
-        return existing, "updated"
+        existing = find_account(accounts, unique_id)
+        if existing:
+            existing["username"] = username
+            existing["cookies"] = cookies
+            existing.setdefault("enabled", True)
+            _dedupe_account_records(
+                accounts,
+                unique_id=unique_id,
+                keep_ref=existing.get("account_ref", ""),
+            )
+            return dict(existing), "updated", True
 
-    account = upsert_user_account(unique_id, username, cookies, [])
-    accounts, _ = ensure_account_refs(get_userData(force_reload=True))
-    _dedupe_account_records(accounts, unique_id=unique_id, keep_ref=account.get("account_ref", ""))
-    save_userData(accounts)
-    return account, "created"
+        account = {
+            "account_ref": f"acc-{uuid.uuid4().hex}",
+            "unique_id": unique_id,
+            "username": username,
+            "cookies": cookies,
+            "targets": [],
+            "enabled": True,
+        }
+        accounts.append(account)
+        return dict(account), "created", True
+
+    account, action, _ = update_user_data(mutate, force_reload=True)
+    return account, action
 
 
 def public_app_settings():
@@ -399,6 +432,89 @@ def public_app_settings():
         "login_desktop_public_port",
     )
     return {key: settings.get(key) for key in allowed_keys}
+
+
+def apply_runtime_config_form(config, form):
+    if "messageTemplate" in form:
+        config["messageTemplate"] = str(
+            form.get("messageTemplate", config.get("messageTemplate", ""))
+        )
+    if "multiTask" in form:
+        config["multiTask"] = str(form.get("multiTask", "")) == "on"
+    if "taskCount" in form:
+        config["taskCount"] = coerce_int(
+            form.get("taskCount", config.get("taskCount", 1)),
+            config.get("taskCount", 1),
+            1,
+        )
+    if "hitokotoTypes" in form:
+        raw_types = str(form.get("hitokotoTypes", ""))
+        config["hitokotoTypes"] = [
+            item.strip()
+            for item in raw_types.replace(",", "\n").splitlines()
+            if item.strip()
+        ]
+
+    send_strategy = config.get("sendStrategy", {}) or {}
+    if "shuffleTargets" in form:
+        send_strategy["shuffleTargets"] = str(form.get("shuffleTargets", "")) == "on"
+    if "accountStartDelaySecondsMin" in form:
+        send_strategy["accountStartDelaySecondsMin"] = coerce_int(
+            form.get(
+                "accountStartDelaySecondsMin",
+                send_strategy.get("accountStartDelaySecondsMin", 0),
+            ),
+            send_strategy.get("accountStartDelaySecondsMin", 0),
+            0,
+        )
+    if "accountStartDelaySecondsMax" in form:
+        send_strategy["accountStartDelaySecondsMax"] = coerce_int(
+            form.get(
+                "accountStartDelaySecondsMax",
+                send_strategy.get("accountStartDelaySecondsMax", 0),
+            ),
+            send_strategy.get("accountStartDelaySecondsMax", 0),
+            send_strategy.get("accountStartDelaySecondsMin", 0),
+        )
+    if "messageIntervalSecondsMin" in form:
+        send_strategy["messageIntervalSecondsMin"] = coerce_int(
+            form.get(
+                "messageIntervalSecondsMin",
+                send_strategy.get("messageIntervalSecondsMin", 0),
+            ),
+            send_strategy.get("messageIntervalSecondsMin", 0),
+            0,
+        )
+    if "messageIntervalSecondsMax" in form:
+        send_strategy["messageIntervalSecondsMax"] = coerce_int(
+            form.get(
+                "messageIntervalSecondsMax",
+                send_strategy.get("messageIntervalSecondsMax", 0),
+            ),
+            send_strategy.get("messageIntervalSecondsMax", 0),
+            send_strategy.get("messageIntervalSecondsMin", 0),
+        )
+    if "messageVariants" in form:
+        raw_variants = str(form.get("messageVariants", ""))
+        send_strategy["messageVariants"] = [
+            item.strip()
+            for item in raw_variants.replace("\r", "\n").split("\n")
+            if item.strip()
+        ]
+    config["sendStrategy"] = send_strategy
+
+    happy_new_year = config.get("happyNewYear", {})
+    if "happyNewYearEnabled" in form:
+        happy_new_year["enabled"] = str(form.get("happyNewYearEnabled", "")) == "on"
+    if "happyNewYearTemplate" in form:
+        happy_new_year["messageTemplate"] = str(
+            form.get(
+                "happyNewYearTemplate",
+                happy_new_year.get("messageTemplate", ""),
+            )
+        )
+    config["happyNewYear"] = happy_new_year
+    return config
 
 
 def create_app():
@@ -470,16 +586,7 @@ def create_app():
         return RedirectResponse(url=path, status_code=status_code)
 
     def principal(request):
-        resolved = current_principal(request)
-        if resolved:
-            return resolved
-        # Keep compatibility with older tests/signed sessions that only expose
-        # the legacy ``user`` value.
-        legacy_user = current_user(request)
-        admin_username = str(get_app_settings().get("admin_username", "admin")).strip() or "admin"
-        if legacy_user and str(legacy_user).casefold() == admin_username.casefold():
-            return {"username": admin_username, "role": "admin", "account_refs": [], "session_id": "", "enabled": True}
-        return None
+        return current_principal(request)
 
     def require_user(request):
         if not principal(request):
@@ -503,9 +610,25 @@ def create_app():
             return accounts, None, PlainTextResponse("Forbidden", status_code=403)
         return accounts, account, None
 
+    def mutate_account_for_request(request, unique_id, mutator):
+        current = principal(request)
+
+        def mutate(accounts):
+            account = account_by_unique_id(accounts, unique_id)
+            if not account:
+                return (None, None, 404), False
+            if not can_access_account(current, account):
+                return (None, None, 403), False
+            return (account, mutator(account, accounts), None), True
+
+        account, result, error = update_user_data(mutate, force_reload=True)
+        return account, result, error
+
     def principal_account_refs(request):
         current = principal(request)
-        if not current or current.get("role") == "admin":
+        if not current:
+            return set()
+        if current.get("role") == "admin":
             return None
         return list(current.get("account_refs", []))
 
@@ -546,8 +669,10 @@ def create_app():
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_page(request: Request):
-        if current_user(request):
+        if principal(request):
             return redirect("/")
+        if current_user(request):
+            clear_session(request)
         return render_template(
             request,
             "login.html",
@@ -596,6 +721,7 @@ def create_app():
             identity["username"],
             role=identity["role"],
             account_refs=identity.get("account_refs", []),
+            auth_version=identity.get("auth_version", 0),
         )
         flash(request, "Signed in successfully.", "success")
         return redirect("/")
@@ -607,7 +733,7 @@ def create_app():
 
     @app.get("/api/ops/overview")
     async def ops_overview(request: Request):
-        if not current_user(request):
+        if not principal(request):
             return JSONResponse(
                 {"error": "Unauthorized"},
                 status_code=401,
@@ -755,14 +881,24 @@ def create_app():
         username = str(form.get("username", "")).strip()
         targets = extract_targets_from_form(form)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
-        if access_error:
-            return access_error
-        if account:
+        def mutate(account, accounts):
+            del accounts
             account["username"] = username or account.get("username", "")
             account["targets"] = targets
             account["enabled"] = str(form.get("enabled", "")) == "on"
-            save_userData(accounts)
+            return None
+
+        account, _, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
+        if account:
             flash(request, f"Updated account {account['username']}.", "success")
         else:
             flash(request, "Account not found.", "error")
@@ -779,12 +915,21 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
-        if access_error:
-            return access_error
+        def mutate(account, accounts):
+            del accounts
+            account["enabled"] = not is_account_enabled(account)
+            return None
 
-        account["enabled"] = not is_account_enabled(account)
-        save_userData(accounts)
+        account, _, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
         flash(
             request,
             f"{account.get('username', 'Account')} 已{'启用' if account['enabled'] else '停用'}自动续火花。",
@@ -802,19 +947,34 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
+        _, account, access_error = account_for_request(request, unique_id)
         if access_error:
             return JSONResponse({"error": "Forbidden" if access_error.status_code == 403 else "Account not found."}, status_code=access_error.status_code)
 
         try:
             friends = await fetch_account_friends(account)
-            account["friends_cache"] = friends
-            account["friends_cache_updated_at"] = datetime.now().isoformat(timespec="seconds")
-            save_userData(accounts)
+            updated_at = datetime.now().isoformat(timespec="seconds")
+
+            def mutate(updated_account, accounts):
+                del accounts
+                updated_account["friends_cache"] = friends
+                updated_account["friends_cache_updated_at"] = updated_at
+                return None
+
+            _, _, access_error = mutate_account_for_request(
+                request,
+                unique_id,
+                mutate,
+            )
+            if access_error:
+                return JSONResponse(
+                    {"error": "Forbidden" if access_error == 403 else "Account not found."},
+                    status_code=access_error,
+                )
             return JSONResponse(
                 {
                     "friends": friends,
-                    "updated_at": account["friends_cache_updated_at"],
+                    "updated_at": updated_at,
                     "message": f"已刷新 {len(friends)} 个好友",
                 }
             )
@@ -831,12 +991,27 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
+        def mutate(account, accounts):
+            del account
+            accounts[:] = [
+                item
+                for item in accounts
+                if normalize_unique_id(item.get("unique_id"))
+                != normalize_unique_id(unique_id)
+            ]
+            return None
+
+        account, _, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+        )
         if access_error:
-            return access_error
-        updated_accounts = [item for item in accounts if normalize_unique_id(item.get("unique_id")) != normalize_unique_id(unique_id)]
-        if len(updated_accounts) != len(accounts):
-            save_userData(updated_accounts)
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
+        if account:
             flash(request, "Account deleted.", "success")
         else:
             flash(request, "Account not found.", "error")
@@ -911,13 +1086,22 @@ def create_app():
             flash(request, "Target is required.", "error")
             return redirect("/ops/send-console")
 
-        accounts, account, access_error = account_for_request(request, unique_id)
-        if access_error:
-            return access_error
+        def mutate(account, accounts):
+            del accounts
+            return mark_target_unconfirmed(account, target_name)
 
-        changed = mark_target_unconfirmed(account, target_name)
+        account, changed, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
+
         if changed:
-            save_userData(accounts)
             flash(request, f"已将 {account.get('username', 'Account')} / {target_name} 标记为待核验/待补发。", "warning")
         else:
             flash(request, f"{target_name} 已是强确认记录或不是今日记录，未自动重置。", "info")
@@ -933,20 +1117,26 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        accounts = get_userData(force_reload=True)
-        changed_count = 0
-        for account in accounts:
-            for target_name in list(account.get("targets") or []):
-                entry = dict(account.get("message_history") or {}).get(target_name) or {}
-                sent_at = _parse_sent_at(entry.get("sentAt"))
-                if not sent_at or sent_at.date() != datetime.now(_schedule_timezone()).date():
-                    continue
-                if _history_entry_strong_confirmed_today(entry):
-                    continue
-                if mark_target_unconfirmed(account, target_name, reason="batch_reset_today_suspicious_success"):
-                    changed_count += 1
+        def mutate(accounts):
+            changed_count = 0
+            for account in accounts:
+                for target_name in list(account.get("targets") or []):
+                    entry = dict(account.get("message_history") or {}).get(target_name) or {}
+                    sent_at = _parse_sent_at(entry.get("sentAt"))
+                    if not sent_at or sent_at.date() != datetime.now(_schedule_timezone()).date():
+                        continue
+                    if _history_entry_strong_confirmed_today(entry):
+                        continue
+                    if mark_target_unconfirmed(
+                        account,
+                        target_name,
+                        reason="batch_reset_today_suspicious_success",
+                    ):
+                        changed_count += 1
+            return changed_count, changed_count > 0
+
+        changed_count = update_user_data(mutate, force_reload=True)
         if changed_count:
-            save_userData(accounts)
             flash(request, f"已将 {changed_count} 条今日可疑成功记录标记为待核验/待补发。", "warning")
         else:
             flash(request, "没有找到需要重置的今日可疑成功记录。", "info")
@@ -962,58 +1152,11 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        config = get_config(force_reload=True)
-        if "messageTemplate" in form:
-            config["messageTemplate"] = str(form.get("messageTemplate", config.get("messageTemplate", "")))
-        if "multiTask" in form:
-            config["multiTask"] = str(form.get("multiTask", "")) == "on"
-        if "taskCount" in form:
-            config["taskCount"] = coerce_int(form.get("taskCount", config.get("taskCount", 1)), config.get("taskCount", 1), 1)
-        if "hitokotoTypes" in form:
-            raw_types = str(form.get("hitokotoTypes", ""))
-            config["hitokotoTypes"] = [item.strip() for item in raw_types.replace(",", "\n").splitlines() if item.strip()]
+        def mutate(config):
+            apply_runtime_config_form(config, form)
+            return None, True
 
-        send_strategy = config.get("sendStrategy", {}) or {}
-        if "shuffleTargets" in form:
-            send_strategy["shuffleTargets"] = str(form.get("shuffleTargets", "")) == "on"
-        if "accountStartDelaySecondsMin" in form:
-            send_strategy["accountStartDelaySecondsMin"] = coerce_int(
-                form.get("accountStartDelaySecondsMin", send_strategy.get("accountStartDelaySecondsMin", 0)),
-                send_strategy.get("accountStartDelaySecondsMin", 0),
-                0,
-            )
-        if "accountStartDelaySecondsMax" in form:
-            send_strategy["accountStartDelaySecondsMax"] = coerce_int(
-                form.get("accountStartDelaySecondsMax", send_strategy.get("accountStartDelaySecondsMax", 0)),
-                send_strategy.get("accountStartDelaySecondsMax", 0),
-                send_strategy.get("accountStartDelaySecondsMin", 0),
-            )
-        if "messageIntervalSecondsMin" in form:
-            send_strategy["messageIntervalSecondsMin"] = coerce_int(
-                form.get("messageIntervalSecondsMin", send_strategy.get("messageIntervalSecondsMin", 0)),
-                send_strategy.get("messageIntervalSecondsMin", 0),
-                0,
-            )
-        if "messageIntervalSecondsMax" in form:
-            send_strategy["messageIntervalSecondsMax"] = coerce_int(
-                form.get("messageIntervalSecondsMax", send_strategy.get("messageIntervalSecondsMax", 0)),
-                send_strategy.get("messageIntervalSecondsMax", 0),
-                send_strategy.get("messageIntervalSecondsMin", 0),
-            )
-        if "messageVariants" in form:
-            raw_variants = str(form.get("messageVariants", ""))
-            send_strategy["messageVariants"] = [
-                item.strip() for item in raw_variants.replace("\r", "\n").split("\n") if item.strip()
-            ]
-        config["sendStrategy"] = send_strategy
-
-        happy_new_year = config.get("happyNewYear", {})
-        if "happyNewYearEnabled" in form:
-            happy_new_year["enabled"] = str(form.get("happyNewYearEnabled", "")) == "on"
-        if "happyNewYearTemplate" in form:
-            happy_new_year["messageTemplate"] = str(form.get("happyNewYearTemplate", happy_new_year.get("messageTemplate", "")))
-        config["happyNewYear"] = happy_new_year
-        save_config(config)
+        update_config(mutate, force_reload=True)
 
         flash(request, "Runtime config saved.", "success")
         return redirect("/")
@@ -1200,7 +1343,6 @@ def create_app():
     async def _reset_and_promote(*, force=False, clear_queue=False):
         """Reset the shared browser profile, then activate the next queue item."""
         async with login_transition_lock:
-            state = get_workspace_state()
             if force:
                 transition = begin_login_force_reset(clear_queue=clear_queue)
             else:
@@ -1360,7 +1502,11 @@ def create_app():
             return lock_error
         url = f"{login_desktop_api_url()}/qr"
         try:
-            upstream_request = urllib.request.Request(url, method="GET")
+            upstream_request = urllib.request.Request(
+                url,
+                method="GET",
+                headers=login_desktop_api_headers(),
+            )
             def read_qr_response():
                 upstream = urllib.request.urlopen(upstream_request, timeout=20)
                 try:
@@ -1443,6 +1589,11 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return JSONResponse({"redirect": "/login"}, status_code=401)
+        current = principal(request)
+        if current.get("role") != "admin":
+            lock_error = login_lock_required(request, api=True)
+            if lock_error:
+                return lock_error
         await _expire_login_workspace()
         try:
             payload = call_login_desktop("/status")

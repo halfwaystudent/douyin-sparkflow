@@ -28,24 +28,34 @@ def is_bootstrapped():
     return bool(get_app_settings().get("admin_password_hash"))
 
 
+def _session_version(value):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def bootstrap_admin_password(password, username="admin"):
     settings = get_app_settings(force_reload=True)
     settings["admin_username"] = username.strip() or "admin"
     settings["admin_password_hash"] = hash_password(password)
+    settings["admin_session_version"] = _session_version(settings.get("admin_session_version")) + 1
     return save_app_settings(settings)
 
 
 def update_admin_password(password):
     settings = get_app_settings(force_reload=True)
     settings["admin_password_hash"] = hash_password(password)
+    settings["admin_session_version"] = _session_version(settings.get("admin_session_version")) + 1
     return save_app_settings(settings)
 
 
-def issue_session(request, username, *, role="admin", account_refs=None):
+def issue_session(request, username, *, role="admin", account_refs=None, auth_version=0):
     request.session.clear()
     request.session["user"] = username
     request.session["role"] = role
     request.session["account_refs"] = list(account_refs or [])
+    request.session["auth_version"] = _session_version(auth_version)
     request.session["session_id"] = secrets.token_urlsafe(24)
     request.session["csrf_token"] = secrets.token_urlsafe(24)
 
@@ -65,8 +75,12 @@ def current_principal(request):
         return None
     session_id = request.session.get("session_id", "")
     role = request.session.get("role")
+    session_version = _session_version(request.session.get("auth_version"))
     admin_username = str(get_app_settings().get("admin_username", "admin")).strip() or "admin"
     if role == "admin" or (role is None and username.casefold() == admin_username.casefold()):
+        settings = get_app_settings()
+        if session_version != _session_version(settings.get("admin_session_version")):
+            return None
         return {
             "username": admin_username,
             "role": "admin",
@@ -81,6 +95,8 @@ def current_principal(request):
     except Exception:
         user = None
     if user and user.get("enabled", True):
+        if session_version != _session_version(user.get("session_version")):
+            return None
         return {
             "username": user["username"],
             "role": "user",

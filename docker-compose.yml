@@ -40,6 +40,7 @@ services:
       SPARKFLOW_LOGIN_DESKTOP_PUBLIC_URL: ${LOGIN_DESKTOP_PUBLIC_URL:-/login-desktop/proxy/vnc.html?autoconnect=1&resize=scale&view_only=0&path=login-desktop/proxy/websockify}
       SPARKFLOW_LOGIN_DESKTOP_NOVNC_URL: http://login-desktop:6080
       SPARKFLOW_LOGIN_DESKTOP_NOVNC_WS_URL: ws://login-desktop:6080/websockify
+      SPARKFLOW_LOGIN_DESKTOP_API_TOKEN_FILE: /run/login-api/token
       SPARKFLOW_SESSION_COOKIE_SECURE: ${SPARKFLOW_SESSION_COOKIE_SECURE:-0}
       DOCKER_API_VERSION: ${DOCKER_API_VERSION:-}
     ports:
@@ -50,6 +51,7 @@ services:
       - ./DouYinSparkFlow/logs:/app/logs
       - /var/run/docker.sock:/var/run/docker.sock
       - ./state/cron:/host-spool-cron
+      - ./state/login-api:/run/login-api:ro
       - .:/opt/douyin-sparkflow
 
   login-desktop:
@@ -72,6 +74,8 @@ services:
       LOGIN_DESKTOP_PROXY: ${LOGIN_DESKTOP_PROXY:-http://proxy:7890}
       LOGIN_DESKTOP_PREFLIGHT_TIMEOUT_SECONDS: ${LOGIN_DESKTOP_PREFLIGHT_TIMEOUT_SECONDS:-15}
       LOGIN_DESKTOP_NETWORK_CACHE_SECONDS: ${LOGIN_DESKTOP_NETWORK_CACHE_SECONDS:-30}
+      LOGIN_DESKTOP_API_BIND_ADDRESS: "0.0.0.0"
+      LOGIN_DESKTOP_API_TOKEN_FILE: /run/login-api/token
 
     ports:
       - "${LOGIN_DESKTOP_BIND_ADDRESS:-127.0.0.1}:${LOGIN_DESKTOP_WEB_PORT:-8788}:6080"
@@ -83,6 +87,7 @@ services:
       - ./DouYinSparkFlow:/app
       - ./DouYinSparkFlow/logs:/app/logs
       - ./state/login-profile:/data/login-profile
+      - ./state/login-api:/run/login-api
 
   scheduler:
     image: douyin-sparkflow:local

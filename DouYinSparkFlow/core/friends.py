@@ -330,13 +330,25 @@ async def _fetch_account_friends_once(account, network_mode):
         raise RuntimeError(f"刷新好友列表失败，请重试：{exc}") from exc
     finally:
         if page:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                logger.debug("Failed to close friend refresh page", exc_info=True)
         if context:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                logger.debug("Failed to close friend refresh context", exc_info=True)
         if browser:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                logger.debug("Failed to close friend refresh browser", exc_info=True)
         if playwright:
-            await playwright.stop()
+            try:
+                await playwright.stop()
+            except Exception:
+                logger.debug("Failed to stop friend refresh Playwright", exc_info=True)
 
 
 async def fetch_account_friends(account):

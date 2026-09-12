@@ -4,17 +4,19 @@ import os
 import random
 import shutil
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from core.msg_builder import build_messages_for_targets
-from utils.config import get_userData, normalize_unique_id, repo_root, save_userData
+from utils.config import normalize_unique_id, repo_root, update_user_data
 from utils.logger import setup_logger
 
 
 logger = setup_logger()
 PROTOCOL_SCRIPT = repo_root() / "core" / "protocol_sender.mjs"
 NODE_HELPER_IMAGE = "node:22-alpine"
+DEFAULT_PROTOCOL_TIMEOUT_SECONDS = 1800
 
 
 def _coerce_non_negative_int(value, default):
@@ -22,6 +24,59 @@ def _coerce_non_negative_int(value, default):
         return max(0, int(value))
     except (TypeError, ValueError):
         return max(0, int(default))
+
+
+def _protocol_timeout_seconds():
+    raw = str(
+        os.getenv("SPARKFLOW_PROTOCOL_TIMEOUT_SECONDS")
+        or DEFAULT_PROTOCOL_TIMEOUT_SECONDS
+    ).strip()
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SPARKFLOW_PROTOCOL_TIMEOUT_SECONDS=%r, using %s",
+            raw,
+            DEFAULT_PROTOCOL_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_PROTOCOL_TIMEOUT_SECONDS
+
+
+def _build_protocol_target_identities(user, messages_by_target):
+    cache = [
+        dict(item)
+        for item in (user.get("protocol_targets_cache") or [])
+        if isinstance(item, dict)
+    ]
+    by_nickname = {}
+    for entry in cache:
+        nickname = str(entry.get("nickname") or "").strip()
+        if nickname:
+            by_nickname.setdefault(nickname, []).append(entry)
+
+    identities = {}
+    for target in (messages_by_target or {}):
+        target_name = str(target).strip()
+        matches = by_nickname.get(target_name) or []
+        if len(matches) > 1:
+            identities[target] = {"ambiguous": True}
+            continue
+        if len(matches) != 1:
+            continue
+        match = matches[0]
+        sec_uid = str(match.get("secUid") or "").strip()
+        peer_user_id = str(match.get("peerUserId") or "").strip()
+        if not sec_uid and not peer_user_id:
+            continue
+        identities[target] = {
+            key: value
+            for key, value in (
+                ("secUid", sec_uid),
+                ("peerUserId", peer_user_id),
+            )
+            if value
+        }
+    return identities
 
 
 def _normalize_send_strategy(config):
@@ -100,31 +155,42 @@ def _protocol_failure_reason(entry):
     return " ".join(bits)
 
 
+def _protocol_entry_succeeded(entry):
+    if entry.get("dryRun"):
+        return False
+    return (
+        entry.get("success") is True
+        and entry.get("statusCode") in (0, "0")
+    )
+
+
 def _persist_protocol_account_failure(account, category, reason, affected_targets=None):
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    all_accounts = get_userData(force_reload=True)
-    accounts_by_identity = {
-        identity: item
-        for item in all_accounts
-        for identity in [_account_identity_key(item)]
-        if identity
-    }
-    target_account = accounts_by_identity.get(_account_identity_key(account))
-    if not target_account:
-        return
-
     affected_targets = list(affected_targets or [])
-    existing_entry = dict(target_account.get("account_failure") or {})
-    target_account["account_failure"] = {
-        "category": category,
-        "reason": reason,
-        "firstAttemptAt": existing_entry.get("firstAttemptAt") or now_iso,
-        "lastAttemptAt": now_iso,
-        "attemptCount": _coerce_attempt_count(existing_entry) + 1,
-        "lastRunMode": "protocol",
-        "affectedTargets": affected_targets,
-    }
-    save_userData(all_accounts)
+
+    def mutate(all_accounts):
+        accounts_by_identity = {
+            identity: item
+            for item in all_accounts
+            for identity in [_account_identity_key(item)]
+            if identity
+        }
+        target_account = accounts_by_identity.get(_account_identity_key(account))
+        if not target_account:
+            return None, False
+        existing_entry = dict(target_account.get("account_failure") or {})
+        target_account["account_failure"] = {
+            "category": category,
+            "reason": reason,
+            "firstAttemptAt": existing_entry.get("firstAttemptAt") or now_iso,
+            "lastAttemptAt": now_iso,
+            "attemptCount": _coerce_attempt_count(existing_entry) + 1,
+            "lastRunMode": "protocol",
+            "affectedTargets": affected_targets,
+        }
+        return dict(target_account["account_failure"]), True
+
+    return update_user_data(mutate, force_reload=True)
 
 
 def _record_protocol_target_failure(target_account, target_name, message, category, reason):
@@ -143,10 +209,9 @@ def _record_protocol_target_failure(target_account, target_name, message, catego
     target_account["failure_queue"] = queue
 
 
-def _merge_protocol_runtime_state(accounts, result_by_username):
+def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
     changed = False
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    all_accounts = get_userData(force_reload=True)
     accounts_by_identity = {
         identity: account
         for account in all_accounts
@@ -171,7 +236,7 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
 
         history = dict(target_account.get("message_history") or {})
         for entry in result.get("sent", []):
-            if entry.get("dryRun") or not entry.get("success", True):
+            if not _protocol_entry_succeeded(entry):
                 continue
 
             target = str(entry.get("target", "")).strip()
@@ -182,14 +247,40 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
             history[target] = {
                 "message": message,
                 "sentAt": str(entry.get("sentAt", now_iso)),
+                "status": "confirmed",
+                "confirmationLevel": "strong",
+                "confirmationSource": "protocol_send_receipt",
+                "confirmationDetail": (
+                    f"statusCode={entry.get('statusCode')} "
+                    f"statusName={entry.get('statusName') or ''}"
+                ).strip(),
+                "needsVerification": False,
             }
+            failure_queue = dict(target_account.get("failure_queue") or {})
+            failure_queue.pop(target, None)
+            if failure_queue:
+                target_account["failure_queue"] = failure_queue
+            else:
+                target_account.pop("failure_queue", None)
+
+            account_failure = dict(target_account.get("account_failure") or {})
+            affected_targets = [
+                item
+                for item in (account_failure.get("affectedTargets") or [])
+                if str(item) != target
+            ]
+            if affected_targets:
+                account_failure["affectedTargets"] = affected_targets
+                target_account["account_failure"] = account_failure
+            elif account_failure:
+                target_account.pop("account_failure", None)
             changed = True
 
         if history:
             target_account["message_history"] = history
 
         for entry in result.get("sent", []):
-            if entry.get("dryRun") or entry.get("success", True):
+            if entry.get("dryRun") or _protocol_entry_succeeded(entry):
                 continue
             target = str(entry.get("target", "")).strip()
             if not target:
@@ -217,8 +308,19 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
             )
             changed = True
 
-    if changed:
-        save_userData(all_accounts)
+    return changed
+
+
+def _merge_protocol_runtime_state(accounts, result_by_username):
+    def mutate(all_accounts):
+        changed = _apply_protocol_runtime_state(
+            all_accounts,
+            accounts,
+            result_by_username,
+        )
+        return None, changed
+
+    update_user_data(mutate, force_reload=True)
 
 
 def _host_repo_root():
@@ -235,16 +337,25 @@ def _host_repo_root():
 def _build_protocol_command():
     node_path = shutil.which("node")
     if node_path:
-        return [node_path, str(PROTOCOL_SCRIPT)], repo_root(), "local-node", str(repo_root())
+        return (
+            [node_path, str(PROTOCOL_SCRIPT)],
+            repo_root(),
+            "local-node",
+            str(repo_root()),
+            None,
+        )
 
     docker_path = shutil.which("docker")
     if docker_path:
         host_repo = _host_repo_root()
+        container_name = f"sparkflow-protocol-{uuid.uuid4().hex[:12]}"
         return (
             [
                 docker_path,
                 "run",
                 "--rm",
+                "--name",
+                container_name,
                 "-i",
                 "--network",
                 "host",
@@ -259,28 +370,61 @@ def _build_protocol_command():
             repo_root(),
             "docker-node-helper",
             "/workspace",
+            container_name,
         )
 
     raise RuntimeError("Neither node nor docker is available for the protocol sender")
 
 
 def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
-    command, cwd, runner_label, runtime_repo_root = _build_protocol_command()
+    (
+        command,
+        cwd,
+        runner_label,
+        runtime_repo_root,
+        container_name,
+    ) = _build_protocol_command()
     payload = {
         "repoRoot": runtime_repo_root,
         "dryRun": dry_run,
         "account": user,
         "messagesByTarget": messages_by_target,
+        "targetIdentities": _build_protocol_target_identities(
+            user,
+            messages_by_target,
+        ),
         "sendStrategy": send_strategy,
     }
-    process = subprocess.run(
-        command,
-        input=json.dumps(payload, ensure_ascii=False),
-        text=True,
-        capture_output=True,
-        cwd=str(cwd),
-        check=False,
-    )
+    timeout_seconds = _protocol_timeout_seconds()
+    try:
+        process = subprocess.run(
+            command,
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            cwd=str(cwd),
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if container_name:
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning(
+                    "Failed to stop timed-out protocol container=%s",
+                    container_name,
+                )
+        raise RuntimeError(
+            f"{user.get('username', 'unknown')} protocol sender timed out "
+            f"after {timeout_seconds}s"
+        ) from exc
 
     stdout = (process.stdout or "").strip()
     if not stdout:

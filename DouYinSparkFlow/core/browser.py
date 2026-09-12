@@ -113,11 +113,20 @@ async def select_douyin_network_mode(target_url):
             failures.append(f"{network_mode}: {exc}")
         finally:
             if page:
-                await page.close()
+                try:
+                    await page.close()
+                except Exception:
+                    pass
             if browser:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
             if playwright:
-                await playwright.stop()
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
     raise RuntimeError(f"Douyin network preflight failed: {'; '.join(failures)}")
 
 
@@ -149,16 +158,24 @@ async def install_browser():
 
 async def get_browser(GUI=False, network_mode=None):
     configure_playwright_environment()
+    playwright = None
 
     try:
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(**_browser_launch_options(GUI, network_mode=network_mode))
         return playwright, browser
     except Exception as exc:
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
         if "Executable doesn't exist" in str(exc) and get_environment() != Environment.GITHUBACTION:
             console.print("[bold red]Playwright browser is missing.[/bold red]")
             await install_browser()
-            sys.exit(1)
+            raise RuntimeError(
+                "Playwright browser is missing; install Chromium before retrying"
+            ) from exc
         traceback.print_exc()
         raise
 
@@ -169,6 +186,7 @@ async def get_persistent_browser_context(profile_name, GUI=False, root=None, net
     profile_dir = browser_profile_root(root) / sanitize_profile_name(profile_name)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
+    playwright = None
     try:
         playwright = await async_playwright().start()
         launch_options = _browser_launch_options(GUI, network_mode=network_mode)
@@ -179,9 +197,16 @@ async def get_persistent_browser_context(profile_name, GUI=False, root=None, net
         )
         return playwright, context, profile_dir
     except Exception as exc:
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception:
+                pass
         if "Executable doesn't exist" in str(exc) and get_environment() != Environment.GITHUBACTION:
             console.print("[bold red]Playwright browser is missing.[/bold red]")
             await install_browser()
-            sys.exit(1)
+            raise RuntimeError(
+                "Playwright browser is missing; install Chromium before retrying"
+            ) from exc
         traceback.print_exc()
         raise

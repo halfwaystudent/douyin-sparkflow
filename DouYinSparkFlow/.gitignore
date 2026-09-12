@@ -9,4 +9,5 @@ webui_settings.json
 config.json
 
 webui_users.json
+*.lock
 .migration-backups/

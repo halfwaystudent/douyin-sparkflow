@@ -7,10 +7,13 @@ import logging
 import os
 import random
 import unicodedata
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from core.browser import (
     get_browser,
@@ -21,7 +24,12 @@ from core.browser import (
 from core.msg_builder import build_message, build_message_candidates
 from core.protocol_dispatch import run_protocol_tasks
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
-from utils.config import get_config, get_userData, normalize_unique_id, save_userData
+from utils.config import (
+    get_config,
+    get_userData,
+    normalize_unique_id,
+    update_user_data,
+)
 from utils.logger import setup_logger
 
 
@@ -112,11 +120,19 @@ def _normalize_send_strategy(active_config):
         message_max = message_min
 
     return {
+        "shuffleTargets": bool(raw.get("shuffleTargets", True)),
         "accountStartDelaySecondsMin": start_min,
         "accountStartDelaySecondsMax": start_max,
         "messageIntervalSecondsMin": message_min,
         "messageIntervalSecondsMax": message_max,
     }
+
+
+def _ordered_targets_for_run(targets, send_strategy):
+    ordered = list(targets or [])
+    if send_strategy.get("shuffleTargets", True):
+        random.shuffle(ordered)
+    return ordered
 
 
 def _normalize_persistent_profile_config(active_config):
@@ -362,14 +378,18 @@ async def refresh_stored_cookies_from_profile(context, user, account_name):
     if not cookies:
         return
 
-    accounts = get_userData(force_reload=True)
-    matched_account = _find_matching_account(accounts, user)
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        matched["cookies"] = list(cookies)
+        return matched, True
+
+    matched_account = update_user_data(mutate, force_reload=True)
     if matched_account is None:
         logger.warning("Could not find account to refresh cookies for user=%s", account_name)
         return
 
-    matched_account["cookies"] = list(cookies)
-    save_userData(accounts)
     user["cookies"] = list(cookies)
     logger.info("Refreshed stored cookies for %s from persistent profile count=%s", account_name, len(cookies))
 
@@ -1055,6 +1075,17 @@ def _build_normalized_target_map(targets):
     return normalized_targets
 
 
+def _normalized_target_order(targets):
+    ordered = []
+    seen = set()
+    for target in targets or []:
+        normalized_name = _normalize_target_name(_target_display_name(target))
+        if normalized_name and normalized_name not in seen:
+            seen.add(normalized_name)
+            ordered.append(normalized_name)
+    return ordered
+
+
 async def _locator_count_with_timeout(locator, account_name, stage, label, timeout_seconds=3):
     try:
         return await asyncio.wait_for(locator.count(), timeout=timeout_seconds)
@@ -1413,9 +1444,11 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
     await asyncio.sleep(2)
 
     normalized_targets = _build_normalized_target_map(targets)
+    target_order = _normalized_target_order(targets)
     normalized_index_targets = _build_normalized_target_map(index_targets or targets)
     found_usernames = set()
     remaining_targets = set(normalized_targets)
+    missing_delivery_targets = set()
     remaining_index_targets = set(normalized_index_targets)
     friend_index = {}
     scan_started_at = asyncio.get_running_loop().time()
@@ -1432,7 +1465,10 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
     )
 
     def missing_target_names():
-        return sorted(normalized_targets[item] for item in remaining_targets)
+        return sorted(
+            normalized_targets[item]
+            for item in (remaining_targets | missing_delivery_targets)
+        )
 
     def missing_index_target_names():
         return sorted(normalized_index_targets[item] for item in remaining_index_targets)
@@ -1445,6 +1481,17 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
             scan_complete=scan_complete,
             missing_targets=missing_index_target_names(),
         )
+
+    _, initial_scroll_element = await _first_scrollable_friends_element(
+        page,
+        scrollable_friends_selectors,
+    )
+    if initial_scroll_element:
+        await page.evaluate(
+            "(element) => { element.scrollTop = 0; }",
+            initial_scroll_element,
+        )
+        await asyncio.sleep(min(scroll_delay_seconds, 1))
 
     while True:
         now_monotonic = asyncio.get_running_loop().time()
@@ -1478,6 +1525,10 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
             continue
         target_elements = await target_locator.all()
         clicked_delivery_target = False
+        next_target_key = next(
+            (item for item in target_order if item in remaining_targets),
+            None,
+        )
 
         for element in target_elements:
             friend_record = await _extract_friend_record(element)
@@ -1489,16 +1540,17 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
             if not normalized_target_name:
                 continue
 
-            if normalized_target_name in found_usernames:
-                continue
-            found_usernames.add(normalized_target_name)
-            friend_index[normalized_target_name] = friend_record
-            remaining_index_targets.discard(normalized_target_name)
-            last_new_friend_at = asyncio.get_running_loop().time()
-            logger.debug("Account %s found friend entry %s", account_name, target_name)
+            if normalized_target_name not in found_usernames:
+                found_usernames.add(normalized_target_name)
+                friend_index[normalized_target_name] = friend_record
+                remaining_index_targets.discard(normalized_target_name)
+                last_new_friend_at = asyncio.get_running_loop().time()
+                logger.debug("Account %s found friend entry %s", account_name, target_name)
 
             matched_target_name = normalized_targets.get(normalized_target_name)
             if matched_target_name and normalized_target_name in remaining_targets:
+                if normalized_target_name != next_target_key:
+                    continue
                 await element.click()
                 logger.info("Account %s selected target friend %s", account_name, target_name)
                 if matched_target_name != target_name:
@@ -1530,6 +1582,17 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                     return
                 break
         if clicked_delivery_target:
+            if remaining_targets:
+                _, scrollable_element = await _first_scrollable_friends_element(
+                    page,
+                    scrollable_friends_selectors,
+                )
+                if scrollable_element:
+                    await page.evaluate(
+                        "(element) => { element.scrollTop = 0; }",
+                        scrollable_element,
+                    )
+                    await asyncio.sleep(min(scroll_delay_seconds, 1))
             continue
 
         if not remaining_targets and not remaining_index_targets:
@@ -1539,6 +1602,26 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
 
         else:
             if await _selector_visible(page, no_more_selectors):
+                if next_target_key:
+                    missing_delivery_targets.add(next_target_key)
+                    remaining_targets.discard(next_target_key)
+                    logger.warning(
+                        "Account %s could not find target %s; continuing with remaining targets",
+                        account_name,
+                        normalized_targets.get(next_target_key, next_target_key),
+                    )
+                    if remaining_targets:
+                        _, scrollable_element = await _first_scrollable_friends_element(
+                            page,
+                            scrollable_friends_selectors,
+                        )
+                        if scrollable_element:
+                            await page.evaluate(
+                                "(element) => { element.scrollTop = 0; }",
+                                scrollable_element,
+                            )
+                            await asyncio.sleep(min(scroll_delay_seconds, 1))
+                        continue
                 persist_index(True)
                 logger.warning(
                     "Account %s reached the end of the friend list. Missing delivery targets: %s; missing indexed targets=%s",
@@ -1550,6 +1633,27 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
 
             now_monotonic = asyncio.get_running_loop().time()
             if found_usernames and now_monotonic - last_new_friend_at > idle_scan_seconds:
+                if next_target_key:
+                    missing_delivery_targets.add(next_target_key)
+                    remaining_targets.discard(next_target_key)
+                    logger.warning(
+                        "Account %s did not find target %s before idle timeout; continuing",
+                        account_name,
+                        normalized_targets.get(next_target_key, next_target_key),
+                    )
+                    if remaining_targets:
+                        last_new_friend_at = now_monotonic
+                        _, scrollable_element = await _first_scrollable_friends_element(
+                            page,
+                            scrollable_friends_selectors,
+                        )
+                        if scrollable_element:
+                            await page.evaluate(
+                                "(element) => { element.scrollTop = 0; }",
+                                scrollable_element,
+                            )
+                            await asyncio.sleep(min(scroll_delay_seconds, 1))
+                        continue
                 persist_index(False)
                 logger.warning(
                     "Account %s friend list scan made no progress for %ss. Missing delivery targets: %s; missing indexed targets=%s; scannedFriends=%s",
@@ -1827,6 +1931,22 @@ def _scheduled_send_time(user, target_name, send_window, now):
     return start_of_window + timedelta(minutes=offset_minutes)
 
 
+def _window_boundary(now, hour):
+    if int(hour) == 24:
+        return now.replace(
+            hour=23,
+            minute=59,
+            second=59,
+            microsecond=0,
+        )
+    return now.replace(
+        hour=int(hour),
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
 def _select_due_targets(user, send_window, now):
     targets = list(user.get("targets") or [])
     if not send_window.get("enabled") or _is_manual_run():
@@ -1838,13 +1958,13 @@ def _select_due_targets(user, send_window, now):
         second=0,
         microsecond=0,
     )
-    window_end = now.replace(
-        hour=send_window["endHour"],
-        minute=0,
-        second=0,
-        microsecond=0,
+    window_end = _window_boundary(now, send_window["endHour"])
+    grace_minutes = (
+        0
+        if int(send_window["endHour"]) == 24
+        else send_window["scheduleIntervalMinutes"]
     )
-    window_grace_end = window_end + timedelta(minutes=send_window["scheduleIntervalMinutes"])
+    window_grace_end = window_end + timedelta(minutes=grace_minutes)
     if now < window_start or now > window_grace_end:
         already_sent = []
         pending_targets = []
@@ -2011,35 +2131,41 @@ def _coerce_attempt_count(entry):
 
 
 def _persist_account_send_failure(user, category, reason, attempted_at, affected_targets=None):
-    accounts = get_userData(force_reload=True)
-    matched_account = _find_matching_account(accounts, user)
-    if matched_account is None:
+    affected_targets = list(affected_targets or [])
+
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        existing_entry = dict(matched.get("account_failure") or {})
+        entry = {
+            "category": category,
+            "reason": reason,
+            "firstAttemptAt": existing_entry.get("firstAttemptAt") or attempted_at,
+            "lastAttemptAt": attempted_at,
+            "attemptCount": _coerce_attempt_count(existing_entry) + 1,
+            "lastRunMode": _current_run_mode(),
+            "affectedTargets": affected_targets,
+        }
+        failure_queue = dict(matched.get("failure_queue") or {})
+        for target_name in affected_targets:
+            failure_queue.pop(target_name, None)
+        if failure_queue:
+            matched["failure_queue"] = failure_queue
+        else:
+            matched.pop("failure_queue", None)
+        matched["account_failure"] = entry
+        return (dict(matched), dict(entry)), True
+
+    saved = update_user_data(mutate, force_reload=True)
+    if saved is None:
         logger.warning(
             "Could not find account to persist account-level browser failure for user=%s",
             user.get("username", "unknown"),
         )
         return
 
-    affected_targets = list(affected_targets or [])
-    existing_entry = dict(matched_account.get("account_failure") or {})
-    entry = {
-        "category": category,
-        "reason": reason,
-        "firstAttemptAt": existing_entry.get("firstAttemptAt") or attempted_at,
-        "lastAttemptAt": attempted_at,
-        "attemptCount": _coerce_attempt_count(existing_entry) + 1,
-        "lastRunMode": _current_run_mode(),
-        "affectedTargets": affected_targets,
-    }
-    failure_queue = dict(matched_account.get("failure_queue") or {})
-    for target_name in affected_targets:
-        failure_queue.pop(target_name, None)
-    if failure_queue:
-        matched_account["failure_queue"] = failure_queue
-    else:
-        matched_account.pop("failure_queue", None)
-    matched_account["account_failure"] = entry
-    save_userData(accounts)
+    matched_account, entry = saved
 
     user["account_failure"] = dict(entry)
     user_queue = dict(user.get("failure_queue") or {})
@@ -2059,50 +2185,56 @@ def _persist_account_send_failure(user, category, reason, attempted_at, affected
 
 
 def _clear_account_send_failure(user):
-    accounts = get_userData(force_reload=True)
-    matched_account = _find_matching_account(accounts, user)
-    changed = False
-    if matched_account is not None and matched_account.pop("account_failure", None) is not None:
-        changed = True
-    if changed:
-        save_userData(accounts)
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        changed = matched.pop("account_failure", None) is not None
+        return matched, changed
+
+    update_user_data(mutate, force_reload=True)
     user.pop("account_failure", None)
 
 
 def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, missing_targets=None):
-    accounts = get_userData(force_reload=True)
-    matched_account = _find_matching_account(accounts, user)
-    if matched_account is None:
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        existing_index = dict(matched.get("friend_index") or {})
+        for normalized_name, record in (friend_records or {}).items():
+            entry = dict(existing_index.get(normalized_name) or {})
+            entry.update(
+                {
+                    "visibleName": record.get("visibleName") or "",
+                    "normalizedName": normalized_name,
+                    "stableKeys": list(record.get("stableKeys") or []),
+                    "lastSeenAt": scanned_at,
+                }
+            )
+            existing_index[normalized_name] = entry
+
+        meta = {
+            "lastScanAt": scanned_at,
+            "lastScanComplete": bool(scan_complete),
+            "scannedCount": len(friend_records or {}),
+            "missingTargets": list(missing_targets or []),
+        }
+        matched["friend_index"] = existing_index
+        matched["friend_index_meta"] = meta
+        if scan_complete and friend_records:
+            matched.pop("account_failure", None)
+        return (dict(existing_index), dict(meta), dict(matched)), True
+
+    saved = update_user_data(mutate, force_reload=True)
+    if saved is None:
         logger.warning(
             "Could not find account to persist friend index for user=%s",
             user.get("username", "unknown"),
         )
         return
 
-    existing_index = dict(matched_account.get("friend_index") or {})
-    for normalized_name, record in (friend_records or {}).items():
-        entry = dict(existing_index.get(normalized_name) or {})
-        entry.update(
-            {
-                "visibleName": record.get("visibleName") or "",
-                "normalizedName": normalized_name,
-                "stableKeys": list(record.get("stableKeys") or []),
-                "lastSeenAt": scanned_at,
-            }
-        )
-        existing_index[normalized_name] = entry
-
-    meta = {
-        "lastScanAt": scanned_at,
-        "lastScanComplete": bool(scan_complete),
-        "scannedCount": len(friend_records or {}),
-        "missingTargets": list(missing_targets or []),
-    }
-    matched_account["friend_index"] = existing_index
-    matched_account["friend_index_meta"] = meta
-    if scan_complete and friend_records:
-        matched_account.pop("account_failure", None)
-    save_userData(accounts)
+    existing_index, meta, matched_account = saved
 
     user["friend_index"] = dict(existing_index)
     user["friend_index_meta"] = dict(meta)
@@ -2119,9 +2251,28 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
 
 
 def _persist_browser_send_failure(user, target_name, message, category, reason, attempted_at, server_receipt=None):
-    accounts = get_userData(force_reload=True)
-    matched_account = _find_matching_account(accounts, user)
-    if matched_account is None:
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        queue = dict(matched.get("failure_queue") or {})
+        existing_entry = dict(queue.get(target_name) or {})
+        queue[target_name] = {
+            "category": category,
+            "reason": reason,
+            "message": message,
+            "firstAttemptAt": existing_entry.get("firstAttemptAt") or attempted_at,
+            "lastAttemptAt": attempted_at,
+            "attemptCount": _coerce_attempt_count(existing_entry) + 1,
+            "lastRunMode": _current_run_mode(),
+        }
+        if server_receipt:
+            queue[target_name]["serverReceipt"] = server_receipt
+        matched["failure_queue"] = queue
+        return (dict(queue[target_name]), dict(matched)), True
+
+    saved = update_user_data(mutate, force_reload=True)
+    if saved is None:
         logger.warning(
             "Could not find account to persist browser send failure for user=%s target=%s",
             user.get("username", "unknown"),
@@ -2129,24 +2280,10 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         )
         return
 
-    queue = dict(matched_account.get("failure_queue") or {})
-    existing_entry = dict(queue.get(target_name) or {})
-    queue[target_name] = {
-        "category": category,
-        "reason": reason,
-        "message": message,
-        "firstAttemptAt": existing_entry.get("firstAttemptAt") or attempted_at,
-        "lastAttemptAt": attempted_at,
-        "attemptCount": _coerce_attempt_count(existing_entry) + 1,
-        "lastRunMode": _current_run_mode(),
-    }
-    if server_receipt:
-        queue[target_name]["serverReceipt"] = server_receipt
-    matched_account["failure_queue"] = queue
-    save_userData(accounts)
+    queue_entry, matched_account = saved
 
     user_queue = dict(user.get("failure_queue") or {})
-    user_queue[target_name] = dict(queue[target_name])
+    user_queue[target_name] = dict(queue_entry)
     user["failure_queue"] = user_queue
 
     logger.warning(
@@ -2159,16 +2296,6 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
 
 
 def _persist_browser_send_success(user, target_name, message, sent_at, server_receipt=None):
-    accounts = get_userData(force_reload=True)
-    matched_account = _find_matching_account(accounts, user)
-    if matched_account is None:
-        logger.warning(
-            "Could not find account to persist browser send history for user=%s target=%s",
-            user.get("username", "unknown"),
-            target_name,
-        )
-        return
-
     receipt_summary = ""
     if isinstance(server_receipt, dict):
         receipt_summary = "message_send http={} logid={}".format(
@@ -2186,17 +2313,31 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
     }
     if server_receipt:
         strong_entry["serverReceipt"] = server_receipt
-    history = dict(matched_account.get("message_history") or {})
-    history[target_name] = strong_entry
-    matched_account["message_history"] = history
-    queue = dict(matched_account.get("failure_queue") or {})
-    queue.pop(target_name, None)
-    if queue:
-        matched_account["failure_queue"] = queue
-    else:
-        matched_account.pop("failure_queue", None)
-    matched_account.pop("account_failure", None)
-    save_userData(accounts)
+
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        history = dict(matched.get("message_history") or {})
+        history[target_name] = dict(strong_entry)
+        matched["message_history"] = history
+        queue = dict(matched.get("failure_queue") or {})
+        queue.pop(target_name, None)
+        if queue:
+            matched["failure_queue"] = queue
+        else:
+            matched.pop("failure_queue", None)
+        matched.pop("account_failure", None)
+        return dict(matched), True
+
+    matched_account = update_user_data(mutate, force_reload=True)
+    if matched_account is None:
+        logger.warning(
+            "Could not find account to persist browser send history for user=%s target=%s",
+            user.get("username", "unknown"),
+            target_name,
+        )
+        return
 
     user_history = dict(user.get("message_history") or {})
     user_history[target_name] = dict(strong_entry)
@@ -2255,67 +2396,37 @@ def _pid_is_alive(pid):
     return True
 
 
-def _extract_lock_pid(raw):
-    for line in str(raw or "").splitlines():
-        if line.startswith("pid="):
-            try:
-                return int(line.split("=", 1)[1].strip())
-            except (TypeError, ValueError):
-                return None
-    try:
-        return int(str(raw or "").strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def _browser_account_lock_is_stale(lock_path, raw):
-    pid = _extract_lock_pid(raw)
-    if pid is not None and not _pid_is_alive(pid):
-        return True, f"missing pid={pid}"
-    try:
-        age_seconds = datetime.now(timezone.utc).timestamp() - lock_path.stat().st_mtime
-    except OSError:
-        return True, "missing lock file"
-    if age_seconds > 7200:
-        return True, f"older than 7200s pid={pid}"
-    return False, ""
-
-
 async def _acquire_browser_account_lock(user, account_name):
     lock_dir = Path("logs/browser-account-locks")
     lock_dir.mkdir(parents=True, exist_ok=True)
     identity = _account_identity(user) or account_name
     lock_path = lock_dir / f"{_safe_name(identity)}.lock"
+    guard = FileLock(f"{lock_path}.guard", timeout=0)
     started_at = asyncio.get_running_loop().time()
     last_logged_at = 0
 
     while True:
         try:
-            handle = lock_path.open("x", encoding="utf-8")
-            handle.write(
-                f"pid={os.getpid()}\n"
-                f"account={account_name}\n"
-                f"createdAt={datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
-            )
-            handle.flush()
-            logger.debug("Acquired browser account lock for %s at %s", account_name, lock_path)
-            return handle, lock_path
-        except FileExistsError:
-            raw = lock_path.read_text(encoding="utf-8", errors="ignore")
-            is_stale, stale_reason = _browser_account_lock_is_stale(lock_path, raw)
-            if is_stale:
-                logger.warning(
-                    "Removing stale browser account lock for %s at %s: %s",
-                    account_name,
-                    lock_path,
-                    stale_reason,
+            guard.acquire()
+            token = uuid.uuid4().hex
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "token": token,
+                        "account": account_name,
+                        "createdAt": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                    },
+                    ensure_ascii=False,
                 )
-                try:
-                    lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-
+                + "\n",
+                encoding="utf-8",
+            )
+            logger.debug("Acquired browser account lock for %s at %s", account_name, lock_path)
+            return guard, lock_path, token
+        except FileLockTimeout:
             now = asyncio.get_running_loop().time()
             if now - started_at > 7200:
                 raise RuntimeError(f"timed out waiting for browser account lock for {account_name}")
@@ -2327,16 +2438,27 @@ async def _acquire_browser_account_lock(user, account_name):
                 )
                 last_logged_at = now
             await asyncio.sleep(5)
+        except Exception:
+            guard.release()
+            raise
 
 
-def _release_browser_account_lock(handle, lock_path, account_name):
+def _release_browser_account_lock(handle, lock_path, token, account_name):
     try:
-        handle.close()
+        try:
+            current = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            current = {}
+        if str(current.get("token") or "") == token:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
     finally:
         try:
-            lock_path.unlink()
+            handle.release()
             logger.debug("Released browser account lock for %s at %s", account_name, lock_path)
-        except FileNotFoundError:
+        except Exception:
             pass
 
 
@@ -2398,8 +2520,10 @@ async def run_browser_tasks(active_config, browser_user_data):
 
         await asyncio.gather(*tasks)
     finally:
-        await playwright.stop()
-        await browser.close()
+        try:
+            await browser.close()
+        finally:
+            await playwright.stop()
 
 
 async def do_user_task(browser, user, semaphore, send_strategy, profile_config, friend_scan_config, network_mode):
@@ -2407,8 +2531,13 @@ async def do_user_task(browser, user, semaphore, send_strategy, profile_config, 
         account_name = user.get("username", "unknown")
         account_lock_handle = None
         account_lock_path = None
+        account_lock_token = None
         try:
-            account_lock_handle, account_lock_path = await _acquire_browser_account_lock(user, account_name)
+            (
+                account_lock_handle,
+                account_lock_path,
+                account_lock_token,
+            ) = await _acquire_browser_account_lock(user, account_name)
             timeout_seconds = _browser_account_timeout_seconds(
                 friend_scan_config,
                 len(user.get("targets") or []),
@@ -2446,12 +2575,17 @@ async def do_user_task(browser, user, semaphore, send_strategy, profile_config, 
                     )
         finally:
             if account_lock_handle is not None:
-                _release_browser_account_lock(account_lock_handle, account_lock_path, account_name)
+                _release_browser_account_lock(
+                    account_lock_handle,
+                    account_lock_path,
+                    account_lock_token,
+                    account_name,
+                )
 
 
 async def _do_user_task_locked(browser, user, send_strategy, profile_config, friend_scan_config, account_name, network_mode):
     cookies = user["cookies"]
-    targets = user["targets"]
+    targets = _ordered_targets_for_run(user["targets"], send_strategy)
     start_delay = _random_delay_seconds(
         send_strategy,
         "accountStartDelaySecondsMin",
@@ -2461,22 +2595,36 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
 
     owned_playwright = None
     profile_dir = None
-    if profile_config["enabled"]:
-        owned_playwright, context, profile_dir = await get_persistent_browser_context(
-            _account_profile_name(user),
-            root=profile_config["root"],
-        network_mode=network_mode,
-        )
-        logger.info("Opened persistent browser profile for %s at %s", account_name, profile_dir)
-        if profile_config["syncStoredCookiesBeforeRun"]:
-            await apply_stored_cookies_to_profile(context, cookies, account_name)
-        elif profile_config["seedCookiesWhenEmpty"]:
-            await apply_stored_cookies_to_profile(context, cookies, account_name, only_when_empty=True)
-    else:
-        context = await browser.new_context()
+    context = None
+    try:
+        if profile_config["enabled"]:
+            owned_playwright, context, profile_dir = await get_persistent_browser_context(
+                _account_profile_name(user),
+                root=profile_config["root"],
+                network_mode=network_mode,
+            )
+            logger.info("Opened persistent browser profile for %s at %s", account_name, profile_dir)
+            if profile_config["syncStoredCookiesBeforeRun"]:
+                await apply_stored_cookies_to_profile(context, cookies, account_name)
+            elif profile_config["seedCookiesWhenEmpty"]:
+                await apply_stored_cookies_to_profile(context, cookies, account_name, only_when_empty=True)
+        else:
+            context = await browser.new_context()
 
-    context.set_default_navigation_timeout(120000)
-    context.set_default_timeout(120000)
+        context.set_default_navigation_timeout(120000)
+        context.set_default_timeout(120000)
+    except Exception:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if owned_playwright is not None:
+            try:
+                await owned_playwright.stop()
+            except Exception:
+                pass
+        raise
     yielded_targets = set()
     page = None
 
@@ -2731,9 +2879,14 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
                 await page.close()
             except Exception:
                 pass
-        await context.close()
-        if owned_playwright is not None:
-            await owned_playwright.stop()
+        try:
+            await context.close()
+        finally:
+            if owned_playwright is not None:
+                try:
+                    await owned_playwright.stop()
+                except Exception:
+                    pass
 
 
 async def runTasks():
@@ -2784,50 +2937,43 @@ class TaskRunAlreadyInProgress(RuntimeError):
 
 
 @contextmanager
-def task_run_lock():
-    lock_path = Path("logs/task.run.lock")
+def task_run_lock(path=None):
+    lock_path = Path(path) if path is not None else Path("logs/task.run.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def _lock_owner_is_alive(pid):
-        return _pid_is_alive(pid)
-
-    while True:
-        try:
-            handle = lock_path.open("x", encoding="utf-8")
-            break
-        except FileExistsError as exc:
-            raw_pid = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
-            stale_pid = None
-            try:
-                stale_pid = int(raw_pid)
-            except (TypeError, ValueError):
-                stale_pid = None
-
-            if stale_pid is not None and not _lock_owner_is_alive(stale_pid):
-                logger.warning("Removing stale task lock owned by missing pid=%s", stale_pid)
-                try:
-                    lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-
-            if stale_pid is None:
-                logger.warning("Removing unreadable stale task lock with contents=%r", raw_pid)
-                try:
-                    lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-
-            raise TaskRunAlreadyInProgress("another task run is already in progress") from exc
-
+    guard = FileLock(f"{lock_path}.guard", timeout=0)
     try:
-        handle.write(f"{os.getpid()}\n")
-        handle.flush()
+        guard.acquire()
+    except FileLockTimeout as exc:
+        raise TaskRunAlreadyInProgress(
+            "another task run is already in progress"
+        ) from exc
+
+    token = uuid.uuid4().hex
+    temp_path = lock_path.with_name(f".{lock_path.name}.{token}.tmp")
+    metadata = json.dumps(
+        {
+            "pid": os.getpid(),
+            "token": token,
+            "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+        ensure_ascii=False,
+    )
+    try:
+        temp_path.write_text(metadata + "\n", encoding="utf-8")
+        os.replace(temp_path, lock_path)
         yield
     finally:
-        handle.close()
         try:
-            lock_path.unlink()
+            current = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            current = {}
+        if str(current.get("token") or "") == token:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            temp_path.unlink()
         except FileNotFoundError:
             pass
+        guard.release()

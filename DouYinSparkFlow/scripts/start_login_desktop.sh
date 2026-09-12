@@ -9,6 +9,13 @@ export LOGIN_DESKTOP_WEB_PORT="${LOGIN_DESKTOP_WEB_PORT:-8788}"
 
 mkdir -p /data/login-profile
 mkdir -p /app/logs/login_desktop
+if [ -n "${LOGIN_DESKTOP_API_TOKEN_FILE:-}" ]; then
+  mkdir -p "$(dirname "${LOGIN_DESKTOP_API_TOKEN_FILE}")"
+  if [ ! -s "${LOGIN_DESKTOP_API_TOKEN_FILE}" ]; then
+    umask 077
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${LOGIN_DESKTOP_API_TOKEN_FILE}"
+  fi
+fi
 
 pkill -f "Xvfb ${DISPLAY}" >/dev/null 2>&1 || true
 pkill -f "x11vnc .*${LOGIN_DESKTOP_VNC_PORT}" >/dev/null 2>&1 || true

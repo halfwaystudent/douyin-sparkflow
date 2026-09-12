@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import os
 import shutil
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 import uvicorn
 from playwright.async_api import async_playwright
 
@@ -61,6 +63,30 @@ GENERIC_WWW_NAMES = {
     "海量优质视频内容",
     "抖音精选电脑版",
 }
+
+
+def _api_bind_address():
+    return str(
+        os.getenv("LOGIN_DESKTOP_API_BIND_ADDRESS") or "127.0.0.1"
+    ).strip() or "127.0.0.1"
+
+
+def _is_loopback_bind(value):
+    host = str(value or "").strip().lower()
+    return host in {"127.0.0.1", "localhost", "::1"} or host.startswith("127.")
+
+
+def _load_api_token():
+    direct = str(os.getenv("LOGIN_DESKTOP_API_TOKEN") or "").strip()
+    if direct:
+        return direct
+    token_file = str(os.getenv("LOGIN_DESKTOP_API_TOKEN_FILE") or "").strip()
+    if not token_file:
+        return ""
+    try:
+        return Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 class LoginNetworkError(RuntimeError):
@@ -674,6 +700,36 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Douyin Login Desktop", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def authenticate_internal_api(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    expected_token = _load_api_token()
+    if expected_token:
+        authorization = request.headers.get("authorization", "")
+        prefix = "bearer "
+        provided = (
+            authorization[len(prefix):]
+            if authorization.lower().startswith(prefix)
+            else ""
+        )
+        if not provided or not hmac.compare_digest(expected_token, provided):
+            return JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+    elif not _is_loopback_bind(_api_bind_address()):
+        return JSONResponse(
+            {"detail": "Login desktop API token is not configured"},
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return await call_next(request)
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -962,4 +1018,9 @@ async def get_net_log():
     return {"count": len(_net_log), "capturing": _net_capturing, "log": _net_log.copy()}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("LOGIN_DESKTOP_API_PORT", "18090")), reload=False)
+    uvicorn.run(
+        app,
+        host=_api_bind_address(),
+        port=int(os.getenv("LOGIN_DESKTOP_API_PORT", "18090")),
+        reload=False,
+    )

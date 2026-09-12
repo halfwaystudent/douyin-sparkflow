@@ -12,8 +12,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from filelock import FileLock, Timeout as FileLockTimeout
+
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
-from utils.config import get_app_settings, get_config, get_userData, repo_root, save_config
+from utils.config import (
+    get_app_settings,
+    get_config,
+    get_userData,
+    repo_root,
+    update_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,7 @@ WINDOWED_SCHEDULE_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})/(\d+)m$", r
 CONFIRMATION_LABELS = {
     "cdp_message_send_receipt": "服务端回执",
     "browser_visible_count_increased": "页面回显",
+    "protocol_send_receipt": "协议发送回执",
     "legacy_sentAt_only": "旧记录待核验",
     "manual_reset": "人工标记待核验",
 }
@@ -104,17 +113,36 @@ def _pid_is_alive(pid):
 
 
 def _parse_lock_pid(raw):
+    text = str(raw or "").strip()
     try:
-        return int(str(raw or "").strip().splitlines()[0])
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("pid") is not None:
+        try:
+            return int(payload["pid"])
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(text.splitlines()[0])
     except (IndexError, TypeError, ValueError):
         return None
 
 
 def task_run_lock_status():
     lock_path = repo_root() / "logs" / "task.run.lock"
+    guard = FileLock(f"{lock_path}.guard", timeout=0)
+    try:
+        guard.acquire()
+    except FileLockTimeout:
+        locked = True
+    else:
+        locked = False
+        guard.release()
+
     if not lock_path.exists():
         return {
-            "running": False,
+            "running": locked,
             "path": str(lock_path),
             "pid": None,
             "ageSeconds": 0,
@@ -126,47 +154,44 @@ def task_run_lock_status():
     raw = lock_path.read_text(encoding="utf-8", errors="ignore")
     pid = _parse_lock_pid(raw)
     try:
-        age_seconds = max(0, int(datetime.now(timezone.utc).timestamp() - lock_path.stat().st_mtime))
+        age_seconds = max(
+            0,
+            int(datetime.now(timezone.utc).timestamp() - lock_path.stat().st_mtime),
+        )
     except OSError:
         return {
-            "running": False,
+            "running": locked,
             "path": str(lock_path),
             "pid": pid,
             "ageSeconds": 0,
-            "stale": True,
-            "staleReason": "lock_stat_failed",
+            "stale": not locked,
+            "staleReason": "lock_stat_failed" if not locked else "",
             "staleRemoved": False,
         }
 
-    if pid is not None and not _pid_is_alive(pid):
+    if locked:
         return {
-            "running": False,
+            "running": True,
             "path": str(lock_path),
             "pid": pid,
             "ageSeconds": age_seconds,
-            "stale": True,
-            "staleReason": "owner_pid_missing",
+            "stale": False,
+            "staleReason": "",
             "staleRemoved": False,
         }
 
-    if pid is None and age_seconds > 7200:
-        return {
-            "running": False,
-            "path": str(lock_path),
-            "pid": None,
-            "ageSeconds": age_seconds,
-            "stale": True,
-            "staleReason": "unreadable_lock",
-            "staleRemoved": False,
-        }
-
+    stale_reason = (
+        "owner_pid_missing"
+        if pid is not None and not _pid_is_alive(pid)
+        else "file_lock_released"
+    )
     return {
-        "running": True,
+        "running": False,
         "path": str(lock_path),
         "pid": pid,
         "ageSeconds": age_seconds,
-        "stale": False,
-        "staleReason": "",
+        "stale": True,
+        "staleReason": stale_reason,
         "staleRemoved": False,
     }
 
@@ -469,7 +494,11 @@ def parse_schedule_string(time_string):
         start_hour, start_minute, end_hour, end_minute, interval = [int(part) for part in match.groups()]
         if start_minute != 0 or end_minute != 0:
             raise ValueError("Window schedule must use whole hours, e.g. 10:00-18:00/10m")
-        if start_hour not in range(24) or end_hour not in range(24) or end_hour <= start_hour:
+        if (
+            start_hour not in range(24)
+            or end_hour not in range(1, 25)
+            or end_hour <= start_hour
+        ):
             raise ValueError("Window schedule is out of range")
         if interval not in range(1, 60):
             raise ValueError("Window schedule interval must be between 1 and 59 minutes")
@@ -508,18 +537,29 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
         updated.append(line)
 
     if schedule["mode"] == "window":
-        updated.append(
-            f"*/{schedule['scheduleIntervalMinutes']} {schedule['startHour']}-{schedule['endHour'] - 1} * * * "
-            f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
-        )
-        updated.append(
-            f"0 {schedule['endHour']} * * * "
-            f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
-        )
-        updated.append(
-            f"{schedule['scheduleIntervalMinutes']} {schedule['endHour']} * * * "
-            f"{fallback_command} >> /var/log/douyin-sparkflow.log 2>&1"
-        )
+        end_hour = schedule["endHour"]
+        if end_hour == 24:
+            updated.append(
+                f"*/{schedule['scheduleIntervalMinutes']} {schedule['startHour']}-23 * * * "
+                f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+            )
+            updated.append(
+                "59 23 * * * "
+                f"{fallback_command} >> /var/log/douyin-sparkflow.log 2>&1"
+            )
+        else:
+            updated.append(
+                f"*/{schedule['scheduleIntervalMinutes']} {schedule['startHour']}-{end_hour - 1} * * * "
+                f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+            )
+            updated.append(
+                f"0 {end_hour} * * * "
+                f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+            )
+            updated.append(
+                f"{schedule['scheduleIntervalMinutes']} {end_hour} * * * "
+                f"{fallback_command} >> /var/log/douyin-sparkflow.log 2>&1"
+            )
     else:
         updated.append(
             f"{schedule['minute']} {schedule['hour']} * * * "
@@ -534,21 +574,24 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
 
 def persist_schedule_config(time_string):
     parsed = parse_schedule_string(time_string)
-    config = get_config(force_reload=True)
-    window = dict(config.get("dailySendWindow") or {})
-    if parsed["mode"] == "window":
-        window.update(
-            {
-                "enabled": True,
-                "startHour": parsed["startHour"],
-                "endHour": parsed["endHour"],
-                "scheduleIntervalMinutes": parsed["scheduleIntervalMinutes"],
-            }
-        )
-    else:
-        window.update({"enabled": False})
-    config["dailySendWindow"] = window
-    save_config(config)
+
+    def mutate(config):
+        window = dict(config.get("dailySendWindow") or {})
+        if parsed["mode"] == "window":
+            window.update(
+                {
+                    "enabled": True,
+                    "startHour": parsed["startHour"],
+                    "endHour": parsed["endHour"],
+                    "scheduleIntervalMinutes": parsed["scheduleIntervalMinutes"],
+                }
+            )
+        else:
+            window.update({"enabled": False})
+        config["dailySendWindow"] = window
+        return None, True
+
+    update_config(mutate, force_reload=True)
 
 
 def update_daily_schedule(time_string):
@@ -635,9 +678,24 @@ def _next_window_trigger(now, window):
         for minute in range(0, 60, interval):
             candidates.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
     end_hour = int(window["endHour"])
-    candidates.append(now.replace(hour=end_hour, minute=0, second=0, microsecond=0))
-    if interval < 60:
-        candidates.append(now.replace(hour=end_hour, minute=interval, second=0, microsecond=0))
+    end_at = (
+        now.replace(
+            hour=23,
+            minute=59,
+            second=0,
+            microsecond=0,
+        )
+        if end_hour == 24
+        else now.replace(
+            hour=end_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    )
+    candidates.append(end_at)
+    if interval < 60 and end_hour != 24:
+        candidates.append(end_at + timedelta(minutes=interval))
     for candidate in sorted(set(candidates)):
         if candidate > now:
             return candidate

@@ -38,7 +38,7 @@ if [ -n "$proxy_sub_url" ]; then
   set_env_value ".env" "PROXY_SUB_URL" "$proxy_sub_url"
 fi
 
-mkdir -p proxy state/cron state/login-profile state/browser-profiles DouYinSparkFlow/logs
+mkdir -p proxy state/cron state/login-api state/login-profile state/browser-profiles DouYinSparkFlow/logs
 if [ ! -f "proxy/config.yaml" ]; then
   cp "proxy/config.example.yaml" "proxy/config.yaml"
 fi

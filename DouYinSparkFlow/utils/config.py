@@ -9,6 +9,8 @@ from copy import deepcopy
 from enum import Enum
 from pathlib import Path
 
+from filelock import FileLock
+
 from utils.logger import setup_logger
 
 
@@ -189,6 +191,10 @@ def _save_json_file(path, data):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     finally:
         try:
             os.unlink(temp_name)
@@ -208,6 +214,35 @@ def save_config(new_config):
     config = _merge_defaults(new_config, DEFAULT_CONFIG)
     _save_json_file(config_path(), config)
     return deepcopy(config)
+
+
+def update_config(
+    mutator,
+    *,
+    path=None,
+    force_reload=True,
+    timeout=30,
+    return_changed=False,
+):
+    target = Path(path) if path is not None else config_path()
+    with FileLock(f"{target}.lock", timeout=timeout):
+        current = (
+            _load_json_file(target, DEFAULT_CONFIG)
+            if path is not None
+            else get_config(force_reload=force_reload)
+        )
+        result = mutator(current)
+        changed = True
+        if isinstance(result, tuple) and len(result) == 2:
+            result, changed = result
+        if changed:
+            if path is None:
+                save_config(current)
+            else:
+                _save_json_file(target, _merge_defaults(current, DEFAULT_CONFIG))
+        if return_changed:
+            return deepcopy(result), changed
+        return deepcopy(result)
 
 
 def get_userData(force_reload=False):
@@ -236,6 +271,35 @@ def save_userData(accounts):
     return deepcopy(userData)
 
 
+def update_user_data(
+    mutator,
+    *,
+    path=None,
+    force_reload=True,
+    timeout=30,
+    return_changed=False,
+):
+    target = Path(path) if path is not None else users_data_path()
+    with FileLock(f"{target}.lock", timeout=timeout):
+        accounts = (
+            _load_json_file(target, [])
+            if path is not None
+            else get_userData(force_reload=force_reload)
+        )
+        result = mutator(accounts)
+        changed = True
+        if isinstance(result, tuple) and len(result) == 2:
+            result, changed = result
+        if changed:
+            if path is None:
+                save_userData(accounts)
+            else:
+                _save_json_file(target, accounts)
+        if return_changed:
+            return deepcopy(result), changed
+        return deepcopy(result)
+
+
 def normalize_unique_id(unique_id):
     if not unique_id:
         return ""
@@ -245,7 +309,6 @@ def normalize_unique_id(unique_id):
 
 def upsert_user_account(unique_id, username, cookies, targets, extra=None):
     unique_id = normalize_unique_id(unique_id)
-    accounts = get_userData(force_reload=True)
     payload = {
         "account_ref": f"acc-{uuid.uuid4().hex}",
         "unique_id": unique_id,
@@ -256,30 +319,40 @@ def upsert_user_account(unique_id, username, cookies, targets, extra=None):
     if extra:
         payload.update(extra)
 
-    for account in accounts:
-        if normalize_unique_id(account.get("unique_id")) == unique_id:
-            payload["account_ref"] = account.get("account_ref") or payload["account_ref"]
-            if "enabled" not in payload:
-                payload["enabled"] = account.get("enabled", True)
-            account.update(payload)
-            save_userData(accounts)
-            return account
+    def mutate(accounts):
+        for account in accounts:
+            if normalize_unique_id(account.get("unique_id")) == unique_id:
+                payload["account_ref"] = (
+                    account.get("account_ref") or payload["account_ref"]
+                )
+                if "enabled" not in payload:
+                    payload["enabled"] = account.get("enabled", True)
+                account.update(payload)
+                return deepcopy(account), True
 
-    if "enabled" not in payload:
-        payload["enabled"] = True
-    accounts.append(payload)
-    save_userData(accounts)
-    return payload
+        if "enabled" not in payload:
+            payload["enabled"] = True
+        accounts.append(payload)
+        return deepcopy(payload), True
+
+    return update_user_data(mutate, force_reload=True)
 
 
 def delete_user_account(unique_id):
     normalized_id = normalize_unique_id(unique_id)
-    accounts = get_userData(force_reload=True)
-    remaining = [item for item in accounts if normalize_unique_id(item.get("unique_id")) != normalized_id]
-    removed = len(accounts) != len(remaining)
-    if removed:
-        save_userData(remaining)
-    return removed
+
+    def mutate(accounts):
+        remaining = [
+            item
+            for item in accounts
+            if normalize_unique_id(item.get("unique_id")) != normalized_id
+        ]
+        removed = len(accounts) != len(remaining)
+        if removed:
+            accounts[:] = remaining
+        return removed, removed
+
+    return update_user_data(mutate, force_reload=True)
 
 
 def get_app_settings(force_reload=False):

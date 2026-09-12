@@ -140,6 +140,11 @@ class WebUiSafetyTests(unittest.TestCase):
         client = TestClient(app_module.app)
         with (
             patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(
+                app_module,
+                "current_principal",
+                return_value={"username": "admin", "role": "admin", "account_refs": [], "session_id": "session-1"},
+            ),
             patch.object(app_module, "validate_csrf", return_value=True),
             patch.object(app_module, "call_login_desktop", return_value={}) as call_login,
         ):
@@ -222,6 +227,11 @@ class WebUiSafetyTests(unittest.TestCase):
 
         with (
             patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(
+                app_module,
+                "current_principal",
+                return_value={"username": "admin", "role": "admin", "account_refs": [], "session_id": "session-1"},
+            ),
             patch.object(app_module, "get_login_lock", return_value={"username": "admin", "session_id": ""}),
             patch.object(app_module, "owns_login_lock", return_value=True),
             patch.object(
@@ -233,7 +243,7 @@ class WebUiSafetyTests(unittest.TestCase):
             response = client.get("/login-desktop/proxy/vnc.html?autoconnect=1")
 
         self.assertEqual(200, response.status_code)
-        self.assertEqual("text/html", response.headers["content-type"])
+        self.assertTrue(response.headers["content-type"].startswith("text/html"))
         self.assertIn("noVNC", response.text)
         fetch_asset.assert_called_once_with("vnc.html", "autoconnect=1")
 
@@ -246,6 +256,11 @@ class WebUiSafetyTests(unittest.TestCase):
         upstream.read.return_value = b"fake-png"
         with (
             patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(
+                app_module,
+                "current_principal",
+                return_value={"username": "admin", "role": "admin", "account_refs": [], "session_id": "session-1"},
+            ),
             patch.object(app_module, "get_login_lock", return_value={"username": "admin", "session_id": ""}),
             patch.object(app_module, "owns_login_lock", return_value=True),
             patch.object(app_module.urllib.request, "urlopen", return_value=upstream),
@@ -317,6 +332,11 @@ class WebUiSafetyTests(unittest.TestCase):
 
         with (
             patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(
+                app_module,
+                "current_principal",
+                return_value={"username": "admin", "role": "admin", "account_refs": [], "session_id": "session-1"},
+            ),
             patch.object(
                 app_module,
                 "get_overview_snapshot",

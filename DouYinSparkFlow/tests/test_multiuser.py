@@ -1,11 +1,9 @@
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from webui import login_lock, users
-from webui.auth import hash_password
 
 
 class MultiUserTests(unittest.TestCase):
