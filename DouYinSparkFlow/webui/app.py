@@ -231,6 +231,8 @@ def login_desktop_display_mode() -> str:
     settings = get_app_settings(force_reload=True)
     configured = os.getenv("SPARKFLOW_LOGIN_DESKTOP_MODE") or settings.get("login_desktop_mode")
     mode = str(configured or ("native" if os.name == "nt" else "novnc")).strip().lower()
+    if mode == "native" and os.name != "nt":
+        return "novnc"
     return mode if mode in {"native", "novnc"} else "novnc"
 
 

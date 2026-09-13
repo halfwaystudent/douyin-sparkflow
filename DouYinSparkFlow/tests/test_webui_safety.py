@@ -39,6 +39,7 @@ class WebUiSafetyTests(unittest.TestCase):
     def test_missing_optional_runtime_tools_do_not_log_warnings(self):
         with (
             patch.object(ops.subprocess, "run", side_effect=FileNotFoundError("missing")),
+            patch.object(ops, "running_in_container", return_value=False),
             patch.object(ops.logger, "warning") as warning,
             patch.object(ops.logger, "debug") as debug,
         ):
