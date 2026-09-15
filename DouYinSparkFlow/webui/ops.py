@@ -894,12 +894,10 @@ def _finalize_target_status(item, now):
 
 
 def _build_target_status(account, target_name, now, send_window):
-    history = dict(account.get("message_history") or {})
-    failure_queue = dict(account.get("failure_queue") or {})
     item = _base_target_status(account, target_name, now)
     state = streak_state.target_state(account, target_name, now)
 
-    history_entry = dict(history.get(target_name) or {})
+    history_entry = streak_state.history_entry(account, target_name, now.tzinfo)
     sent_at = _parse_sent_at(history_entry.get("sentAt"), now.tzinfo)
     if streak_state.is_send_confirmed(account, target_name, now):
         state_sent_at = _parse_sent_at(state.get("sentAt"), now.tzinfo)
@@ -947,7 +945,7 @@ def _build_target_status(account, target_name, now, send_window):
         )
         return _finalize_target_status(item, now)
 
-    failure_entry = dict(failure_queue.get(target_name) or {})
+    failure_entry = streak_state.failure_entry(account, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"), now.tzinfo)
     failure_is_today = bool(last_attempt_at and last_attempt_at.date() == now.date())
 

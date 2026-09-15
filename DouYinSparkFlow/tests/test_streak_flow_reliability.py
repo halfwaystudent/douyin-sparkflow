@@ -160,6 +160,42 @@ class StreakTargetIdentityTests(unittest.TestCase):
             streak_state.target_state(account, "Alice", NOW)["status"],
         )
 
+    def test_mixed_naive_and_aware_timestamps_order_correctly(self):
+        now = NOW.replace(hour=0, minute=45)
+        account = {
+            "username": "demo",
+            "targets": ["Alice"],
+            "target_refs": {
+                "Alice": "sec:sec-1",
+                "Alice Mid": "sec:sec-1",
+            },
+            "message_history": {
+                "Alice": {
+                    "sentAt": "2026-09-15T00:00:00",
+                    "status": "sent_unverified",
+                    "confirmationLevel": "weak",
+                },
+                "Alice Mid": {
+                    "sentAt": "2026-09-15T00:30:00+08:00",
+                    "status": "confirmed",
+                    "confirmationLevel": "strong",
+                },
+            },
+            "failure_queue": {
+                "Alice": {
+                    "lastAttemptAt": "2026-09-15T00:15:00+08:00",
+                    "category": "browser_timeout",
+                }
+            },
+        }
+
+        streak_state.reconcile_account(account, now)
+
+        self.assertEqual(
+            "send_confirmed",
+            streak_state.target_state(account, "Alice", now)["status"],
+        )
+
 
 class StreakStateMachineTests(unittest.TestCase):
     def test_in_flight_lease_expires_without_becoming_confirmed(self):
@@ -630,6 +666,34 @@ class StreakTaskIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual("failed", item["status"])
+
+    def test_send_console_reads_failure_from_alias_ref(self):
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice New"],
+            "target_refs": {
+                "Alice": "sec:sec-1",
+                "Alice New": "sec:sec-1",
+            },
+            "failure_queue": {
+                "Alice": {
+                    "category": "send_unconfirmed",
+                    "lastAttemptAt": NOW.isoformat(timespec="seconds"),
+                    "attemptCount": 1,
+                }
+            },
+        }
+
+        item = web_ops._build_target_status(
+            account,
+            "Alice New",
+            NOW,
+            {"enabled": False},
+        )
+
+        self.assertEqual("unconfirmed", item["status"])
+        self.assertEqual("send_unconfirmed", item["category"])
 
     def test_protocol_exception_still_runs_selected_fallback(self):
         user = {

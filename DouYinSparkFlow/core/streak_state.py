@@ -191,6 +191,16 @@ def resolve_target_ref(account, target_name):
     return ref
 
 
+def history_entry(account, target_name, tz=None):
+    target_ref = resolve_target_ref(account, target_name)
+    return _legacy_history_entry(account, target_name, target_ref, tz)
+
+
+def failure_entry(account, target_name, tz=None):
+    target_ref = resolve_target_ref(account, target_name)
+    return _legacy_failure_entry(account, target_name, target_ref, tz)
+
+
 def target_display_name(account, target_ref):
     for name, ref in (_ref_bucket(account) or {}).items():
         if ref == target_ref:
@@ -199,7 +209,7 @@ def target_display_name(account, target_ref):
     return str(state.get("displayName") or target_ref).strip()
 
 
-def _legacy_history_entry(account, target_name, target_ref):
+def _legacy_history_entry(account, target_name, target_ref, tz=None):
     history = account.get("message_history") or {}
     aliases = _legacy_aliases(account, target_name, target_ref)
     entries = [
@@ -207,10 +217,10 @@ def _legacy_history_entry(account, target_name, target_ref):
         for alias in aliases
         if alias in history
     ]
-    return _latest_entry(entries, "sentAt")
+    return _latest_entry(entries, "sentAt", tz=tz)
 
 
-def _legacy_failure_entry(account, target_name, target_ref):
+def _legacy_failure_entry(account, target_name, target_ref, tz=None):
     failures = account.get("failure_queue") or {}
     aliases = _legacy_aliases(account, target_name, target_ref)
     entries = [
@@ -218,7 +228,7 @@ def _legacy_failure_entry(account, target_name, target_ref):
         for alias in aliases
         if alias in failures
     ]
-    return _latest_entry(entries, "lastAttemptAt")
+    return _latest_entry(entries, "lastAttemptAt", tz=tz)
 
 
 def _legacy_aliases(account, target_name, target_ref):
@@ -232,13 +242,13 @@ def _legacy_aliases(account, target_name, target_ref):
     return list(dict.fromkeys(alias for alias in aliases if alias))
 
 
-def _latest_entry(entries, *time_keys):
+def _latest_entry(entries, *time_keys, tz=None):
     best = {}
     best_time = None
     for entry in entries or []:
         parsed = None
         for key in time_keys:
-            parsed = _parse_time(entry.get(key))
+            parsed = _parse_time(entry.get(key), tz)
             if parsed is not None:
                 break
         if not best or (
@@ -280,8 +290,8 @@ def _upgrade_state_key(account, old_ref, new_ref):
 
 
 def _state_from_legacy(account, target_name, target_ref, now):
-    history = _legacy_history_entry(account, target_name, target_ref)
-    failure = _legacy_failure_entry(account, target_name, target_ref)
+    history = _legacy_history_entry(account, target_name, target_ref, now.tzinfo)
+    failure = _legacy_failure_entry(account, target_name, target_ref, now.tzinfo)
     history_time = _parse_time(history.get("sentAt"), now.tzinfo)
     failure_time = _parse_time(failure.get("lastAttemptAt"), now.tzinfo)
     state = {
