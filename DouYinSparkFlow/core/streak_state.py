@@ -282,6 +282,8 @@ def _upgrade_state_key(account, old_ref, new_ref):
 def _state_from_legacy(account, target_name, target_ref, now):
     history = _legacy_history_entry(account, target_name, target_ref)
     failure = _legacy_failure_entry(account, target_name, target_ref)
+    history_time = _parse_time(history.get("sentAt"), now.tzinfo)
+    failure_time = _parse_time(failure.get("lastAttemptAt"), now.tzinfo)
     state = {
         "targetRef": target_ref,
         "displayName": target_name,
@@ -310,8 +312,16 @@ def _state_from_legacy(account, target_name, target_ref, now):
                 history.get("confirmationDetail") or ""
             )
     if failure:
-        last_attempt = _parse_time(failure.get("lastAttemptAt"), now.tzinfo)
-        if last_attempt and last_attempt.date() == now.date():
+        failure_is_newer = bool(
+            failure_time
+            and (history_time is None or failure_time > history_time)
+        )
+        if (
+            failure_time
+            and failure_time.date() == now.date()
+            and failure_is_newer
+            and state.get("status") not in CONFIRMED_STATES
+        ):
             category = str(failure.get("category") or "")
             state["status"] = (
                 STATE_FAILED_TERMINAL

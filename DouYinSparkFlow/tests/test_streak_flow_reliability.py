@@ -132,6 +132,34 @@ class StreakTargetIdentityTests(unittest.TestCase):
         )
         self.assertTrue(streak_state.is_send_confirmed(account, "Alice New", NOW))
 
+    def test_older_failure_does_not_override_newer_confirmation(self):
+        account = {
+            "username": "demo",
+            "targets": ["Alice"],
+            "message_history": {
+                "Alice": {
+                    "sentAt": NOW.isoformat(timespec="seconds"),
+                    "status": "confirmed",
+                    "confirmationLevel": "strong",
+                }
+            },
+            "failure_queue": {
+                "Alice": {
+                    "lastAttemptAt": (NOW - timedelta(hours=1)).isoformat(
+                        timespec="seconds"
+                    ),
+                    "category": "browser_timeout",
+                }
+            },
+        }
+
+        streak_state.reconcile_account(account, NOW)
+
+        self.assertEqual(
+            "send_confirmed",
+            streak_state.target_state(account, "Alice", NOW)["status"],
+        )
+
 
 class StreakStateMachineTests(unittest.TestCase):
     def test_in_flight_lease_expires_without_becoming_confirmed(self):
@@ -571,6 +599,37 @@ class StreakTaskIntegrationTests(unittest.TestCase):
         self.assertEqual("sent", item["status"])
         self.assertEqual("send_confirmed", item["sendState"])
         self.assertFalse(item["needsVerification"])
+
+    def test_send_console_does_not_reuse_previous_day_confirmation(self):
+        next_day = NOW + timedelta(days=1)
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        streak_state.mark_send_confirmed(
+            account,
+            "Alice",
+            strategy="protocol",
+            now=NOW,
+        )
+        account["failure_queue"] = {
+            "Alice": {
+                "category": "browser_timeout",
+                "lastAttemptAt": next_day.isoformat(timespec="seconds"),
+                "attemptCount": 1,
+            }
+        }
+
+        item = web_ops._build_target_status(
+            account,
+            "Alice",
+            next_day,
+            {"enabled": False},
+        )
+
+        self.assertEqual("failed", item["status"])
 
     def test_protocol_exception_still_runs_selected_fallback(self):
         user = {

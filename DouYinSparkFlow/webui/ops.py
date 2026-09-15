@@ -901,7 +901,7 @@ def _build_target_status(account, target_name, now, send_window):
 
     history_entry = dict(history.get(target_name) or {})
     sent_at = _parse_sent_at(history_entry.get("sentAt"), now.tzinfo)
-    if state.get("status") == streak_state.STATE_SEND_CONFIRMED:
+    if streak_state.is_send_confirmed(account, target_name, now):
         state_sent_at = _parse_sent_at(state.get("sentAt"), now.tzinfo)
         item.update(
             {
@@ -921,7 +921,7 @@ def _build_target_status(account, target_name, now, send_window):
             }
         )
         return _finalize_target_status(item, now)
-    if state.get("status") == streak_state.STATE_STREAK_VERIFIED:
+    if streak_state.is_streak_verified(account, target_name, now):
         item.update(
             {
                 "status": "sent",
