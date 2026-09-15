@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core import streak_state
 from core.msg_builder import build_messages_for_targets
 from utils.config import normalize_unique_id, repo_root, update_user_data
 from utils.logger import setup_logger
@@ -211,7 +212,8 @@ def _record_protocol_target_failure(target_account, target_name, message, catego
 
 def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
     changed = False
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
     accounts_by_identity = {
         identity: account
         for account in all_accounts
@@ -232,6 +234,7 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
         if protocol_cache is not None:
             target_account["protocol_targets_cache"] = protocol_cache
             target_account["protocol_user_id"] = result.get("userId", "")
+            streak_state.reconcile_account(target_account, now)
             changed = True
 
         history = dict(target_account.get("message_history") or {})
@@ -274,6 +277,14 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
                 target_account["account_failure"] = account_failure
             elif account_failure:
                 target_account.pop("account_failure", None)
+            streak_state.mark_send_confirmed(
+                target_account,
+                target,
+                strategy="protocol",
+                now=now,
+                source="protocol_send_receipt",
+                detail=str(entry.get("statusName") or entry.get("statusCode") or ""),
+            )
             changed = True
 
         if history:
@@ -292,6 +303,16 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
                 _protocol_failure_category(entry),
                 _protocol_failure_reason(entry),
             )
+            category = _protocol_failure_category(entry)
+            streak_state.mark_failed(
+                target_account,
+                target,
+                category=category,
+                reason=_protocol_failure_reason(entry),
+                retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
+                now=now,
+                strategy="protocol",
+            )
             changed = True
 
         unresolved = result.get("unresolved", []) or []
@@ -306,6 +327,16 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
                 str(entry.get("reason") or "protocol_unresolved"),
                 str(entry.get("reason") or "protocol could not resolve target"),
             )
+            category = str(entry.get("reason") or "protocol_unresolved")
+            streak_state.mark_failed(
+                target_account,
+                target,
+                category=category,
+                reason="protocol could not resolve target",
+                retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
+                now=now,
+                strategy="protocol",
+            )
             changed = True
 
     return changed
@@ -319,6 +350,49 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
             result_by_username,
         )
         return None, changed
+
+    update_user_data(mutate, force_reload=True)
+
+
+def _mark_protocol_targets_in_flight(user, run_id):
+    now = datetime.now(timezone.utc)
+
+    def mutate(accounts):
+        matched = streak_state.find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        for target_name in user.get("targets") or []:
+            streak_state.mark_in_flight(
+                matched,
+                target_name,
+                run_id=run_id,
+                strategy="protocol",
+                now=now,
+            )
+        return None, True
+
+    update_user_data(mutate, force_reload=True)
+
+
+def _mark_protocol_targets_failed(user, category, reason):
+    now = datetime.now(timezone.utc)
+    retryable = str(category or "") not in streak_state.TERMINAL_FAILURE_CATEGORIES
+
+    def mutate(accounts):
+        matched = streak_state.find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        for target_name in user.get("targets") or []:
+            streak_state.mark_failed(
+                matched,
+                target_name,
+                category=category,
+                reason=reason,
+                retryable=retryable,
+                now=now,
+                strategy="protocol",
+            )
+        return None, True
 
     update_user_data(mutate, force_reload=True)
 
@@ -450,7 +524,7 @@ def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
     return data
 
 
-async def run_protocol_tasks(config, accounts, message_builder):
+async def run_protocol_tasks(config, accounts, message_builder, run_id=""):
     del message_builder
 
     dry_run = bool(config.get("protocolDryRun", False))
@@ -474,6 +548,8 @@ async def run_protocol_tasks(config, accounts, message_builder):
                 await asyncio.sleep(start_delay)
 
             logger.info("Starting protocol sender for %s", user.get("username", "unknown"))
+            if run_id:
+                _mark_protocol_targets_in_flight(user, run_id)
             messages_by_target = build_messages_for_targets(
                 user.get("targets", []),
                 previous_messages=user.get("message_history", {}),
@@ -530,6 +606,11 @@ async def run_protocol_tasks(config, accounts, message_builder):
                 "protocol_sender_failed",
                 reason,
                 user.get("targets", []),
+            )
+            _mark_protocol_targets_failed(
+                user,
+                "protocol_sender_failed",
+                reason,
             )
             continue
         result_by_username[user.get("username")] = item

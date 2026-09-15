@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
+from core import streak_state
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
 from utils.config import (
     get_app_settings,
@@ -40,6 +41,7 @@ CONFIRMATION_LABELS = {
     "cdp_message_send_receipt": "服务端回执",
     "browser_visible_count_increased": "页面回显",
     "protocol_send_receipt": "协议发送回执",
+    "streak_verified": "续火花已核验",
     "legacy_sentAt_only": "旧记录待核验",
     "manual_reset": "人工标记待核验",
 }
@@ -842,6 +844,8 @@ def _scheduled_send_time(user, target_name, send_window, now):
 def _base_target_status(account, target_name, now):
     return {
         "target": target_name,
+        "targetRef": streak_state.resolve_target_ref(account, target_name),
+        "sendState": streak_state.target_state(account, target_name, now).get("status") or "",
         "status": "",
         "message": "",
         "sentAt": "",
@@ -893,9 +897,23 @@ def _build_target_status(account, target_name, now, send_window):
     history = dict(account.get("message_history") or {})
     failure_queue = dict(account.get("failure_queue") or {})
     item = _base_target_status(account, target_name, now)
+    state = streak_state.target_state(account, target_name, now)
 
     history_entry = dict(history.get(target_name) or {})
     sent_at = _parse_sent_at(history_entry.get("sentAt"), now.tzinfo)
+    if state.get("status") == streak_state.STATE_STREAK_VERIFIED:
+        item.update(
+            {
+                "status": "sent",
+                "message": str(history_entry.get("message") or ""),
+                "sentAt": sent_at.isoformat(timespec="seconds") if sent_at else "",
+                "confirmationLevel": "verified",
+                "confirmationSource": "streak_verified",
+                "confirmationDetail": str(state.get("lastEvidenceDetail") or ""),
+                "needsVerification": False,
+            }
+        )
+        return _finalize_target_status(item, now)
     if _history_entry_is_strong_confirmed(history_entry, sent_at, now):
         item.update(
             {

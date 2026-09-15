@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from core import streak_state
+
 
 def parse_sent_at(raw_value, local_tz):
     if not raw_value:
@@ -42,6 +44,8 @@ def history_entry_is_strong_confirmed_today(entry, now):
 
 
 def target_is_strong_confirmed_today(account, target_name, now):
+    if streak_state.is_send_confirmed(account, target_name, now):
+        return True
     history = dict(account.get("message_history") or {})
     return history_entry_is_strong_confirmed_today(history.get(target_name), now)
 
