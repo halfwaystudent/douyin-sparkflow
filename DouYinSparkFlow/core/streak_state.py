@@ -161,8 +161,6 @@ def resolve_target_ref(account, target_name):
 
     refs = _ref_bucket(account)
     cached = str(refs.get(target_name) or "").strip()
-    if cached:
-        return cached
 
     normalized = _normalize_key(target_name)
     protocol_matches = [
@@ -174,6 +172,7 @@ def resolve_target_ref(account, target_name):
     if len(protocol_matches) == 1:
         ref = _ref_from_record(protocol_matches[0])
         if ref:
+            _upgrade_state_key(account, cached, ref)
             refs[target_name] = ref
             return ref
 
@@ -181,8 +180,13 @@ def resolve_target_ref(account, target_name):
         (account.get("friend_index") or {}).get(normalized) or {}
     )
     ref = _ref_from_record(friend_entry)
-    if not ref:
-        ref = f"nickname:{normalized}"
+    if ref:
+        _upgrade_state_key(account, cached, ref)
+        refs[target_name] = ref
+        return ref
+    if cached:
+        return cached
+    ref = f"nickname:{normalized}"
     refs[target_name] = ref
     return ref
 
@@ -198,19 +202,23 @@ def target_display_name(account, target_ref):
 def _legacy_history_entry(account, target_name, target_ref):
     history = account.get("message_history") or {}
     aliases = _legacy_aliases(account, target_name, target_ref)
-    for alias in aliases:
-        if alias in history:
-            return dict(history.get(alias) or {})
-    return {}
+    entries = [
+        dict(history.get(alias) or {})
+        for alias in aliases
+        if alias in history
+    ]
+    return _latest_entry(entries, "sentAt")
 
 
 def _legacy_failure_entry(account, target_name, target_ref):
     failures = account.get("failure_queue") or {}
     aliases = _legacy_aliases(account, target_name, target_ref)
-    for alias in aliases:
-        if alias in failures:
-            return dict(failures.get(alias) or {})
-    return {}
+    entries = [
+        dict(failures.get(alias) or {})
+        for alias in aliases
+        if alias in failures
+    ]
+    return _latest_entry(entries, "lastAttemptAt")
 
 
 def _legacy_aliases(account, target_name, target_ref):
@@ -224,12 +232,51 @@ def _legacy_aliases(account, target_name, target_ref):
     return list(dict.fromkeys(alias for alias in aliases if alias))
 
 
+def _latest_entry(entries, *time_keys):
+    best = {}
+    best_time = None
+    for entry in entries or []:
+        parsed = None
+        for key in time_keys:
+            parsed = _parse_time(entry.get(key))
+            if parsed is not None:
+                break
+        if not best or (
+            parsed is not None
+            and (best_time is None or parsed > best_time)
+        ):
+            best = dict(entry)
+            best_time = parsed
+    return best
+
+
 def _state_event_time(state):
     for key in ("confirmedAt", "verifiedAt", "sentAt"):
         parsed = _parse_time(dict(state or {}).get(key))
         if parsed is not None:
             return parsed
     return None
+
+
+def _upgrade_state_key(account, old_ref, new_ref):
+    old_ref = str(old_ref or "")
+    new_ref = str(new_ref or "")
+    if not old_ref or not new_ref or old_ref == new_ref:
+        return
+    states = _state_bucket(account)
+    old_state = states.get(old_ref)
+    if not isinstance(old_state, dict):
+        return
+    new_state = states.get(new_ref)
+    old_time = _state_event_time(old_state)
+    new_time = _state_event_time(new_state) if isinstance(new_state, dict) else None
+    if not isinstance(new_state, dict) or (old_time and (not new_time or old_time > new_time)):
+        states[new_ref] = old_state
+    states.pop(old_ref, None)
+    refs = _ref_bucket(account)
+    for name, ref in list(refs.items()):
+        if str(ref or "") == old_ref:
+            refs[name] = new_ref
 
 
 def _state_from_legacy(account, target_name, target_ref, now):
@@ -284,7 +331,12 @@ def _receipt_is_strong(receipt):
         http_status = int(receipt.get("httpStatus") or 0)
     except (TypeError, ValueError):
         http_status = 0
-    return bool(receipt.get("ok")) and 200 <= http_status < 300
+    call = str(receipt.get("call") or "").strip()
+    return (
+        bool(receipt.get("ok"))
+        and 200 <= http_status < 300
+        and call == "message_send"
+    )
 
 
 def receipt_is_strong(receipt):

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from core import protocol_dispatch, streak_state, tasks
+from webui import ops as web_ops
 
 
 NOW = datetime(2026, 9, 15, 11, 0, tzinfo=timezone(timedelta(hours=8)))
@@ -73,6 +74,64 @@ class StreakTargetIdentityTests(unittest.TestCase):
         self.assertEqual("send_confirmed", state["status"])
         self.assertTrue(streak_state.is_send_confirmed(account, "Alice New", NOW))
 
+    def test_nickname_ref_upgrades_when_stable_identity_appears(self):
+        account = {
+            "username": "demo",
+            "targets": ["Alice"],
+            "target_refs": {"Alice": "nickname:alice"},
+            "target_states": {
+                "nickname:alice": {
+                    "targetRef": "nickname:alice",
+                    "displayName": "Alice",
+                    "status": "send_confirmed",
+                    "sentAt": NOW.isoformat(timespec="seconds"),
+                }
+            },
+            "protocol_targets_cache": [
+                {"nickname": "Alice", "secUid": "sec-1", "peerUserId": "1001"}
+            ],
+        }
+
+        ref = streak_state.resolve_target_ref(account, "Alice")
+
+        self.assertEqual("sec:sec-1", ref)
+        self.assertNotIn("nickname:alice", account["target_states"])
+        self.assertEqual(
+            "send_confirmed",
+            account["target_states"]["sec:sec-1"]["status"],
+        )
+
+    def test_latest_alias_history_wins_during_migration(self):
+        account = {
+            "username": "demo",
+            "targets": ["Alice New"],
+            "target_refs": {
+                "Alice": "sec:sec-1",
+                "Alice Mid": "sec:sec-1",
+                "Alice New": "sec:sec-1",
+            },
+            "message_history": {
+                "Alice": {
+                    "sentAt": (NOW - timedelta(days=1)).isoformat(timespec="seconds"),
+                    "status": "confirmed",
+                    "confirmationLevel": "strong",
+                },
+                "Alice Mid": {
+                    "sentAt": NOW.isoformat(timespec="seconds"),
+                    "status": "confirmed",
+                    "confirmationLevel": "strong",
+                },
+            },
+        }
+
+        streak_state.reconcile_account(account, NOW)
+
+        self.assertEqual(
+            "send_confirmed",
+            streak_state.target_state(account, "Alice New", NOW)["status"],
+        )
+        self.assertTrue(streak_state.is_send_confirmed(account, "Alice New", NOW))
+
 
 class StreakStateMachineTests(unittest.TestCase):
     def test_in_flight_lease_expires_without_becoming_confirmed(self):
@@ -126,6 +185,18 @@ class StreakStateMachineTests(unittest.TestCase):
 
         streak_state.mark_streak_verified(account, "Alice", now=NOW)
         self.assertTrue(streak_state.is_streak_verified(account, "Alice", NOW))
+
+    def test_receipt_requires_message_send_call(self):
+        self.assertFalse(
+            streak_state.receipt_is_strong(
+                {"ok": True, "httpStatus": 200, "call": "profile"}
+            )
+        )
+        self.assertTrue(
+            streak_state.receipt_is_strong(
+                {"ok": True, "httpStatus": 200, "call": "message_send"}
+            )
+        )
 
     def test_confirmed_state_expires_on_the_next_day(self):
         account = {"username": "demo", "targets": ["Alice"]}
@@ -468,6 +539,38 @@ class StreakTaskIntegrationTests(unittest.TestCase):
 
         self.assertEqual(["healthy"], [user["username"] for user in runnable])
         persist.assert_called_once()
+
+    def test_send_console_keeps_confirmed_state_over_weak_failure_queue(self):
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        streak_state.mark_send_confirmed(
+            account,
+            "Alice",
+            strategy="protocol",
+            now=NOW,
+        )
+        account["failure_queue"] = {
+            "Alice": {
+                "category": "browser_timeout",
+                "lastAttemptAt": NOW.isoformat(timespec="seconds"),
+                "attemptCount": 1,
+            }
+        }
+
+        item = web_ops._build_target_status(
+            account,
+            "Alice",
+            NOW,
+            {"enabled": False},
+        )
+
+        self.assertEqual("sent", item["status"])
+        self.assertEqual("send_confirmed", item["sendState"])
+        self.assertFalse(item["needsVerification"])
 
     def test_protocol_exception_still_runs_selected_fallback(self):
         user = {
