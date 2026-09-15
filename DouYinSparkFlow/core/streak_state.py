@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import unicodedata
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -196,12 +197,39 @@ def target_display_name(account, target_ref):
 
 def _legacy_history_entry(account, target_name, target_ref):
     history = account.get("message_history") or {}
-    return dict(history.get(target_name) or history.get(target_ref) or {})
+    aliases = _legacy_aliases(account, target_name, target_ref)
+    for alias in aliases:
+        if alias in history:
+            return dict(history.get(alias) or {})
+    return {}
 
 
 def _legacy_failure_entry(account, target_name, target_ref):
     failures = account.get("failure_queue") or {}
-    return dict(failures.get(target_name) or failures.get(target_ref) or {})
+    aliases = _legacy_aliases(account, target_name, target_ref)
+    for alias in aliases:
+        if alias in failures:
+            return dict(failures.get(alias) or {})
+    return {}
+
+
+def _legacy_aliases(account, target_name, target_ref):
+    aliases = [normalize_target_name(target_name), str(target_ref or "")]
+    for name, ref in (_ref_bucket(account) or {}).items():
+        if str(ref or "") == str(target_ref or ""):
+            aliases.append(name)
+    state = _state_bucket(account).get(str(target_ref or "")) or {}
+    if state.get("displayName"):
+        aliases.append(str(state.get("displayName")))
+    return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _state_event_time(state):
+    for key in ("confirmedAt", "verifiedAt", "sentAt"):
+        parsed = _parse_time(dict(state or {}).get(key))
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _state_from_legacy(account, target_name, target_ref, now):
@@ -257,6 +285,10 @@ def _receipt_is_strong(receipt):
     except (TypeError, ValueError):
         http_status = 0
     return bool(receipt.get("ok")) and 200 <= http_status < 300
+
+
+def receipt_is_strong(receipt):
+    return _receipt_is_strong(receipt)
 
 
 def _attempt_count(entry):
@@ -333,6 +365,13 @@ def mark_in_flight(
 ):
     now = _now(now)
     state = _state_for_write(account, target_name, now)
+    event_time = _state_event_time(state)
+    if (
+        state.get("status") in CONFIRMED_STATES
+        and event_time
+        and event_time.astimezone(now.tzinfo).date() == now.date()
+    ):
+        return deepcopy(state)
     state.update(
         {
             "status": STATE_IN_FLIGHT,
@@ -360,6 +399,13 @@ def mark_sent_unverified(
 ):
     now = _now(now)
     state = _state_for_write(account, target_name, now)
+    event_time = _state_event_time(state)
+    if (
+        state.get("status") in CONFIRMED_STATES
+        and event_time
+        and event_time.astimezone(now.tzinfo).date() == now.date()
+    ):
+        return deepcopy(state)
     state.update(
         {
             "status": STATE_SENT_UNVERIFIED,
@@ -433,6 +479,13 @@ def mark_failed(
 ):
     now = _now(now)
     state = _state_for_write(account, target_name, now)
+    event_time = _state_event_time(state)
+    if (
+        state.get("status") in CONFIRMED_STATES
+        and event_time
+        and event_time.astimezone(now.tzinfo).date() == now.date()
+    ):
+        return deepcopy(state)
     state.update(
         {
             "status": (
@@ -464,25 +517,40 @@ def mark_fallback_attempted(account, target_name, *, now=None, strategy="browser
 
 
 def fallback_eligible(account, target_name, now=None):
+    now = _now(now)
     state = target_state(account, target_name, now)
+    fallback_at = _parse_time(state.get("fallbackAt"), now.tzinfo)
     return bool(
         state.get("status") == STATE_FAILED_RETRYABLE
-        and not state.get("fallbackAttempted")
+        and not (fallback_at and fallback_at.date() == now.date())
     )
 
 
 def is_send_confirmed(account, target_name, now=None):
-    return target_state(account, target_name, now).get("status") in CONFIRMED_STATES
+    now = _now(now)
+    state = target_state(account, target_name, now)
+    if state.get("status") not in CONFIRMED_STATES:
+        return False
+    event_time = _state_event_time(state)
+    return bool(event_time and event_time.astimezone(now.tzinfo).date() == now.date())
 
 
 def is_streak_verified(account, target_name, now=None):
+    now = _now(now)
     state = target_state(account, target_name, now)
-    return state.get("status") == STATE_STREAK_VERIFIED
+    if state.get("status") != STATE_STREAK_VERIFIED:
+        return False
+    event_time = _parse_time(state.get("verifiedAt") or state.get("sentAt"))
+    return bool(event_time and event_time.astimezone(now.tzinfo).date() == now.date())
 
 
 def is_sent_unverified(account, target_name, now=None):
+    now = _now(now)
     state = target_state(account, target_name, now)
-    return state.get("status") == STATE_SENT_UNVERIFIED
+    if state.get("status") != STATE_SENT_UNVERIFIED:
+        return False
+    event_time = _parse_time(state.get("sentAt"))
+    return bool(event_time and event_time.astimezone(now.tzinfo).date() == now.date())
 
 
 def preflight_account(account, now=None, *, require_friend_index=False):
@@ -495,6 +563,29 @@ def preflight_account(account, now=None, *, require_friend_index=False):
             "healthy": False,
             "category": category,
             "reason": str(failure.get("reason") or category),
+        }
+    if account.get("account_identity_mismatch") or account.get("identity_mismatch"):
+        return {
+            "healthy": False,
+            "category": "account_identity_mismatch",
+            "reason": "login identity does not match the configured account",
+        }
+    if account.get("login_required") or account.get("needs_relogin"):
+        return {
+            "healthy": False,
+            "category": "login_required",
+            "reason": "account requires login",
+        }
+    network_route = str(
+        account.get("lastNetworkRoute")
+        or account.get("networkRoute")
+        or ""
+    ).strip().lower()
+    if network_route in {"unavailable", "failed"}:
+        return {
+            "healthy": False,
+            "category": "network_unavailable",
+            "reason": f"network route is {network_route}",
         }
     if not (account.get("cookies") or []):
         return {
@@ -559,7 +650,24 @@ def _redact_report(value):
         return redacted
     if isinstance(value, list):
         return [_redact_report(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
     return value
+
+
+def _redact_text(value):
+    text = str(value or "")
+    text = re.sub(
+        r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@",
+        r"\1[redacted]@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(token|sessionid|session|password|secret)=([^&\s]+)",
+        r"\1=[redacted]",
+        text,
+    )
+    return text
 
 
 def append_run_report(record, *, path=None, now=None):
@@ -584,6 +692,66 @@ def append_run_report(record, *, path=None, now=None):
         os.chmod(target, 0o600)
     except OSError:
         pass
+    return target
+
+
+def update_weekly_summary(records, *, directory=None, now=None):
+    now = _now(now)
+    root = (
+        Path(directory)
+        if directory is not None
+        else Path("logs") / "run_reports"
+    )
+    iso = now.isocalendar()
+    target = root / "weekly" / f"{iso.year}-W{iso.week:02d}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = f"{target}.lock"
+
+    def mutate():
+        try:
+            summary = json.loads(target.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            summary = {
+                "week": f"{iso.year}-W{iso.week:02d}",
+                "runs": 0,
+                "statusCounts": {},
+                "categoryCounts": {},
+                "confirmationSourceCounts": {},
+                "totalDurationMs": 0,
+            }
+        for record in records or []:
+            record = dict(record or {})
+            summary["runs"] = int(summary.get("runs") or 0) + 1
+            status = str(record.get("status") or "unknown")
+            category = str(record.get("category") or "none")
+            source = str(record.get("confirmationSource") or "none")
+            for key, value in (
+                ("statusCounts", status),
+                ("categoryCounts", category),
+                ("confirmationSourceCounts", source),
+            ):
+                bucket = summary.setdefault(key, {})
+                bucket[value] = int(bucket.get(value) or 0) + 1
+            try:
+                duration = max(0, int(record.get("durationMs") or 0))
+            except (TypeError, ValueError):
+                duration = 0
+            summary["totalDurationMs"] = int(summary.get("totalDurationMs") or 0) + duration
+        target.write_text(
+            json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+
+    if FileLock is not None:
+        with FileLock(lock, timeout=30):
+            mutate()
+    else:
+        mutate()
     return target
 
 

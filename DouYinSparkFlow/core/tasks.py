@@ -1954,20 +1954,8 @@ def _select_due_targets(user, send_window, now):
     if not send_window.get("enabled") or _is_manual_run():
         return targets, [], [], []
 
-    window_start = now.replace(
-        hour=send_window["startHour"],
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    window_end = _window_boundary(now, send_window["endHour"])
-    grace_minutes = (
-        0
-        if int(send_window["endHour"]) == 24
-        else send_window["scheduleIntervalMinutes"]
-    )
-    window_grace_end = window_end + timedelta(minutes=grace_minutes)
-    if now < window_start or now > window_grace_end:
+    phase = streak_state.schedule_phase(now, send_window)
+    if phase == "outside":
         already_sent = []
         pending_targets = []
         queued_failures = []
@@ -1990,13 +1978,48 @@ def _select_due_targets(user, send_window, now):
         if _target_sent_today(user, target_name, now):
             already_sent.append(target_name)
             continue
+        if _target_has_non_retryable_failure_today(user, target_name, now):
+            queued_failures.append(target_name)
+            continue
+        if phase == "fallback":
+            fallback_now = (
+                now - timedelta(days=1)
+                if now.hour < int(send_window["startHour"])
+                and int(send_window["endHour"]) == 24
+                else now
+            )
+            if _target_sent_today(user, target_name, fallback_now):
+                pending_targets.append(
+                    (
+                        target_name,
+                        _scheduled_send_time(user, target_name, send_window, now),
+                    )
+                )
+                continue
+            if _target_has_non_retryable_failure_today(
+                user,
+                target_name,
+                fallback_now,
+            ):
+                queued_failures.append(target_name)
+                continue
+            if account_paused:
+                pending_targets.append(
+                    (
+                        target_name,
+                        _scheduled_send_time(user, target_name, send_window, now),
+                    )
+                )
+            else:
+                due_targets.append(target_name)
+            continue
         if _target_failed_today(user, target_name, now):
             queued_failures.append(target_name)
             continue
         scheduled_at = _scheduled_send_time(user, target_name, send_window, now)
         if account_paused:
             pending_targets.append((target_name, scheduled_at))
-        elif now >= scheduled_at:
+        elif phase == "close-out" or now >= scheduled_at:
             due_targets.append(target_name)
         else:
             pending_targets.append((target_name, scheduled_at))
@@ -2018,7 +2041,11 @@ def _prepare_active_users_for_run(active_config, active_user_data):
         healthy_users = []
         checked_at = now.astimezone(timezone.utc).isoformat(timespec="seconds")
         for user in active_user_data:
-            preflight = streak_state.preflight_account(user, now)
+            preflight = streak_state.preflight_account(
+                user,
+                now,
+                require_friend_index=bool(user.get("friend_index_meta")),
+            )
             if not preflight.get("healthy"):
                 _persist_account_preflight(user, preflight, checked_at)
                 logger.warning(
@@ -2340,6 +2367,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
 
 def _persist_browser_send_success(user, target_name, message, sent_at, server_receipt=None):
     state_now = parse_sent_at(sent_at, timezone.utc) or datetime.now(timezone.utc)
+    strong_receipt = streak_state.receipt_is_strong(server_receipt)
     receipt_summary = ""
     if isinstance(server_receipt, dict):
         receipt_summary = "message_send http={} logid={}".format(
@@ -2349,15 +2377,15 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
     strong_entry = {
         "message": message,
         "sentAt": sent_at,
-        "status": "confirmed" if server_receipt else streak_state.STATE_SENT_UNVERIFIED,
-        "confirmationLevel": "strong" if server_receipt else "weak",
+        "status": "confirmed" if strong_receipt else streak_state.STATE_SENT_UNVERIFIED,
+        "confirmationLevel": "strong" if strong_receipt else "weak",
         "confirmationSource": (
             "cdp_message_send_receipt"
-            if server_receipt
+            if strong_receipt
             else "browser_visible_count_increased"
         ),
         "confirmationDetail": receipt_summary,
-        "needsVerification": not bool(server_receipt),
+        "needsVerification": not strong_receipt,
     }
     if server_receipt:
         strong_entry["serverReceipt"] = server_receipt
@@ -2376,7 +2404,7 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
         else:
             matched.pop("failure_queue", None)
         matched.pop("account_failure", None)
-        if server_receipt:
+        if strong_receipt:
             streak_state.mark_send_confirmed(
                 matched,
                 target_name,
@@ -2414,7 +2442,7 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
     else:
         user.pop("failure_queue", None)
     user.pop("account_failure", None)
-    if server_receipt:
+    if strong_receipt:
         streak_state.mark_send_confirmed(
             user,
             target_name,
@@ -2546,6 +2574,7 @@ def _append_streak_run_report(run_id, started_at, active_config, users):
         else "proxy"
     )
     report_dir = Path("logs/run_reports")
+    report_records = []
     for account in users or []:
         account_ref = str(
             account.get("account_ref")
@@ -2555,24 +2584,32 @@ def _append_streak_run_report(run_id, started_at, active_config, users):
         )
         for target_name in account.get("targets") or []:
             state = streak_state.target_state(account, target_name, completed_at)
+            report_record = {
+                "runId": run_id,
+                "accountRef": account_ref,
+                "targetRef": state.get("targetRef") or "",
+                "displayName": state.get("displayName") or target_name,
+                "status": state.get("status") or "",
+                "strategy": state.get("strategy") or "",
+                "attemptCount": state.get("attemptCount") or 0,
+                "category": state.get("lastErrorCategory") or "",
+                "reason": state.get("lastErrorReason") or "",
+                "confirmationSource": state.get("confirmationSource") or "",
+                "durationMs": duration_ms,
+                "networkRoute": network_route,
+            }
+            report_records.append(report_record)
             streak_state.append_run_report(
-                {
-                    "runId": run_id,
-                    "accountRef": account_ref,
-                    "targetRef": state.get("targetRef") or "",
-                    "displayName": state.get("displayName") or target_name,
-                    "status": state.get("status") or "",
-                    "strategy": state.get("strategy") or "",
-                    "attemptCount": state.get("attemptCount") or 0,
-                    "category": state.get("lastErrorCategory") or "",
-                    "reason": state.get("lastErrorReason") or "",
-                    "confirmationSource": state.get("confirmationSource") or "",
-                    "durationMs": duration_ms,
-                    "networkRoute": network_route,
-                },
+                report_record,
                 path=report_dir / f"{completed_at.date().isoformat()}.jsonl",
                 now=completed_at,
             )
+    if report_records:
+        streak_state.update_weekly_summary(
+            report_records,
+            directory=report_dir,
+            now=completed_at,
+        )
     streak_state.prune_run_reports(report_dir, detail_days=30, now=completed_at)
 
 
@@ -3130,12 +3167,18 @@ async def runTasks():
         with task_run_lock():
             protocol_user_data, browser_user_data = _split_sender_modes(active_config, runnable_user_data)
             if protocol_user_data:
-                await run_protocol_tasks(
-                    active_config,
-                    protocol_user_data,
-                    build_message,
-                    run_id=run_id,
-                )
+                try:
+                    await run_protocol_tasks(
+                        active_config,
+                        protocol_user_data,
+                        build_message,
+                        run_id=run_id,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Protocol sender run failed before fallback selection: %s",
+                        exc,
+                    )
                 fallback_users = _prepare_protocol_fallback_users(
                     active_config,
                     protocol_user_data,
