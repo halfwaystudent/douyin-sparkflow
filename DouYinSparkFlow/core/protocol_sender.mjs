@@ -614,12 +614,14 @@ async function buildConversationCache({
 
     const peerUserId = stringifyMaybeLong(peer.user_id);
     const secUid = peer.sec_uid || "";
-    if (!peerUserId || !secUid) {
+    if (!peerUserId && !secUid) {
       continue;
     }
 
-    let nickname = normalizeNickname(cachedBySecUid.get(secUid)?.nickname);
-    if (!nickname) {
+    let nickname = normalizeNickname(
+      (secUid && cachedBySecUid.get(secUid)?.nickname) || "",
+    );
+    if (!nickname && secUid) {
       try {
         nickname = await fetchProfileNickname(cookieString, secUid);
       } catch {
@@ -644,18 +646,23 @@ async function buildConversationCache({
     }
   }
 
+  return mergeConversationCache(existingCache, cacheEntries);
+}
+
+export function mergeConversationCache(existingCache, cacheEntries) {
   const deduped = new Map();
   for (const entry of existingCache || []) {
-    if (!entry?.nickname || !entry?.secUid) {
+    const stableKey = String(entry?.secUid || entry?.peerUserId || "").trim();
+    if (!entry?.nickname || !stableKey) {
       continue;
     }
-    deduped.set(entry.secUid, entry);
+    deduped.set(stableKey, entry);
   }
   for (const entry of cacheEntries) {
     if (!entry.nickname) {
       continue;
     }
-    deduped.set(entry.secUid, entry);
+    deduped.set(String(entry.secUid || entry.peerUserId || "").trim(), entry);
   }
   return Array.from(deduped.values()).sort((left, right) =>
     left.nickname.localeCompare(right.nickname, "zh-CN"),

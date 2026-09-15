@@ -101,6 +101,17 @@ class StreakTargetIdentityTests(unittest.TestCase):
             account["target_states"]["sec:sec-1"]["status"],
         )
 
+    def test_friend_index_stable_key_formats_are_supported(self):
+        account = {
+            "username": "demo",
+            "targets": ["Alice"],
+            "friend_index": {
+                "alice": {"stableKeys": ["data-sec-uid:SEC1"]},
+            },
+        }
+
+        self.assertEqual("sec:SEC1", streak_state.resolve_target_ref(account, "Alice"))
+
     def test_latest_alias_history_wins_during_migration(self):
         account = {
             "username": "demo",
@@ -299,6 +310,19 @@ class StreakStateMachineTests(unittest.TestCase):
             streak_state.target_state(account, "Alice", NOW)["status"],
         )
 
+    def test_send_confirmed_does_not_downgrade_streak_verified(self):
+        account = {"username": "demo", "targets": ["Alice"]}
+        streak_state.mark_streak_verified(account, "Alice", now=NOW)
+
+        streak_state.mark_send_confirmed(
+            account,
+            "Alice",
+            strategy="protocol",
+            now=NOW,
+        )
+
+        self.assertTrue(streak_state.is_streak_verified(account, "Alice", NOW))
+
     def test_fallback_is_only_eligible_for_retryable_unconfirmed_failure(self):
         account = {"username": "demo", "targets": ["Alice"]}
         streak_state.mark_failed(
@@ -407,6 +431,73 @@ class StreakScheduleTests(unittest.TestCase):
         )
 
         self.assertEqual(["Alice"], due)
+
+    def test_active_in_flight_is_not_selected_as_due(self):
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        streak_state.mark_in_flight(
+            account,
+            "Alice",
+            run_id="run-1",
+            strategy="browser",
+            now=NOW.replace(hour=17, minute=45),
+            lease_seconds=900,
+        )
+        window = {
+            "enabled": True,
+            "startHour": 10,
+            "endHour": 18,
+            "scheduleIntervalMinutes": 20,
+        }
+
+        due, _, pending, _ = tasks._select_due_targets(
+            account,
+            window,
+            NOW.replace(hour=17, minute=45),
+        )
+
+        self.assertEqual([], due)
+        self.assertEqual(1, len(pending))
+
+    def test_fallback_attempted_target_is_not_selected_again(self):
+        now = NOW.replace(hour=18, minute=10)
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        streak_state.mark_failed(
+            account,
+            "Alice",
+            category="protocol_network_error",
+            reason="temporary",
+            retryable=True,
+            now=now,
+        )
+        streak_state.mark_fallback_attempted(account, "Alice", now=now)
+        streak_state.mark_sent_unverified(
+            account,
+            "Alice",
+            run_id="fallback-1",
+            strategy="browser",
+            now=now,
+        )
+        window = {
+            "enabled": True,
+            "startHour": 10,
+            "endHour": 18,
+            "scheduleIntervalMinutes": 20,
+        }
+
+        due, _, pending, _ = tasks._select_due_targets(account, window, now)
+
+        self.assertEqual([], due)
+        self.assertEqual(1, len(pending))
 
     def test_end_hour_24_wraps_to_next_day_without_duplicate_fallback(self):
         window = {
@@ -768,6 +859,29 @@ class StreakTaskIntegrationTests(unittest.TestCase):
         self.assertEqual("weak", history["confirmationLevel"])
         self.assertEqual("sent_unverified", state["status"])
         self.assertFalse(streak_state.is_send_confirmed(account, "Alice", NOW))
+
+    def test_browser_recovery_can_mark_streak_verified(self):
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        accounts = [account]
+
+        with patch.object(
+            tasks,
+            "update_user_data",
+            side_effect=self._update_side_effect(accounts),
+        ):
+            tasks._persist_browser_streak_verified(
+                account.copy(),
+                "Alice",
+                NOW.isoformat(timespec="seconds"),
+                detail="conversation already contains message",
+            )
+
+        self.assertTrue(streak_state.is_streak_verified(account, "Alice", NOW))
 
 
 if __name__ == "__main__":

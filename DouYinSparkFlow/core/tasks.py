@@ -1689,6 +1689,10 @@ def _is_manual_run():
     return os.getenv("SPARKFLOW_MANUAL_RUN") == "1"
 
 
+def _is_fallback_run():
+    return os.getenv("SPARKFLOW_FALLBACK_PHASE") == "1"
+
+
 def _schedule_timezone():
     timezone_name = (
         str(os.getenv("SPARKFLOW_TIMEZONE") or "").strip()
@@ -1951,7 +1955,9 @@ def _window_boundary(now, hour):
 
 def _select_due_targets(user, send_window, now):
     targets = list(user.get("targets") or [])
-    if not send_window.get("enabled") or _is_manual_run():
+    if not send_window.get("enabled") or (
+        _is_manual_run() and not _is_fallback_run()
+    ):
         return targets, [], [], []
 
     phase = streak_state.schedule_phase(now, send_window)
@@ -1977,6 +1983,13 @@ def _select_due_targets(user, send_window, now):
     for target_name in targets:
         if _target_sent_today(user, target_name, now):
             already_sent.append(target_name)
+            continue
+        scheduled_at = _scheduled_send_time(user, target_name, send_window, now)
+        if streak_state.attempt_in_progress(user, target_name, now):
+            pending_targets.append((target_name, scheduled_at))
+            continue
+        if streak_state.fallback_attempted_today(user, target_name, now):
+            pending_targets.append((target_name, scheduled_at))
             continue
         if _target_has_non_retryable_failure_today(user, target_name, now):
             queued_failures.append(target_name)
@@ -2007,7 +2020,7 @@ def _select_due_targets(user, send_window, now):
                 pending_targets.append(
                     (
                         target_name,
-                        _scheduled_send_time(user, target_name, send_window, now),
+                        scheduled_at,
                     )
                 )
             else:
@@ -2016,7 +2029,6 @@ def _select_due_targets(user, send_window, now):
         if _target_failed_today(user, target_name, now):
             queued_failures.append(target_name)
             continue
-        scheduled_at = _scheduled_send_time(user, target_name, send_window, now)
         if account_paused:
             pending_targets.append((target_name, scheduled_at))
         elif phase == "close-out" or now >= scheduled_at:
@@ -2036,6 +2048,17 @@ def _select_due_targets(user, send_window, now):
 def _prepare_active_users_for_run(active_config, active_user_data):
     schedule_tz = _schedule_timezone()
     now = datetime.now(schedule_tz)
+
+    if _is_fallback_run():
+        send_window = _normalize_send_window(active_config)
+        if not send_window.get("enabled"):
+            return []
+        runnable_users = []
+        for user in active_user_data:
+            due_targets, _, _, _ = _select_due_targets(user, send_window, now)
+            if due_targets:
+                runnable_users.append(dict(user, targets=due_targets))
+        return runnable_users
 
     if not _is_manual_run():
         healthy_users = []
@@ -2466,6 +2489,65 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
         target_name,
         sent_at,
     )
+
+
+def _persist_browser_streak_verified(user, target_name, sent_at, detail=""):
+    state_now = parse_sent_at(sent_at, timezone.utc) or datetime.now(timezone.utc)
+    entry = {
+        "message": "",
+        "sentAt": sent_at,
+        "status": "streak_verified",
+        "confirmationLevel": "verified",
+        "confirmationSource": "conversation_verified",
+        "confirmationDetail": str(detail or ""),
+        "needsVerification": False,
+    }
+
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        history = dict(matched.get("message_history") or {})
+        previous = dict(history.get(target_name) or {})
+        previous.update(entry)
+        history[target_name] = previous
+        matched["message_history"] = history
+        failure_queue = dict(matched.get("failure_queue") or {})
+        failure_queue.pop(target_name, None)
+        if failure_queue:
+            matched["failure_queue"] = failure_queue
+        else:
+            matched.pop("failure_queue", None)
+        matched.pop("account_failure", None)
+        streak_state.mark_streak_verified(
+            matched,
+            target_name,
+            now=state_now,
+            detail=detail,
+        )
+        return dict(matched), True
+
+    matched_account = update_user_data(mutate, force_reload=True)
+    if matched_account is None:
+        logger.warning(
+            "Could not find account to persist streak verification for user=%s target=%s",
+            user.get("username", "unknown"),
+            target_name,
+        )
+        return
+    history = dict(user.get("message_history") or {})
+    previous = dict(history.get(target_name) or {})
+    previous.update(entry)
+    history[target_name] = previous
+    user["message_history"] = history
+    failure_queue = dict(user.get("failure_queue") or {})
+    failure_queue.pop(target_name, None)
+    if failure_queue:
+        user["failure_queue"] = failure_queue
+    else:
+        user.pop("failure_queue", None)
+    user.pop("account_failure", None)
+    streak_state.mark_streak_verified(user, target_name, now=state_now, detail=detail)
 
 
 def _split_sender_modes(active_config, runnable_user_data):
@@ -3027,13 +3109,24 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
                             target_name,
                             detail,
                         )
-                        _persist_browser_send_success(
-                            user,
-                            target_name,
-                            message,
-                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                            server_receipt=send_receipt,
+                        verified_at = datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
                         )
+                        if streak_state.receipt_is_strong(send_receipt):
+                            _persist_browser_send_success(
+                                user,
+                                target_name,
+                                message,
+                                verified_at,
+                                server_receipt=send_receipt,
+                            )
+                        else:
+                            _persist_browser_streak_verified(
+                                user,
+                                target_name,
+                                verified_at,
+                                detail=detail,
+                            )
                         continue
 
                     logger.exception("Send flow failed for %s/%s", account_name, target_name)

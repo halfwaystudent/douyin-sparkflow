@@ -5,6 +5,7 @@ import {
   SDK_BUNDLES,
   buildTargetLookup,
   isSuccessfulSendResult,
+  mergeConversationCache,
   resolveTargetMapping,
   sha256Hex,
   verifyBundleBytes,
@@ -60,6 +61,39 @@ test("ambiguous nickname without stable identity is rejected", () => {
 
   assert.equal(resolved.mapping, null);
   assert.equal(resolved.reason, "ambiguous_target");
+});
+
+
+test("peerUserId-only cache entries survive deduplication", () => {
+  const merged = mergeConversationCache([], [
+    {
+      nickname: "PeerOnly",
+      peerUserId: "1001",
+      secUid: "",
+      conversationId: "conversation-1",
+    },
+  ]);
+
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].peerUserId, "1001");
+});
+
+
+test("peerUserId is used when secUid is unavailable", () => {
+  const lookup = buildTargetLookup([
+    {
+      nickname: "PeerOnly",
+      peerUserId: "1001",
+      secUid: "",
+      conversationId: "conversation-1",
+    },
+  ]);
+
+  const resolved = resolveTargetMapping(lookup, "PeerOnly", {
+    peerUserId: "1001",
+  });
+
+  assert.equal(resolved.mapping.conversationId, "conversation-1");
 });
 
 

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import unicodedata
+from urllib.parse import parse_qs, urlparse
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,6 +149,30 @@ def _ref_from_record(record):
         raw = str(item or "").strip()
         if raw.startswith(("sec:", "peer:")):
             return raw
+        if raw.startswith("data-sec-uid:"):
+            value = raw.split(":", 1)[1].strip()
+            if value:
+                return f"sec:{value}"
+        if raw.startswith("data-user-id:"):
+            value = raw.split(":", 1)[1].strip()
+            if value:
+                return f"peer:{value}"
+        if raw.startswith("data-id:"):
+            value = raw.split(":", 1)[1].strip()
+            if value:
+                return f"peer:{value}"
+        if raw.startswith("data-conversation-id:"):
+            value = raw.split(":", 1)[1].strip()
+            if value:
+                return f"conversation:{value}"
+        if raw.startswith("href:"):
+            href = raw.split(":", 1)[1].strip()
+            query = parse_qs(urlparse(href).query)
+            for key in ("sec_uid", "secUid", "peerUserId", "user_id"):
+                value = str((query.get(key) or [""])[0]).strip()
+                if value:
+                    prefix = "sec" if key.lower() == "sec_uid" else "peer"
+                    return f"{prefix}:{value}"
         ref = resolve_target_ref({}, raw)
         if ref and not ref.startswith("nickname:"):
             return ref
@@ -506,6 +531,13 @@ def mark_send_confirmed(
 ):
     now = _now(now)
     state = _state_for_write(account, target_name, now)
+    event_time = _state_event_time(state)
+    if (
+        state.get("status") == STATE_STREAK_VERIFIED
+        and event_time
+        and event_time.astimezone(now.tzinfo).date() == now.date()
+    ):
+        return deepcopy(state)
     state.update(
         {
             "status": STATE_SEND_CONFIRMED,
@@ -596,6 +628,22 @@ def fallback_eligible(account, target_name, now=None):
         state.get("status") == STATE_FAILED_RETRYABLE
         and not (fallback_at and fallback_at.date() == now.date())
     )
+
+
+def attempt_in_progress(account, target_name, now=None):
+    now = _now(now)
+    state = target_state(account, target_name, now)
+    if state.get("status") != STATE_IN_FLIGHT:
+        return False
+    lease_expires_at = _parse_time(state.get("leaseExpiresAt"), now.tzinfo)
+    return bool(lease_expires_at and lease_expires_at > now)
+
+
+def fallback_attempted_today(account, target_name, now=None):
+    now = _now(now)
+    state = target_state(account, target_name, now)
+    fallback_at = _parse_time(state.get("fallbackAt"), now.tzinfo)
+    return bool(fallback_at and fallback_at.date() == now.date())
 
 
 def is_send_confirmed(account, target_name, now=None):

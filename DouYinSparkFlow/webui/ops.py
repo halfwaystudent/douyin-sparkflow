@@ -254,6 +254,7 @@ def build_unsent_fallback_task_command():
         {
             "SPARKFLOW_MANUAL_RUN": "1",
             "SPARKFLOW_MANUAL_UNSENT_ONLY": "1",
+            "SPARKFLOW_FALLBACK_PHASE": "1",
             "PYTHONUNBUFFERED": "1",
         },
         trigger_label="unsent fallback",
