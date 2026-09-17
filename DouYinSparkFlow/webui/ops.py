@@ -16,6 +16,10 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 from core import streak_state
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
+from core.tasks import (
+    TEMPORARY_ACCOUNT_FAILURE_CATEGORIES,
+    _temporary_account_failure_cooldown_minutes,
+)
 from utils.config import (
     get_app_settings,
     get_config,
@@ -542,8 +546,14 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
     if schedule["mode"] == "window":
         end_hour = schedule["endHour"]
         if end_hour == 24:
+            if schedule["startHour"] < 23:
+                updated.append(
+                    f"*/{schedule['scheduleIntervalMinutes']} "
+                    f"{schedule['startHour']}-22 * * * "
+                    f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+                )
             updated.append(
-                f"*/{schedule['scheduleIntervalMinutes']} {schedule['startHour']}-23 * * * "
+                f"0-58/{schedule['scheduleIntervalMinutes']} 23 * * * "
                 f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
             )
             updated.append(
@@ -557,10 +567,6 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
             )
             updated.append(
                 f"0 {end_hour} * * * "
-                f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
-            )
-            updated.append(
-                f"{schedule['scheduleIntervalMinutes']} {end_hour} * * * "
                 f"{fallback_command} >> /var/log/douyin-sparkflow.log 2>&1"
             )
     else:
@@ -677,28 +683,19 @@ def current_daily_schedule():
 def _next_window_trigger(now, window):
     interval = max(1, int(window["scheduleIntervalMinutes"]))
     candidates = []
-    for hour in range(int(window["startHour"]), int(window["endHour"])):
-        for minute in range(0, 60, interval):
-            candidates.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
     end_hour = int(window["endHour"])
-    end_at = (
-        now.replace(
-            hour=23,
-            minute=59,
-            second=0,
-            microsecond=0,
-        )
-        if end_hour == 24
-        else now.replace(
-            hour=end_hour,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
+    for hour in range(int(window["startHour"]), end_hour):
+        for minute in range(0, 60, interval):
+            if end_hour == 24 and hour == 23 and minute == 59:
+                continue
+            candidates.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+    fallback_at = now.replace(
+        hour=23 if end_hour == 24 else end_hour,
+        minute=59 if end_hour == 24 else 0,
+        second=0,
+        microsecond=0,
     )
-    candidates.append(end_at)
-    if interval < 60 and end_hour != 24:
-        candidates.append(end_at + timedelta(minutes=interval))
+    candidates.append(fallback_at)
     for candidate in sorted(set(candidates)):
         if candidate > now:
             return candidate
@@ -779,10 +776,36 @@ def _account_failure_pause_after_attempts():
         return 2
 
 
+def _account_failure_pause_active(account_failure, now, pause_after):
+    if _coerce_attempt_count(account_failure) < pause_after:
+        return False
+    category = str(account_failure.get("category") or "")
+    if category not in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES:
+        return True
+    last_attempt_at = _parse_sent_at(
+        account_failure.get("lastAttemptAt"),
+        now.tzinfo,
+    )
+    if not last_attempt_at:
+        return True
+    elapsed_seconds = (now - last_attempt_at).total_seconds()
+    return elapsed_seconds < _temporary_account_failure_cooldown_minutes() * 60
+
+
 def _account_failure_entry_today(account, now):
     entry = dict(account.get("account_failure") or {})
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
-    if last_attempt_at and last_attempt_at.date() == now.date():
+    category = str(entry.get("category") or "")
+    cooldown_active = bool(
+        last_attempt_at
+        and category in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES
+        and now
+        < last_attempt_at
+        + timedelta(minutes=_temporary_account_failure_cooldown_minutes())
+    )
+    if last_attempt_at and (
+        last_attempt_at.date() == now.date() or cooldown_active
+    ):
         entry["lastAttemptAt"] = last_attempt_at.isoformat(timespec="seconds")
         first_attempt_at = _parse_sent_at(entry.get("firstAttemptAt"), now.tzinfo)
         if first_attempt_at:
@@ -798,12 +821,23 @@ def _normalize_friend_index_key(value):
     for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
         raw = raw.replace(token, "")
     raw = raw.replace("\xa0", " ")
-    return " ".join(raw.split()).strip()
+    return " ".join(raw.split()).strip().casefold()
 
 
 def _friend_index_status(account, target_name):
     friend_index = dict(account.get("friend_index") or {})
-    entry = dict(friend_index.get(_normalize_friend_index_key(target_name)) or {})
+    normalized_target = _normalize_friend_index_key(target_name)
+    entry = {}
+    for key, record in friend_index.items():
+        if not isinstance(record, dict):
+            continue
+        normalized_names = {
+            _normalize_friend_index_key(key),
+            _normalize_friend_index_key(record.get("visibleName")),
+        }
+        if normalized_target in normalized_names:
+            entry = dict(record)
+            break
     return {
         "seen": bool(entry),
         "visibleName": str(entry.get("visibleName") or ""),
@@ -812,9 +846,13 @@ def _friend_index_status(account, target_name):
     }
 
 
-def _account_blocked_target_status(item, account_failure):
+def _account_blocked_target_status(account, item, account_failure):
     blocked_item = dict(item)
-    affected_targets = set(account_failure.get("affectedTargets") or [])
+    target_name = str(blocked_item.get("target") or "")
+    account_failure_affected = any(
+        streak_state.target_keys_match(account, target_name, affected_target)
+        for affected_target in (account_failure.get("affectedTargets") or [])
+    )
     blocked_item.update(
         {
             "status": "account_blocked",
@@ -822,7 +860,7 @@ def _account_blocked_target_status(item, account_failure):
             "reason": str(account_failure.get("reason") or ""),
             "attemptCount": _coerce_attempt_count(account_failure),
             "lastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
-            "accountFailureAffected": blocked_item.get("target") in affected_targets,
+            "accountFailureAffected": account_failure_affected,
         }
     )
     return blocked_item
@@ -900,6 +938,61 @@ def _build_target_status(account, target_name, now, send_window):
 
     history_entry = streak_state.history_entry(account, target_name, now.tzinfo)
     sent_at = _parse_sent_at(history_entry.get("sentAt"), now.tzinfo)
+    if streak_state.is_streak_verified(account, target_name, now):
+        item.update(
+            {
+                "status": "sent",
+                "message": str(history_entry.get("message") or ""),
+                "sentAt": sent_at.isoformat(timespec="seconds") if sent_at else "",
+                "confirmationLevel": "verified",
+                "confirmationSource": "streak_verified",
+                "confirmationDetail": str(state.get("lastEvidenceDetail") or ""),
+                "needsVerification": False,
+            }
+        )
+        return _finalize_target_status(item, now)
+    if (
+        str(state.get("status") or "")
+        == streak_state.STATE_FAILED_RETRYABLE
+        and str(state.get("lastErrorCategory") or "") == "send_unconfirmed"
+    ):
+        last_attempt_at = _parse_sent_at(
+            state.get("lastAttemptAt"),
+            now.tzinfo,
+        )
+        item.update(
+            {
+                "status": "unconfirmed",
+                "message": str(
+                    history_entry.get("message")
+                    or state.get("lastEvidenceDetail")
+                    or ""
+                ),
+                "sentAt": (
+                    sent_at.isoformat(timespec="seconds") if sent_at else ""
+                ),
+                "lastAttemptAt": (
+                    last_attempt_at.isoformat(timespec="seconds")
+                    if last_attempt_at
+                    else ""
+                ),
+                "category": "send_unconfirmed",
+                "reason": str(
+                    state.get("lastErrorReason")
+                    or "manual reset requires verification"
+                ),
+                "attemptCount": int(state.get("attemptCount") or 0),
+                "confirmationLevel": "weak",
+                "confirmationSource": str(
+                    state.get("confirmationSource") or "manual_reset"
+                ),
+                "confirmationDetail": str(
+                    state.get("lastEvidenceDetail") or ""
+                ),
+                "needsVerification": True,
+            }
+        )
+        return _finalize_target_status(item, now)
     if streak_state.is_send_confirmed(account, target_name, now):
         state_sent_at = _parse_sent_at(state.get("sentAt"), now.tzinfo)
         item.update(
@@ -915,19 +1008,6 @@ def _build_target_status(account, target_name, now, send_window):
                 "confirmationSource": str(
                     state.get("confirmationSource") or "protocol_send_receipt"
                 ),
-                "confirmationDetail": str(state.get("lastEvidenceDetail") or ""),
-                "needsVerification": False,
-            }
-        )
-        return _finalize_target_status(item, now)
-    if streak_state.is_streak_verified(account, target_name, now):
-        item.update(
-            {
-                "status": "sent",
-                "message": str(history_entry.get("message") or ""),
-                "sentAt": sent_at.isoformat(timespec="seconds") if sent_at else "",
-                "confirmationLevel": "verified",
-                "confirmationSource": "streak_verified",
                 "confirmationDetail": str(state.get("lastEvidenceDetail") or ""),
                 "needsVerification": False,
             }
@@ -1016,11 +1096,34 @@ def _build_target_status(account, target_name, now, send_window):
 
 
 def _orphan_records(account, configured_targets):
-    configured_target_set = {str(target) for target in configured_targets}
+    configured_targets = [str(target) for target in configured_targets]
+    configured_target_set = set(configured_targets)
+    configured_target_refs = {
+        streak_state.target_ref_for_stored_key(account, target)
+        for target in configured_targets
+        if streak_state.target_ref_for_stored_key(account, target)
+    }
+
+    def is_configured(key):
+        if str(key) in configured_target_set:
+            return True
+        return (
+            streak_state.target_ref_for_stored_key(account, key)
+            in configured_target_refs
+        )
+
     history = dict(account.get("message_history") or {})
     failure_queue = dict(account.get("failure_queue") or {})
-    orphan_history = sorted(str(target) for target in history if str(target) not in configured_target_set)
-    orphan_failure = sorted(str(target) for target in failure_queue if str(target) not in configured_target_set)
+    orphan_history = sorted(
+        str(target)
+        for target in history
+        if not is_configured(target)
+    )
+    orphan_failure = sorted(
+        str(target)
+        for target in failure_queue
+        if not is_configured(target)
+    )
     return orphan_history, orphan_failure
 
 
@@ -1066,12 +1169,36 @@ def get_send_console_snapshot(account_refs=None):
         sent_targets = confirmed_targets
         unconfirmed_targets = [item for item in statuses if item["status"] == "unconfirmed"]
         failed_targets = [item for item in statuses if item["status"] == "failed"]
+        account_health = dict(account.get("account_health") or {})
+        preflight_failed = account_health.get("healthy") is False
         account_failure = _account_failure_entry_today(account, now)
-        account_paused = bool(account_failure and _coerce_attempt_count(account_failure) >= account_failure_pause_after)
+        failure_paused = _account_failure_pause_active(
+            account_failure,
+            now,
+            account_failure_pause_after,
+        )
+        account_paused = bool(failure_paused or preflight_failed)
+        pause_entry = (
+            account_failure
+            if failure_paused
+            else {
+                "category": str(account_health.get("category") or "account_preflight"),
+                "reason": str(
+                    account_health.get("reason")
+                    or "account health preflight failed"
+                ),
+                "attemptCount": 0,
+                "lastAttemptAt": str(account_health.get("checkedAt") or ""),
+                "affectedTargets": [],
+            }
+        )
         account_blocked_targets = []
         if account_paused:
             account_blocked_targets = [
-                _finalize_target_status(_account_blocked_target_status(item, account_failure), now)
+                _finalize_target_status(
+                    _account_blocked_target_status(account, item, pause_entry),
+                    now,
+                )
                 for item in statuses
                 if item["status"] in {"pending", "unprocessed"}
             ]
@@ -1093,6 +1220,16 @@ def get_send_console_snapshot(account_refs=None):
 
         orphan_history, orphan_failure = _orphan_records(account, configured_targets)
         warnings = []
+        if preflight_failed:
+            warnings.append(
+                {
+                    "category": "account_preflight",
+                    "message": (
+                        "账号预检失败，已暂停："
+                        f"{pause_entry.get('reason') or pause_entry.get('category')}"
+                    ),
+                }
+            )
         if not configured_targets:
             warnings.append({"category": "no_targets", "message": "该启用账号没有配置目标，不能代表全部续上。"})
         if orphan_history:
@@ -1170,6 +1307,7 @@ def get_send_console_snapshot(account_refs=None):
                 "account_paused": account_paused,
                 "account_failure_pause_after": account_failure_pause_after,
                 "state": account_state,
+                "account_health": account_health,
                 "attention_count": attention_count,
                 "pending_count": pending_count,
                 "last_confirmed_at": last_confirmed_at,

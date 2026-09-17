@@ -7,6 +7,8 @@ import vm from "node:vm";
 import { Blob } from "node:buffer";
 import { pathToFileURL } from "node:url";
 
+import { casefold } from "./unicode_casefold.mjs";
+
 export const SDK_BUNDLES = [
   {
     url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/lib-polyfill.f81f86eb.js",
@@ -77,7 +79,10 @@ function toCookieString(cookies) {
 }
 
 function normalizeNickname(value) {
-  return String(value || "").trim();
+  return casefold(value)
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function stableNow() {
@@ -651,18 +656,78 @@ async function buildConversationCache({
 
 export function mergeConversationCache(existingCache, cacheEntries) {
   const deduped = new Map();
-  for (const entry of existingCache || []) {
-    const stableKey = String(entry?.secUid || entry?.peerUserId || "").trim();
-    if (!entry?.nickname || !stableKey) {
-      continue;
+  const bySecUid = new Map();
+  const byPeerUserId = new Map();
+
+  function removeEntry(entry) {
+    const secUid = String(entry?.secUid || "").trim();
+    const peerUserId = String(entry?.peerUserId || "").trim();
+    if (secUid) {
+      bySecUid.delete(secUid);
     }
-    deduped.set(stableKey, entry);
+    if (peerUserId) {
+      byPeerUserId.delete(peerUserId);
+    }
+  }
+
+  function addEntry(entry) {
+    const secUid = String(entry?.secUid || "").trim();
+    const peerUserId = String(entry?.peerUserId || "").trim();
+    if (!entry?.nickname || (!secUid && !peerUserId)) {
+      return;
+    }
+    const matches = [];
+    for (const candidate of [
+      secUid && bySecUid.get(secUid),
+      peerUserId && byPeerUserId.get(peerUserId),
+    ]) {
+      if (candidate && !matches.includes(candidate)) {
+        matches.push(candidate);
+      }
+    }
+    const merged = {};
+    for (const existing of [...matches, entry]) {
+      for (const field of [
+        "nickname",
+        "secUid",
+        "peerUserId",
+        "conversationId",
+        "conversationShortId",
+        "updatedAt",
+      ]) {
+        const value = String(existing[field] || "").trim();
+        if (value) {
+          merged[field] = existing[field];
+        }
+      }
+    }
+    for (const existing of matches) {
+      removeEntry(existing);
+      for (const [key, value] of deduped) {
+        if (value === existing) {
+          deduped.delete(key);
+        }
+      }
+    }
+    const mergedSecUid = String(merged.secUid || "").trim();
+    const mergedPeerUserId = String(merged.peerUserId || "").trim();
+    const key = mergedSecUid
+      ? `sec:${mergedSecUid}`
+      : `peer:${mergedPeerUserId}`;
+    deduped.set(key, merged);
+    if (mergedSecUid) {
+      bySecUid.set(mergedSecUid, merged);
+    }
+    if (mergedPeerUserId) {
+      byPeerUserId.set(mergedPeerUserId, merged);
+    }
+  }
+
+  for (const entry of existingCache || []) {
+    addEntry(entry);
   }
   for (const entry of cacheEntries) {
-    if (!entry.nickname) {
-      continue;
-    }
-    deduped.set(String(entry.secUid || entry.peerUserId || "").trim(), entry);
+    addEntry(entry);
   }
   return Array.from(deduped.values()).sort((left, right) =>
     left.nickname.localeCompare(right.nickname, "zh-CN"),
@@ -730,7 +795,7 @@ export function resolveTargetMapping(lookup, target, identity = {}) {
   };
 }
 
-async function sendMessages({
+export async function sendMessages({
   client,
   cacheEntries,
   messagesByTarget,
@@ -739,9 +804,11 @@ async function sendMessages({
   cookieString,
   cookieMap,
   sendStrategy,
+  identityOverride = null,
 }) {
   if (!dryRun) {
-    const identity = await fetchIdentitySecurityToken(cookieString, cookieMap);
+    const identity = identityOverride
+      || await fetchIdentitySecurityToken(cookieString, cookieMap);
     client.updateSendMessageHeaders({
       identity_security_token: identity.identitySecurityHeader,
       identity_security_device_id: identity.realDeviceId,
@@ -756,76 +823,94 @@ async function sendMessages({
   const normalizedStrategy = normalizeSendStrategy(sendStrategy);
 
   for (const [target, message] of Object.entries(messagesByTarget)) {
-    const { mapping, reason } = resolveTargetMapping(
-      lookup,
-      target,
-      targetIdentities?.[target] || {},
-    );
-    if (!mapping) {
-      unresolved.push({ target, reason });
-      continue;
-    }
-
-    const conversation = client.getConversation({ conversationId: mapping.conversationId });
-    if (!conversation) {
-      unresolved.push({ target, reason: "conversation_not_loaded", mapping });
-      continue;
-    }
-
-    resolved.push({
-      target,
-      nickname: mapping.nickname,
-      peerUserId: mapping.peerUserId,
-      conversationId: mapping.conversationId,
-      conversationShortId: mapping.conversationShortId,
-    });
-
-    let delayBeforeSendSeconds = 0;
-    if (!dryRun && sent.length > 0 && normalizedStrategy.messageIntervalSecondsMax > 0) {
-      delayBeforeSendSeconds = randomBetweenInclusive(
-        normalizedStrategy.messageIntervalSecondsMin,
-        normalizedStrategy.messageIntervalSecondsMax,
+    try {
+      const { mapping, reason } = resolveTargetMapping(
+        lookup,
+        target,
+        targetIdentities?.[target] || {},
       );
-      if (delayBeforeSendSeconds > 0) {
-        await sleep(delayBeforeSendSeconds * 1000);
+      if (!mapping) {
+        unresolved.push({ target, reason });
+        continue;
       }
-    }
 
-    const payload = JSON.stringify({ text: message, aweType: 774 });
-    const messageObject = await client.createMessage({
-      type: 7,
-      content: payload,
-      conversation,
-      insert: false,
-    });
+      const conversation = client.getConversation({
+        conversationId: mapping.conversationId,
+      });
+      if (!conversation) {
+        unresolved.push({ target, reason: "conversation_not_loaded", mapping });
+        continue;
+      }
 
-    if (dryRun) {
+      resolved.push({
+        target,
+        nickname: mapping.nickname,
+        peerUserId: mapping.peerUserId,
+        conversationId: mapping.conversationId,
+        conversationShortId: mapping.conversationShortId,
+      });
+
+      let delayBeforeSendSeconds = 0;
+      if (!dryRun && sent.length > 0 && normalizedStrategy.messageIntervalSecondsMax > 0) {
+        delayBeforeSendSeconds = randomBetweenInclusive(
+          normalizedStrategy.messageIntervalSecondsMin,
+          normalizedStrategy.messageIntervalSecondsMax,
+        );
+        if (delayBeforeSendSeconds > 0) {
+          await sleep(delayBeforeSendSeconds * 1000);
+        }
+      }
+
+      const payload = JSON.stringify({ text: message, aweType: 774 });
+      const messageObject = await client.createMessage({
+        type: 7,
+        content: payload,
+        conversation,
+        insert: false,
+      });
+
+      if (dryRun) {
+        sent.push({
+          target,
+          dryRun: true,
+          message,
+          payload,
+          conversationId: mapping.conversationId,
+          delayBeforeSendSeconds,
+        });
+        continue;
+      }
+
+      const sendResult = await client.sendMessage({ message: messageObject });
+      const statusCode = sendResult?.statusCode ?? null;
       sent.push({
         target,
-        dryRun: true,
+        dryRun: false,
         message,
-        payload,
+        success: isSuccessfulSendResult(sendResult),
+        statusCode,
+        statusName: sendMessageStatusName(statusCode),
+        statusMsg: sendResult?.statusMsg ?? "",
+        sendResultSummary: publicSendResultSummary(sendResult),
         conversationId: mapping.conversationId,
         delayBeforeSendSeconds,
+        sentAt: stableNow(),
       });
-      continue;
+    } catch (error) {
+      sent.push({
+        target,
+        dryRun: false,
+        message,
+        success: false,
+        statusCode: null,
+        statusName: "exception",
+        statusMsg: String(error?.message || error || "protocol target failed"),
+        sendResultSummary: { rawKeys: [] },
+        conversationId: "",
+        delayBeforeSendSeconds: 0,
+        sentAt: stableNow(),
+      });
     }
-
-    const sendResult = await client.sendMessage({ message: messageObject });
-    const statusCode = sendResult?.statusCode ?? null;
-    sent.push({
-      target,
-      dryRun: false,
-      message,
-      success: isSuccessfulSendResult(sendResult),
-      statusCode,
-      statusName: sendMessageStatusName(statusCode),
-      statusMsg: sendResult?.statusMsg ?? "",
-      sendResultSummary: publicSendResultSummary(sendResult),
-      conversationId: mapping.conversationId,
-      delayBeforeSendSeconds,
-      sentAt: stableNow(),
-    });
   }
 
   return { resolved, unresolved, sent };

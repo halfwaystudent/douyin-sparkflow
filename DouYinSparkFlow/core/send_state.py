@@ -30,6 +30,7 @@ def _receipt_is_strong(receipt):
         bool(receipt.get("ok"))
         and 200 <= http_status < 300
         and str(receipt.get("call") or "message_send") in ("", "message_send")
+        and receipt.get("jsonOk") is True
     )
 
 

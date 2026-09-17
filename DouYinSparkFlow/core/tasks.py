@@ -64,7 +64,7 @@ def _normalize_target_name(value):
     for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
         raw = raw.replace(token, "")
     raw = raw.replace("\xa0", " ")
-    return " ".join(raw.split()).strip()
+    return " ".join(raw.split()).strip().casefold()
 
 
 def _current_run_mode():
@@ -582,20 +582,6 @@ async def start_im_send_observer(page, account_name, target_name):
                         return _trim(value, 300)
         return _trim(body_text, 300)
 
-    def _json_success(data):
-        if not isinstance(data, dict):
-            return None
-        success_values = []
-        for key in ("status_code", "err_no", "errno", "error_code", "code"):
-            if key in data:
-                success_values.append(data.get(key) in (0, "0", None))
-        message = str(data.get("message") or data.get("status_msg") or "").lower()
-        if message:
-            success_values.append(message in ("success", "ok"))
-        if success_values:
-            return all(success_values)
-        return None
-
     def _receipt_body_meta(data, body_text):
         meta = {"bodyLen": len(body_text or "")}
         if body_text:
@@ -681,8 +667,16 @@ async def start_im_send_observer(page, account_name, target_name):
             body_text = _decode_body(body)
             data = _parse_json_body(body_text)
             http_ok = isinstance(status, (int, float)) and 200 <= status < 300
-            json_ok = _json_success(data)
-            receipt = {"call": kind, "httpStatus": status, "ok": bool(http_ok and (json_ok is not False)), "jsonParsed": isinstance(data, dict), "logid": _trim(logid, 120), "url": _safe_url(url)}
+            json_ok = _json_body_success(data)
+            receipt_ok = bool(
+                http_ok
+                and (
+                    json_ok is True
+                    if item.get("is_send_post")
+                    else json_ok is not False
+                )
+            )
+            receipt = {"call": kind, "httpStatus": status, "ok": receipt_ok, "jsonParsed": isinstance(data, dict), "logid": _trim(logid, 120), "url": _safe_url(url)}
             receipt.update(_receipt_body_meta(data, body_text))
             if json_ok is not None:
                 receipt["jsonOk"] = bool(json_ok)
@@ -969,6 +963,58 @@ async def find_visible_spark_message_candidate(page, chat_input=None, candidates
     return ""
 
 
+def _json_body_success(data):
+    if not isinstance(data, dict):
+        return None
+
+    candidates = []
+    pending = [data]
+    while pending:
+        candidate = pending.pop(0)
+        if isinstance(candidate, dict):
+            candidates.append(candidate)
+            for value in candidate.values():
+                if isinstance(value, (dict, list)):
+                    pending.append(value)
+        elif isinstance(candidate, list):
+            pending.extend(
+                value
+                for value in candidate
+                if isinstance(value, (dict, list))
+            )
+
+    code_seen = False
+    code_success = True
+    error_seen = False
+    for candidate in candidates:
+        for key in ("status_code", "err_no", "errno", "error_code", "code"):
+            if key in candidate:
+                code_seen = True
+                if candidate.get(key) not in (0, "0"):
+                    code_success = False
+        message = str(
+            candidate.get("message")
+            or candidate.get("status_msg")
+            or ""
+        ).lower()
+        if message and message not in ("success", "ok"):
+            error_seen = True
+        for key in ("error", "error_msg", "err_msg"):
+            if candidate.get(key):
+                error_seen = True
+
+    if code_seen:
+        return code_success and not error_seen
+    if error_seen:
+        return False
+    return None
+
+
+def _should_persist_recovered_browser_evidence(sent_ok, error):
+    del error
+    return bool(sent_ok)
+
+
 async def detect_message_already_sent(page, chat_input, message, before_snapshot=None):
     try:
         if chat_input is not None:
@@ -1049,6 +1095,7 @@ TEMPORARY_ACCOUNT_FAILURE_CATEGORIES = {
     "navigation_timeout",
     "navigation_failed",
     "page_crashed",
+    "protocol_sender_failed",
     "timeout",
 }
 
@@ -1765,19 +1812,25 @@ def _target_sent_today(user, target_name, now):
 
 
 def _target_unconfirmed_today(user, target_name, now):
-    history = dict(user.get("message_history") or {})
-    entry = dict(history.get(target_name) or {})
-    sent_at = _parse_sent_at(entry.get("sentAt"), now.tzinfo)
-    return bool(
+    history = streak_state.history_entry(user, target_name, now.tzinfo)
+    sent_at = _parse_sent_at(history.get("sentAt"), now.tzinfo)
+    if (
         sent_at
         and sent_at.date() == now.date()
         and not _target_sent_today(user, target_name, now)
+    ):
+        return True
+    failure = streak_state.failure_entry(user, target_name, now.tzinfo)
+    last_attempt_at = _parse_sent_at(failure.get("lastAttemptAt"), now.tzinfo)
+    return bool(
+        last_attempt_at
+        and last_attempt_at.date() == now.date()
+        and str(failure.get("category") or "") == "send_unconfirmed"
     )
 
 
 def _target_failed_today(user, target_name, now):
-    queue = dict(user.get("failure_queue") or {})
-    entry = queue.get(target_name) or {}
+    entry = streak_state.failure_entry(user, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
     return bool(last_attempt_at and last_attempt_at.date() == now.date())
 
@@ -1785,7 +1838,17 @@ def _target_failed_today(user, target_name, now):
 def _account_failure_entry_today(user, now):
     entry = dict(user.get("account_failure") or {})
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
-    if last_attempt_at and last_attempt_at.date() == now.date():
+    category = str(entry.get("category") or "")
+    cooldown_active = bool(
+        last_attempt_at
+        and category in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES
+        and now
+        < last_attempt_at
+        + timedelta(minutes=_temporary_account_failure_cooldown_minutes())
+    )
+    if last_attempt_at and (
+        last_attempt_at.date() == now.date() or cooldown_active
+    ):
         return entry
     return {}
 
@@ -1852,8 +1915,7 @@ def _friend_index_complete_today(user, now):
 
 
 def _target_failure_attempts_today(user, target_name, now):
-    queue = dict(user.get("failure_queue") or {})
-    entry = queue.get(target_name) or {}
+    entry = streak_state.failure_entry(user, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
     if not last_attempt_at or last_attempt_at.date() != now.date():
         return 0
@@ -1864,8 +1926,7 @@ def _target_failure_attempts_today(user, target_name, now):
 
 
 def _target_failure_category_today(user, target_name, now):
-    queue = dict(user.get("failure_queue") or {})
-    entry = queue.get(target_name) or {}
+    entry = streak_state.failure_entry(user, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
     if not last_attempt_at or last_attempt_at.date() != now.date():
         return ""
@@ -1883,13 +1944,25 @@ def _target_has_non_retryable_failure_today(user, target_name, now):
 
 
 def _pending_failed_targets(user, now):
-    queue = dict(user.get("failure_queue") or {})
     targets = []
     account_failure = _account_failure_entry_today(user, now)
     account_failure_targets = list(account_failure.get("affectedTargets") or [])
     if account_failure_targets:
-        for target_name in account_failure_targets:
-            if target_name in (user.get("targets") or []) and not _target_sent_today(user, target_name, now):
+        for target_name in user.get("targets") or []:
+            if not any(
+                streak_state.target_keys_match(
+                    user,
+                    target_name,
+                    affected_target,
+                )
+                for affected_target in account_failure_targets
+            ):
+                continue
+            if (
+                not _target_sent_today(user, target_name, now)
+                and not streak_state.attempt_in_progress(user, target_name, now)
+                and not streak_state.fallback_attempted_today(user, target_name, now)
+            ):
                 targets.append(target_name)
         if targets:
             return targets
@@ -1897,10 +1970,14 @@ def _pending_failed_targets(user, now):
     for target_name in user.get("targets") or []:
         if _target_sent_today(user, target_name, now):
             continue
+        if streak_state.attempt_in_progress(user, target_name, now):
+            continue
+        if streak_state.fallback_attempted_today(user, target_name, now):
+            continue
         if _target_unconfirmed_today(user, target_name, now):
             targets.append(target_name)
             continue
-        if target_name in queue and _target_failed_today(user, target_name, now):
+        if _target_failed_today(user, target_name, now):
             targets.append(target_name)
     return targets
 
@@ -1911,6 +1988,12 @@ def _pending_unsent_targets(user, now):
     max_attempts = _unsent_retry_max_attempts()
     for target_name in user.get("targets") or []:
         if _target_sent_today(user, target_name, now):
+            continue
+        if streak_state.attempt_in_progress(user, target_name, now):
+            skipped_targets.append(f"{target_name}(in_flight)")
+            continue
+        if streak_state.fallback_attempted_today(user, target_name, now):
+            skipped_targets.append(f"{target_name}(fallback_attempted)")
             continue
         if _target_has_non_retryable_failure_today(user, target_name, now):
             skipped_targets.append(f"{target_name}(non_retryable)")
@@ -1961,6 +2044,18 @@ def _select_due_targets(user, send_window, now):
         return targets, [], [], []
 
     phase = streak_state.schedule_phase(now, send_window)
+    phase_now = (
+        now - timedelta(days=1)
+        if phase == "fallback"
+        and now.hour < int(send_window["startHour"])
+        and int(send_window["endHour"]) == 24
+        else now
+    )
+    phase_check_times = (
+        (phase_now, now)
+        if phase_now != now
+        else (now,)
+    )
     if phase == "outside":
         already_sent = []
         pending_targets = []
@@ -1985,23 +2080,47 @@ def _select_due_targets(user, send_window, now):
             already_sent.append(target_name)
             continue
         scheduled_at = _scheduled_send_time(user, target_name, send_window, now)
-        if streak_state.attempt_in_progress(user, target_name, now):
+        if any(
+            streak_state.attempt_in_progress(user, target_name, check_now)
+            for check_now in phase_check_times
+        ):
             pending_targets.append((target_name, scheduled_at))
             continue
-        if streak_state.fallback_attempted_today(user, target_name, now):
+        if any(
+            streak_state.fallback_attempted_today(
+                user,
+                target_name,
+                check_now,
+            )
+            for check_now in phase_check_times
+        ):
             pending_targets.append((target_name, scheduled_at))
             continue
-        if _target_has_non_retryable_failure_today(user, target_name, now):
+        if any(
+            streak_state.is_sent_unverified(
+                user,
+                target_name,
+                check_now,
+            )
+            for check_now in phase_check_times
+        ):
+            pending_targets.append((target_name, scheduled_at))
+            continue
+        if any(
+            _target_has_non_retryable_failure_today(
+                user,
+                target_name,
+                check_now,
+            )
+            for check_now in phase_check_times
+        ):
             queued_failures.append(target_name)
             continue
         if phase == "fallback":
-            fallback_now = (
-                now - timedelta(days=1)
-                if now.hour < int(send_window["startHour"])
-                and int(send_window["endHour"]) == 24
-                else now
-            )
-            if _target_sent_today(user, target_name, fallback_now):
+            if any(
+                _target_sent_today(user, target_name, check_now)
+                for check_now in phase_check_times
+            ):
                 pending_targets.append(
                     (
                         target_name,
@@ -2009,10 +2128,13 @@ def _select_due_targets(user, send_window, now):
                     )
                 )
                 continue
-            if _target_has_non_retryable_failure_today(
-                user,
-                target_name,
-                fallback_now,
+            if any(
+                _target_has_non_retryable_failure_today(
+                    user,
+                    target_name,
+                    check_now,
+                )
+                for check_now in phase_check_times
             ):
                 queued_failures.append(target_name)
                 continue
@@ -2049,6 +2171,53 @@ def _prepare_active_users_for_run(active_config, active_user_data):
     schedule_tz = _schedule_timezone()
     now = datetime.now(schedule_tz)
 
+    if not _is_manual_run() or _is_fallback_run():
+        healthy_users = []
+        checked_at = now.astimezone(timezone.utc).isoformat(timespec="seconds")
+        browser_sending_required = bool(
+            not active_config.get("useProtocolSender", True)
+            or active_config.get("browserFallbackEnabled", True)
+        )
+        browser_sender_accounts = {
+            str(item).strip().lower()
+            for item in (active_config.get("browserSenderAccounts") or [])
+            if str(item).strip()
+        }
+        for user in active_user_data:
+            account_uses_browser = bool(
+                _account_match_tokens(user) & browser_sender_accounts
+            )
+            preflight = streak_state.preflight_account(
+                user,
+                now,
+                require_friend_index=bool(
+                    user.get("friend_index_meta")
+                    or browser_sending_required
+                    or account_uses_browser
+                ),
+            )
+            if (
+                not preflight.get("healthy")
+                or user.get("account_health")
+                or user.get("account_failure")
+            ):
+                _persist_account_preflight(user, preflight, checked_at)
+            if not preflight.get("healthy"):
+                logger.warning(
+                    "Account %s failed preflight category=%s reason=%s",
+                    user.get("username") or user.get("unique_id") or "unknown",
+                    preflight.get("category") or "unknown",
+                    preflight.get("reason") or "",
+                )
+                continue
+            if _account_paused_by_failure_today(user, now):
+                continue
+            healthy_users.append(user)
+        active_user_data = healthy_users
+        if not active_user_data:
+            logger.warning("No accounts passed preflight for the scheduled run")
+            return []
+
     if _is_fallback_run():
         send_window = _normalize_send_window(active_config)
         if not send_window.get("enabled"):
@@ -2059,30 +2228,6 @@ def _prepare_active_users_for_run(active_config, active_user_data):
             if due_targets:
                 runnable_users.append(dict(user, targets=due_targets))
         return runnable_users
-
-    if not _is_manual_run():
-        healthy_users = []
-        checked_at = now.astimezone(timezone.utc).isoformat(timespec="seconds")
-        for user in active_user_data:
-            preflight = streak_state.preflight_account(
-                user,
-                now,
-                require_friend_index=bool(user.get("friend_index_meta")),
-            )
-            if not preflight.get("healthy"):
-                _persist_account_preflight(user, preflight, checked_at)
-                logger.warning(
-                    "Account %s failed preflight category=%s reason=%s",
-                    user.get("username") or user.get("unique_id") or "unknown",
-                    preflight.get("category") or "unknown",
-                    preflight.get("reason") or "",
-                )
-                continue
-            healthy_users.append(user)
-        active_user_data = healthy_users
-        if not active_user_data:
-            logger.warning("No accounts passed preflight for the scheduled run")
-            return []
 
     if _manual_run_failed_only():
         logger.info("SPARKFLOW_MANUAL_RUN=1, retrying queued failures only")
@@ -2330,8 +2475,28 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         matched = _find_matching_account(accounts, user)
         if matched is None:
             return None, False
+        state = streak_state.mark_failed(
+            matched,
+            target_name,
+            category=category,
+            reason=reason,
+            retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
+            now=state_now,
+            strategy="browser",
+        )
+        if (
+            state.get("status") not in streak_state.FAILED_STATES
+            or str(state.get("lastErrorCategory") or "") != str(category or "")
+            or str(state.get("lastAttemptAt") or "")
+            != state_now.isoformat(timespec="seconds")
+        ):
+            return None, False
         queue = dict(matched.get("failure_queue") or {})
-        existing_entry = dict(queue.get(target_name) or {})
+        existing_entry = streak_state.failure_entry(
+            matched,
+            target_name,
+            state_now.tzinfo,
+        )
         queue[target_name] = {
             "category": category,
             "reason": reason,
@@ -2344,15 +2509,6 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         if server_receipt:
             queue[target_name]["serverReceipt"] = server_receipt
         matched["failure_queue"] = queue
-        streak_state.mark_failed(
-            matched,
-            target_name,
-            category=category,
-            reason=reason,
-            retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
-            now=state_now,
-            strategy="browser",
-        )
         return (dict(queue[target_name]), dict(matched)), True
 
     saved = update_user_data(mutate, force_reload=True)
@@ -2366,10 +2522,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
 
     queue_entry, matched_account = saved
 
-    user_queue = dict(user.get("failure_queue") or {})
-    user_queue[target_name] = dict(queue_entry)
-    user["failure_queue"] = user_queue
-    streak_state.mark_failed(
+    state = streak_state.mark_failed(
         user,
         target_name,
         category=category,
@@ -2378,6 +2531,16 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         now=state_now,
         strategy="browser",
     )
+    if (
+        state.get("status") not in streak_state.FAILED_STATES
+        or str(state.get("lastErrorCategory") or "") != str(category or "")
+        or str(state.get("lastAttemptAt") or "")
+        != state_now.isoformat(timespec="seconds")
+    ):
+        return
+    user_queue = dict(user.get("failure_queue") or {})
+    user_queue[target_name] = dict(queue_entry)
+    user["failure_queue"] = user_queue
 
     logger.warning(
         "Queued failed browser send for %s/%s category=%s reason=%s",
@@ -2388,7 +2551,14 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
     )
 
 
-def _persist_browser_send_success(user, target_name, message, sent_at, server_receipt=None):
+def _persist_browser_send_success(
+    user,
+    target_name,
+    message,
+    sent_at,
+    server_receipt=None,
+    detail="",
+):
     state_now = parse_sent_at(sent_at, timezone.utc) or datetime.now(timezone.utc)
     strong_receipt = streak_state.receipt_is_strong(server_receipt)
     receipt_summary = ""
@@ -2407,7 +2577,15 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
             if strong_receipt
             else "browser_visible_count_increased"
         ),
-        "confirmationDetail": receipt_summary,
+        "confirmationDetail": (
+            receipt_summary
+            if strong_receipt
+            else str(
+                detail
+                or receipt_summary
+                or "browser_visible_count_increased"
+            )
+        ),
         "needsVerification": not strong_receipt,
     }
     if server_receipt:
@@ -2416,6 +2594,34 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
     def mutate(accounts):
         matched = _find_matching_account(accounts, user)
         if matched is None:
+            return None, False
+        expected_iso = state_now.isoformat(timespec="seconds")
+        if strong_receipt:
+            state = streak_state.mark_send_confirmed(
+                matched,
+                target_name,
+                strategy="browser",
+                now=state_now,
+                source="cdp_message_send_receipt",
+                detail=receipt_summary,
+            )
+            state_accepted = bool(
+                state.get("status") == streak_state.STATE_SEND_CONFIRMED
+                and str(state.get("confirmedAt") or "") == expected_iso
+            )
+        else:
+            state = streak_state.mark_sent_unverified(
+                matched,
+                target_name,
+                strategy="browser",
+                now=state_now,
+                detail=strong_entry["confirmationDetail"],
+            )
+            state_accepted = bool(
+                state.get("status") == streak_state.STATE_SENT_UNVERIFIED
+                and str(state.get("sentAt") or "") == expected_iso
+            )
+        if not state_accepted:
             return None, False
         history = dict(matched.get("message_history") or {})
         history[target_name] = dict(strong_entry)
@@ -2427,23 +2633,6 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
         else:
             matched.pop("failure_queue", None)
         matched.pop("account_failure", None)
-        if strong_receipt:
-            streak_state.mark_send_confirmed(
-                matched,
-                target_name,
-                strategy="browser",
-                now=state_now,
-                source="cdp_message_send_receipt",
-                detail=receipt_summary,
-            )
-        else:
-            streak_state.mark_sent_unverified(
-                matched,
-                target_name,
-                strategy="browser",
-                now=state_now,
-                detail="browser_visible_count_increased",
-            )
         return dict(matched), True
 
     matched_account = update_user_data(mutate, force_reload=True)
@@ -2455,6 +2644,34 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
         )
         return
 
+    expected_iso = state_now.isoformat(timespec="seconds")
+    if strong_receipt:
+        state = streak_state.mark_send_confirmed(
+            user,
+            target_name,
+            strategy="browser",
+            now=state_now,
+            source="cdp_message_send_receipt",
+            detail=receipt_summary,
+        )
+        state_accepted = bool(
+            state.get("status") == streak_state.STATE_SEND_CONFIRMED
+            and str(state.get("confirmedAt") or "") == expected_iso
+        )
+    else:
+        state = streak_state.mark_sent_unverified(
+            user,
+            target_name,
+            strategy="browser",
+            now=state_now,
+            detail="browser_visible_count_increased",
+        )
+        state_accepted = bool(
+            state.get("status") == streak_state.STATE_SENT_UNVERIFIED
+            and str(state.get("sentAt") or "") == expected_iso
+        )
+    if not state_accepted:
+        return
     user_history = dict(user.get("message_history") or {})
     user_history[target_name] = dict(strong_entry)
     user["message_history"] = user_history
@@ -2465,23 +2682,6 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
     else:
         user.pop("failure_queue", None)
     user.pop("account_failure", None)
-    if strong_receipt:
-        streak_state.mark_send_confirmed(
-            user,
-            target_name,
-            strategy="browser",
-            now=state_now,
-            source="cdp_message_send_receipt",
-            detail=receipt_summary,
-        )
-    else:
-        streak_state.mark_sent_unverified(
-            user,
-            target_name,
-            strategy="browser",
-            now=state_now,
-            detail="browser_visible_count_increased",
-        )
 
     logger.info(
         "Persisted browser send history for %s/%s at %s",
@@ -2491,63 +2691,23 @@ def _persist_browser_send_success(user, target_name, message, sent_at, server_re
     )
 
 
-def _persist_browser_streak_verified(user, target_name, sent_at, detail=""):
-    state_now = parse_sent_at(sent_at, timezone.utc) or datetime.now(timezone.utc)
-    entry = {
-        "message": "",
-        "sentAt": sent_at,
-        "status": "streak_verified",
-        "confirmationLevel": "verified",
-        "confirmationSource": "conversation_verified",
-        "confirmationDetail": str(detail or ""),
-        "needsVerification": False,
-    }
-
-    def mutate(accounts):
-        matched = _find_matching_account(accounts, user)
-        if matched is None:
-            return None, False
-        history = dict(matched.get("message_history") or {})
-        previous = dict(history.get(target_name) or {})
-        previous.update(entry)
-        history[target_name] = previous
-        matched["message_history"] = history
-        failure_queue = dict(matched.get("failure_queue") or {})
-        failure_queue.pop(target_name, None)
-        if failure_queue:
-            matched["failure_queue"] = failure_queue
-        else:
-            matched.pop("failure_queue", None)
-        matched.pop("account_failure", None)
-        streak_state.mark_streak_verified(
-            matched,
-            target_name,
-            now=state_now,
-            detail=detail,
-        )
-        return dict(matched), True
-
-    matched_account = update_user_data(mutate, force_reload=True)
-    if matched_account is None:
-        logger.warning(
-            "Could not find account to persist streak verification for user=%s target=%s",
-            user.get("username", "unknown"),
-            target_name,
-        )
-        return
-    history = dict(user.get("message_history") or {})
-    previous = dict(history.get(target_name) or {})
-    previous.update(entry)
-    history[target_name] = previous
-    user["message_history"] = history
-    failure_queue = dict(user.get("failure_queue") or {})
-    failure_queue.pop(target_name, None)
-    if failure_queue:
-        user["failure_queue"] = failure_queue
-    else:
-        user.pop("failure_queue", None)
-    user.pop("account_failure", None)
-    streak_state.mark_streak_verified(user, target_name, now=state_now, detail=detail)
+def _persist_browser_recovery_outcome(
+    user,
+    target_name,
+    message,
+    sent_at,
+    *,
+    detail="",
+    server_receipt=None,
+):
+    _persist_browser_send_success(
+        user,
+        target_name,
+        message,
+        sent_at,
+        server_receipt=server_receipt,
+        detail=detail,
+    )
 
 
 def _split_sender_modes(active_config, runnable_user_data):
@@ -2572,32 +2732,63 @@ def _split_sender_modes(active_config, runnable_user_data):
     return protocol_users, browser_users
 
 
-def _mark_browser_target_in_flight(user, target_name):
-    if not _ACTIVE_RUN_ID:
-        return
+def _mark_browser_target_in_flight(
+    user,
+    target_name,
+    *,
+    run_id="",
+    fallback=False,
+    allow_retry=False,
+):
+    effective_run_id = str(run_id or _ACTIVE_RUN_ID or "")
+    if not effective_run_id:
+        return False
     now = datetime.now(timezone.utc)
-    streak_state.mark_in_flight(
+    state, claimed = streak_state.claim_in_flight(
         user,
         target_name,
-        run_id=_ACTIVE_RUN_ID,
+        run_id=effective_run_id,
         strategy="browser",
         now=now,
+        allow_retry=allow_retry,
     )
+    if (
+        not claimed
+        or
+        state.get("status") != streak_state.STATE_IN_FLIGHT
+        or str(state.get("runId") or "") != effective_run_id
+    ):
+        return False
+    if fallback:
+        streak_state.mark_fallback_attempted(user, target_name, now=now)
 
     def mutate(accounts):
         matched = streak_state.find_matching_account(accounts, user)
         if matched is None:
             return None, False
-        streak_state.mark_in_flight(
+        matched_state = streak_state.mark_in_flight(
             matched,
             target_name,
-            run_id=_ACTIVE_RUN_ID,
+            run_id=effective_run_id,
             strategy="browser",
             now=now,
+            allow_retry=allow_retry,
         )
-        return None, True
+        if (
+            matched_state.get("status") != streak_state.STATE_IN_FLIGHT
+            or str(matched_state.get("runId") or "") != effective_run_id
+        ):
+            return None, False
+        if fallback:
+            streak_state.mark_fallback_attempted(
+                matched,
+                target_name,
+                now=now,
+            )
+        return dict(matched), True
 
-    update_user_data(mutate, force_reload=True)
+    persisted = update_user_data(mutate, force_reload=True)
+    return persisted is not None
 
 
 def _persist_account_preflight(user, result, checked_at):
@@ -2607,16 +2798,46 @@ def _persist_account_preflight(user, result, checked_at):
         "reason": str(result.get("reason") or ""),
         "checkedAt": checked_at,
     }
+    recoverable_failure_categories = set(
+        streak_state.LOGIN_FAILURE_CATEGORIES
+    ) | {
+        "expired_cookies",
+        "friend_index_stale",
+        "missing_cookies",
+        "network_unavailable",
+    }
 
     def mutate(accounts):
         matched = streak_state.find_matching_account(accounts, user)
         if matched is None:
             return None, False
         matched["account_health"] = dict(record)
+        if record["healthy"]:
+            failure = dict(matched.get("account_failure") or {})
+            if str(failure.get("category") or "") in recoverable_failure_categories:
+                matched.pop("account_failure", None)
+            for key in (
+                "account_identity_mismatch",
+                "identity_mismatch",
+                "login_required",
+                "needs_relogin",
+            ):
+                matched.pop(key, None)
         return None, True
 
     update_user_data(mutate, force_reload=True)
     user["account_health"] = dict(record)
+    if record["healthy"]:
+        failure = dict(user.get("account_failure") or {})
+        if str(failure.get("category") or "") in recoverable_failure_categories:
+            user.pop("account_failure", None)
+        for key in (
+            "account_identity_mismatch",
+            "identity_mismatch",
+            "login_required",
+            "needs_relogin",
+        ):
+            user.pop(key, None)
 
 
 def _prepare_protocol_fallback_users(active_config, protocol_users):
@@ -2635,7 +2856,6 @@ def _prepare_protocol_fallback_users(active_config, protocol_users):
                 streak_state.reconcile_account(matched, now)
                 if not streak_state.fallback_eligible(matched, target_name, now):
                     continue
-                streak_state.mark_fallback_attempted(matched, target_name, now=now)
                 targets.append(target_name)
             if targets:
                 fallback_users.append(dict(matched, targets=targets))
@@ -2644,7 +2864,14 @@ def _prepare_protocol_fallback_users(active_config, protocol_users):
     return update_user_data(mutate, force_reload=True) or []
 
 
-def _append_streak_run_report(run_id, started_at, active_config, users):
+def _append_streak_run_report(
+    run_id,
+    started_at,
+    active_config,
+    users,
+    *,
+    run_status="completed",
+):
     completed_at = datetime.now(timezone.utc)
     duration_ms = max(
         0,
@@ -2664,21 +2891,31 @@ def _append_streak_run_report(run_id, started_at, active_config, users):
             or account.get("username")
             or ""
         )
+        account_health = dict(account.get("account_health") or {})
+        preflight_failed = account_health.get("healthy") is False
         for target_name in account.get("targets") or []:
             state = streak_state.target_state(account, target_name, completed_at)
+            state_category = str(state.get("lastErrorCategory") or "")
+            state_reason = str(state.get("lastErrorReason") or "")
+            report_status = str(state.get("status") or "")
+            if preflight_failed:
+                state_category = str(account_health.get("category") or "")
+                state_reason = str(account_health.get("reason") or "")
+                report_status = "account_preflight_failed"
             report_record = {
                 "runId": run_id,
                 "accountRef": account_ref,
                 "targetRef": state.get("targetRef") or "",
                 "displayName": state.get("displayName") or target_name,
-                "status": state.get("status") or "",
+                "status": report_status,
                 "strategy": state.get("strategy") or "",
                 "attemptCount": state.get("attemptCount") or 0,
-                "category": state.get("lastErrorCategory") or "",
-                "reason": state.get("lastErrorReason") or "",
+                "category": state_category,
+                "reason": state_reason,
                 "confirmationSource": state.get("confirmationSource") or "",
                 "durationMs": duration_ms,
                 "networkRoute": network_route,
+                "runStatus": str(run_status or "completed"),
             }
             report_records.append(report_record)
             streak_state.append_run_report(
@@ -2686,6 +2923,28 @@ def _append_streak_run_report(run_id, started_at, active_config, users):
                 path=report_dir / f"{completed_at.date().isoformat()}.jsonl",
                 now=completed_at,
             )
+    if not report_records:
+        report_record = {
+            "runId": run_id,
+            "accountRef": "",
+            "targetRef": "",
+            "displayName": "",
+            "status": str(run_status or "completed"),
+            "strategy": "",
+            "attemptCount": 0,
+            "category": "",
+            "reason": "",
+            "confirmationSource": "",
+            "durationMs": duration_ms,
+            "networkRoute": network_route,
+            "runStatus": str(run_status or "completed"),
+        }
+        report_records.append(report_record)
+        streak_state.append_run_report(
+            report_record,
+            path=report_dir / f"{completed_at.date().isoformat()}.jsonl",
+            now=completed_at,
+        )
     if report_records:
         streak_state.update_weekly_summary(
             report_records,
@@ -2793,7 +3052,14 @@ def _browser_account_timeout_seconds(friend_scan_config, target_count):
     return max(900, scan_seconds + 420 + max(1, target_count) * 240)
 
 
-async def run_browser_tasks(active_config, browser_user_data):
+async def run_browser_tasks(
+    active_config,
+    browser_user_data,
+    *,
+    run_id="",
+    fallback=False,
+    allow_retry=False,
+):
     if not browser_user_data:
         return
 
@@ -2819,7 +3085,20 @@ async def run_browser_tasks(active_config, browser_user_data):
                 user.get("username", "unknown"),
                 len(user["targets"]),
             )
-            tasks.append(do_user_task(None, user, semaphore, send_strategy, profile_config, friend_scan_config, network_mode))
+            tasks.append(
+                do_user_task(
+                    None,
+                    user,
+                    semaphore,
+                    send_strategy,
+                    profile_config,
+                    friend_scan_config,
+                    network_mode,
+                    run_id=run_id,
+                    fallback=fallback,
+                    allow_retry=allow_retry,
+                )
+            )
         await asyncio.gather(*tasks)
         return
 
@@ -2831,7 +3110,20 @@ async def run_browser_tasks(active_config, browser_user_data):
                 user.get("username", "unknown"),
                 len(user["targets"]),
             )
-            tasks.append(do_user_task(browser, user, semaphore, send_strategy, profile_config, friend_scan_config, network_mode))
+            tasks.append(
+                do_user_task(
+                    browser,
+                    user,
+                    semaphore,
+                    send_strategy,
+                    profile_config,
+                    friend_scan_config,
+                    network_mode,
+                    run_id=run_id,
+                    fallback=fallback,
+                    allow_retry=allow_retry,
+                )
+            )
 
         await asyncio.gather(*tasks)
     finally:
@@ -2841,7 +3133,19 @@ async def run_browser_tasks(active_config, browser_user_data):
             await playwright.stop()
 
 
-async def do_user_task(browser, user, semaphore, send_strategy, profile_config, friend_scan_config, network_mode):
+async def do_user_task(
+    browser,
+    user,
+    semaphore,
+    send_strategy,
+    profile_config,
+    friend_scan_config,
+    network_mode,
+    *,
+    run_id="",
+    fallback=False,
+    allow_retry=False,
+):
     async with semaphore:
         account_name = user.get("username", "unknown")
         account_lock_handle = None
@@ -2871,7 +3175,10 @@ async def do_user_task(browser, user, semaphore, send_strategy, profile_config, 
                         profile_config,
                         friend_scan_config,
                         account_name,
-                    network_mode,
+                        network_mode,
+                        run_id=run_id,
+                        fallback=fallback,
+                        allow_retry=allow_retry,
                     ),
                     timeout=timeout_seconds,
                 )
@@ -2898,7 +3205,19 @@ async def do_user_task(browser, user, semaphore, send_strategy, profile_config, 
                 )
 
 
-async def _do_user_task_locked(browser, user, send_strategy, profile_config, friend_scan_config, account_name, network_mode):
+async def _do_user_task_locked(
+    browser,
+    user,
+    send_strategy,
+    profile_config,
+    friend_scan_config,
+    account_name,
+    network_mode,
+    *,
+    run_id="",
+    fallback=False,
+    allow_retry=False,
+):
     cookies = user["cookies"]
     targets = _ordered_targets_for_run(user["targets"], send_strategy)
     start_delay = _random_delay_seconds(
@@ -3030,7 +3349,20 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
                         len((last_own_message_before or {}).get("text", "")),
                     )
 
-                    _mark_browser_target_in_flight(user, target_name)
+                    started = _mark_browser_target_in_flight(
+                        user,
+                        target_name,
+                        run_id=run_id,
+                        fallback=fallback,
+                        allow_retry=allow_retry,
+                    )
+                    if not started:
+                        logger.info(
+                            "Skipping browser send for %s/%s because it is already confirmed",
+                            account_name,
+                            target_name,
+                        )
+                        continue
                     lines = message.split("\n")
                     for index, line in enumerate(lines):
                         await chat_input.type(line, delay=50)
@@ -3102,7 +3434,10 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
                             message,
                             before_snapshot=last_own_message_before,
                         )
-                    if sent_ok and not str(exc).startswith("server send"):
+                    if _should_persist_recovered_browser_evidence(
+                        sent_ok,
+                        exc,
+                    ):
                         logger.warning(
                             "Recovered send outcome for %s/%s after failure: %s",
                             account_name,
@@ -3113,19 +3448,22 @@ async def _do_user_task_locked(browser, user, send_strategy, profile_config, fri
                             timespec="seconds"
                         )
                         if streak_state.receipt_is_strong(send_receipt):
-                            _persist_browser_send_success(
+                            _persist_browser_recovery_outcome(
                                 user,
                                 target_name,
                                 message,
                                 verified_at,
+                                detail=detail,
                                 server_receipt=send_receipt,
                             )
                         else:
-                            _persist_browser_streak_verified(
+                            _persist_browser_recovery_outcome(
                                 user,
                                 target_name,
+                                message,
                                 verified_at,
                                 detail=detail,
+                                server_receipt={},
                             )
                         continue
 
@@ -3242,21 +3580,28 @@ async def runTasks():
     for user in disabled_user_data:
         logger.info("skipping disabled user=%s", user.get("username", "unknown"))
 
-    if not active_user_data:
-        logger.warning("No enabled accounts are available for the task run")
-        return
-
-    runnable_user_data = _prepare_active_users_for_run(active_config, active_user_data)
-    if not runnable_user_data:
-        return
-
     run_id = uuid.uuid4().hex
     started_at = datetime.now(timezone.utc)
     _ACTIVE_RUN_ID = run_id
-    for user in runnable_user_data:
-        streak_state.reconcile_account(user, started_at)
+    run_status = "completed"
 
     try:
+        if not active_user_data:
+            run_status = "skipped_no_enabled_accounts"
+            logger.warning("No enabled accounts are available for the task run")
+            return
+
+        runnable_user_data = _prepare_active_users_for_run(
+            active_config,
+            active_user_data,
+        )
+        if not runnable_user_data:
+            run_status = "skipped_no_runnable_accounts"
+            return
+
+        for user in runnable_user_data:
+            streak_state.reconcile_account(user, started_at)
+
         with task_run_lock():
             protocol_user_data, browser_user_data = _split_sender_modes(active_config, runnable_user_data)
             if protocol_user_data:
@@ -3281,10 +3626,18 @@ async def runTasks():
                         "Running browser fallback for %s protocol-failed targets",
                         sum(len(user.get("targets") or []) for user in fallback_users),
                     )
-                    await run_browser_tasks(active_config, fallback_users)
+                    await run_browser_tasks(
+                        active_config,
+                        fallback_users,
+                        fallback=True,
+                    )
             await run_browser_tasks(active_config, browser_user_data)
     except TaskRunAlreadyInProgress:
+        run_status = "skipped_task_in_progress"
         logger.warning("Skipping task run because another task run is already in progress")
+    except Exception:
+        run_status = "failed"
+        raise
     finally:
         try:
             _append_streak_run_report(
@@ -3292,6 +3645,7 @@ async def runTasks():
                 started_at,
                 active_config,
                 get_userData(force_reload=True),
+                run_status=run_status,
             )
         finally:
             _ACTIVE_RUN_ID = ""

@@ -762,10 +762,11 @@ class RuntimeHardeningTests(unittest.TestCase):
         ):
             crontab = ops.replace_douyin_cron_schedule("", "10:00-24:00/20m")
 
-        self.assertIn("*/20 10-23 * * * scheduled", crontab)
+        self.assertIn("*/20 10-22 * * * scheduled", crontab)
+        self.assertIn("0-58/20 23 * * * scheduled", crontab)
         self.assertIn("59 23 * * * fallback", crontab)
 
-    def test_midnight_window_does_not_resend_after_date_rollover(self):
+    def test_midnight_window_treats_utc_rollover_as_same_local_day(self):
         now = datetime(2026, 9, 13, 0, 5, tzinfo=timezone.utc)
         window = {
             "enabled": True,
@@ -794,9 +795,9 @@ class RuntimeHardeningTests(unittest.TestCase):
         )
 
         self.assertEqual([], due)
-        self.assertEqual([], already_sent)
+        self.assertEqual(["target"], already_sent)
         self.assertEqual([], queued_failures)
-        self.assertEqual(1, len(pending))
+        self.assertEqual([], pending)
 
     def test_missing_playwright_browser_raises_runtime_error(self):
         class FailingPlaywright:

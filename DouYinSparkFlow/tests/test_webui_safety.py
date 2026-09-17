@@ -320,7 +320,6 @@ class WebUiSafetyTests(unittest.TestCase):
             text = cron_path.read_text(encoding="utf-8")
             self.assertIn("*/20 10-17 * * *", text)
             self.assertIn("0 18 * * *", text)
-            self.assertIn("20 18 * * *", text)
             self.assertIn("run_scheduled_task.sh", text)
             self.assertNotIn("docker exec", text)
 

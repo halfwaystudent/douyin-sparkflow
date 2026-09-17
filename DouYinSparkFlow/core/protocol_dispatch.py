@@ -53,18 +53,34 @@ def _build_protocol_target_identities(user, messages_by_target):
     for entry in cache:
         nickname = str(entry.get("nickname") or "").strip()
         if nickname:
-            by_nickname.setdefault(nickname, []).append(entry)
+            normalized_nickname = (
+                streak_state.normalize_target_name(nickname).casefold()
+            )
+            by_nickname.setdefault(normalized_nickname, []).append(entry)
 
     identities = {}
     for target in (messages_by_target or {}):
         target_name = str(target).strip()
-        matches = by_nickname.get(target_name) or []
-        if len(matches) > 1:
-            identities[target] = {"ambiguous": True}
-            continue
-        if len(matches) != 1:
-            continue
-        match = matches[0]
+        target_ref = streak_state.target_ref_for_stored_key(user, target_name)
+        stable_matches = [
+            entry
+            for entry in cache
+            if target_ref
+            and target_ref in streak_state._refs_from_record(entry)
+        ]
+        normalized_target = (
+            streak_state.normalize_target_name(target_name).casefold()
+        )
+        if stable_matches:
+            match = stable_matches[0]
+        else:
+            matches = by_nickname.get(normalized_target) or []
+            if len(matches) > 1:
+                identities[target] = {"ambiguous": True}
+                continue
+            if len(matches) != 1:
+                continue
+            match = matches[0]
         sec_uid = str(match.get("secUid") or "").strip()
         peer_user_id = str(match.get("peerUserId") or "").strip()
         if not sec_uid and not peer_user_id:
@@ -194,10 +210,38 @@ def _persist_protocol_account_failure(account, category, reason, affected_target
     return update_user_data(mutate, force_reload=True)
 
 
-def _record_protocol_target_failure(target_account, target_name, message, category, reason):
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _record_protocol_target_failure(
+    target_account,
+    target_name,
+    message,
+    category,
+    reason,
+    *,
+    now=None,
+):
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
+    state = streak_state.mark_failed(
+        target_account,
+        target_name,
+        category=category,
+        reason=reason,
+        retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
+        now=now,
+        strategy="protocol",
+    )
+    if (
+        state.get("status") not in streak_state.FAILED_STATES
+        or str(state.get("lastErrorCategory") or "") != str(category or "")
+        or str(state.get("lastAttemptAt") or "") != now_iso
+    ):
+        return False
     queue = dict(target_account.get("failure_queue") or {})
-    existing_entry = dict(queue.get(target_name) or {})
+    existing_entry = streak_state.failure_entry(
+        target_account,
+        target_name,
+        timezone.utc,
+    )
     queue[target_name] = {
         "category": category,
         "reason": reason,
@@ -208,12 +252,12 @@ def _record_protocol_target_failure(target_account, target_name, message, catego
         "lastRunMode": "protocol",
     }
     target_account["failure_queue"] = queue
+    return True
 
 
 def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
     changed = False
     now = datetime.now(timezone.utc)
-    now_iso = now.isoformat(timespec="seconds")
     accounts_by_identity = {
         identity: account
         for account in all_accounts
@@ -247,9 +291,31 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
             if not target or not message:
                 continue
 
+            entry_sent_at = (
+                streak_state._parse_time(
+                    entry.get("sentAt"),
+                    timezone.utc,
+                )
+                or now
+            )
+            state = streak_state.mark_send_confirmed(
+                target_account,
+                target,
+                strategy="protocol",
+                now=entry_sent_at,
+                source="protocol_send_receipt",
+                detail=str(entry.get("statusName") or entry.get("statusCode") or ""),
+            )
+            if (
+                str(state.get("status") or "")
+                != streak_state.STATE_SEND_CONFIRMED
+                or str(state.get("confirmedAt") or "")
+                != entry_sent_at.isoformat(timespec="seconds")
+            ):
+                continue
             history[target] = {
                 "message": message,
-                "sentAt": str(entry.get("sentAt", now_iso)),
+                "sentAt": entry_sent_at.isoformat(timespec="seconds"),
                 "status": "confirmed",
                 "confirmationLevel": "strong",
                 "confirmationSource": "protocol_send_receipt",
@@ -270,21 +336,17 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
             affected_targets = [
                 item
                 for item in (account_failure.get("affectedTargets") or [])
-                if str(item) != target
+                if not streak_state.target_keys_match(
+                    target_account,
+                    item,
+                    target,
+                )
             ]
             if affected_targets:
                 account_failure["affectedTargets"] = affected_targets
                 target_account["account_failure"] = account_failure
             elif account_failure:
                 target_account.pop("account_failure", None)
-            streak_state.mark_send_confirmed(
-                target_account,
-                target,
-                strategy="protocol",
-                now=now,
-                source="protocol_send_receipt",
-                detail=str(entry.get("statusName") or entry.get("statusCode") or ""),
-            )
             changed = True
 
         if history:
@@ -296,48 +358,41 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
             target = str(entry.get("target", "")).strip()
             if not target:
                 continue
-            _record_protocol_target_failure(
+            failure_at = (
+                streak_state._parse_time(
+                    entry.get("sentAt"),
+                    timezone.utc,
+                )
+                or now
+            )
+            changed = _record_protocol_target_failure(
                 target_account,
                 target,
                 str(entry.get("message", "")).strip(),
                 _protocol_failure_category(entry),
                 _protocol_failure_reason(entry),
-            )
-            category = _protocol_failure_category(entry)
-            streak_state.mark_failed(
-                target_account,
-                target,
-                category=category,
-                reason=_protocol_failure_reason(entry),
-                retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
-                now=now,
-                strategy="protocol",
-            )
-            changed = True
+                now=failure_at,
+            ) or changed
 
         unresolved = result.get("unresolved", []) or []
         for entry in unresolved:
             target = str(entry.get("target", "")).strip()
             if not target:
                 continue
-            _record_protocol_target_failure(
+            changed = _record_protocol_target_failure(
                 target_account,
                 target,
                 "",
                 str(entry.get("reason") or "protocol_unresolved"),
                 str(entry.get("reason") or "protocol could not resolve target"),
-            )
-            category = str(entry.get("reason") or "protocol_unresolved")
-            streak_state.mark_failed(
-                target_account,
-                target,
-                category=category,
-                reason="protocol could not resolve target",
-                retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
-                now=now,
-                strategy="protocol",
-            )
-            changed = True
+                now=(
+                    streak_state._parse_time(
+                        entry.get("sentAt"),
+                        timezone.utc,
+                    )
+                    or now
+                ),
+            ) or changed
 
     return changed
 
@@ -361,17 +416,45 @@ def _mark_protocol_targets_in_flight(user, run_id):
         matched = streak_state.find_matching_account(accounts, user)
         if matched is None:
             return None, False
+        claimed_targets = []
         for target_name in user.get("targets") or []:
-            streak_state.mark_in_flight(
+            state, claimed = streak_state.claim_in_flight(
                 matched,
                 target_name,
                 run_id=run_id,
                 strategy="protocol",
                 now=now,
             )
-        return None, True
+            if (
+                claimed
+                and
+                state.get("status") == streak_state.STATE_IN_FLIGHT
+                and str(state.get("runId") or "") == str(run_id or "")
+            ):
+                claimed_targets.append(str(target_name))
+        return claimed_targets, True
 
-    update_user_data(mutate, force_reload=True)
+    return update_user_data(mutate, force_reload=True)
+
+
+def _protocol_claimed_targets(user, run_id):
+    now = datetime.now(timezone.utc)
+
+    def mutate(accounts):
+        matched = streak_state.find_matching_account(accounts, user)
+        if matched is None:
+            return [], False
+        claimed = []
+        for target_name in user.get("targets") or []:
+            state = streak_state.target_state(matched, target_name, now)
+            if (
+                state.get("status") == streak_state.STATE_IN_FLIGHT
+                and str(state.get("runId") or "") == str(run_id or "")
+            ):
+                claimed.append(str(target_name))
+        return claimed, False
+
+    return update_user_data(mutate, force_reload=True) or []
 
 
 def _mark_protocol_targets_failed(user, category, reason):
@@ -548,8 +631,35 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id=""):
                 await asyncio.sleep(start_delay)
 
             logger.info("Starting protocol sender for %s", user.get("username", "unknown"))
-            if run_id:
-                _mark_protocol_targets_in_flight(user, run_id)
+            if run_id and not dry_run:
+                claimed_targets = _mark_protocol_targets_in_flight(user, run_id)
+                if claimed_targets is None:
+                    raise RuntimeError(
+                        f"unable to claim protocol targets for {user.get('username', 'unknown')}"
+                    )
+                claimed = {
+                    streak_state.normalize_target_name(target_name)
+                    for target_name in claimed_targets
+                }
+                user = dict(user)
+                user["targets"] = [
+                    target_name
+                    for target_name in user.get("targets") or []
+                    if streak_state.normalize_target_name(target_name) in claimed
+                ]
+                if not user["targets"]:
+                    logger.info(
+                        "Skipping protocol sender for %s because no targets need sending",
+                        user.get("username", "unknown"),
+                    )
+                    return {
+                        "ok": True,
+                        "sent": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "runner": "state-machine-skipped",
+                        "dryRun": dry_run,
+                    }
             messages_by_target = build_messages_for_targets(
                 user.get("targets", []),
                 previous_messages=user.get("message_history", {}),
@@ -601,17 +711,19 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id=""):
             reason = str(item)
             failures.append(reason)
             logger.error("Protocol sender failed for %s: %s", user.get("username", "unknown"), item)
+            claimed_targets = _protocol_claimed_targets(user, run_id)
             _persist_protocol_account_failure(
                 user,
                 "protocol_sender_failed",
                 reason,
                 user.get("targets", []),
             )
-            _mark_protocol_targets_failed(
-                user,
-                "protocol_sender_failed",
-                reason,
-            )
+            if claimed_targets:
+                _mark_protocol_targets_failed(
+                    dict(user, targets=claimed_targets),
+                    "protocol_sender_failed",
+                    reason,
+                )
             continue
         result_by_username[user.get("username")] = item
         unresolved = item.get("unresolved", [])

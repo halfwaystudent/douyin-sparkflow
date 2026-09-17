@@ -19,9 +19,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from core import streak_state
 from core.friends import fetch_account_friends
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
-from core.tasks import run_browser_tasks, task_run_lock
+from core.tasks import (
+    _append_streak_run_report,
+    run_browser_tasks,
+    task_run_lock,
+)
 from utils.config import (
     get_app_settings,
     get_config,
@@ -158,38 +163,58 @@ def _history_entry_strong_confirmed_today(entry):
 
 
 def _target_sent_today(account, target_name):
-    entry = dict(account.get("message_history") or {}).get(target_name) or {}
+    if streak_state.is_send_confirmed(account, target_name):
+        return True
+    entry = streak_state.history_entry(
+        account,
+        target_name,
+        _schedule_timezone(),
+    )
     return _history_entry_strong_confirmed_today(entry)
 
 
 def _target_unconfirmed_today(account, target_name):
-    entry = dict(account.get("message_history") or {}).get(target_name) or {}
+    now = datetime.now(_schedule_timezone())
+    entry = streak_state.history_entry(account, target_name, now.tzinfo)
     sent_at = _parse_sent_at(entry.get("sentAt"))
-    if sent_at and sent_at.date() == datetime.now(_schedule_timezone()).date() and not _history_entry_strong_confirmed_today(entry):
+    if (
+        sent_at
+        and sent_at.date() == now.date()
+        and not _history_entry_strong_confirmed_today(entry)
+        and not streak_state.is_send_confirmed(account, target_name, now)
+    ):
         return True
-    failure_entry = dict(account.get("failure_queue") or {}).get(target_name) or {}
+    failure_entry = streak_state.failure_entry(account, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"))
     return bool(
         last_attempt_at
-        and last_attempt_at.date() == datetime.now(_schedule_timezone()).date()
+        and last_attempt_at.date() == now.date()
         and str(failure_entry.get("category") or "") == "send_unconfirmed"
     )
 
 
-def mark_target_unconfirmed(account, target_name, *, reason="manual_reset_possible_false_positive", force=False):
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def mark_target_unconfirmed(
+    account,
+    target_name,
+    *,
+    reason="manual_reset_possible_false_positive",
+    force=False,
+    now=None,
+):
+    now_dt = (now or datetime.now(_schedule_timezone())).replace(
+        microsecond=0,
+    )
+    now = now_dt.astimezone(timezone.utc).isoformat(timespec="seconds")
     history = dict(account.get("message_history") or {})
-    existing = dict(history.get(target_name) or {})
+    existing = streak_state.history_entry(account, target_name, now_dt.tzinfo)
     sent_at = _parse_sent_at(existing.get("sentAt"))
-    today = datetime.now(_schedule_timezone()).date()
+    today = now_dt.date()
     if existing and sent_at and sent_at.date() != today and not force:
-        return False
-    if existing and _history_entry_strong_confirmed_today(existing) and not force:
         return False
 
     previous_status = existing.get("status") or ("legacy_sentAt_only" if existing else "missing_history")
     message = str(existing.get("message") or "")
-    history[target_name] = {
+    history_entry = {
         **existing,
         "message": message,
         "sentAt": existing.get("sentAt") or now,
@@ -202,11 +227,14 @@ def mark_target_unconfirmed(account, target_name, *, reason="manual_reset_possib
         "resetReason": reason,
         "previousStatus": previous_status,
     }
-    account["message_history"] = history
 
     queue = dict(account.get("failure_queue") or {})
-    existing_failure = dict(queue.get(target_name) or {})
-    queue[target_name] = {
+    existing_failure = streak_state.failure_entry(
+        account,
+        target_name,
+        now_dt.tzinfo,
+    )
+    queue_entry = {
         "category": "send_unconfirmed",
         "reason": reason,
         "message": message,
@@ -214,9 +242,26 @@ def mark_target_unconfirmed(account, target_name, *, reason="manual_reset_possib
         "lastAttemptAt": now,
         "attemptCount": int(existing_failure.get("attemptCount") or 0) + 1,
         "lastRunMode": "manual_reset",
-        "confirmationLevel": history[target_name].get("confirmationLevel"),
-        "confirmationSource": history[target_name].get("confirmationSource"),
+        "confirmationLevel": history_entry.get("confirmationLevel"),
+        "confirmationSource": history_entry.get("confirmationSource"),
     }
+    state = streak_state.mark_unconfirmed(
+        account,
+        target_name,
+        reason=reason,
+        now=now_dt,
+        detail=history_entry.get("confirmationDetail") or "",
+    )
+    if (
+        str(state.get("status") or "")
+        != streak_state.STATE_FAILED_RETRYABLE
+        or str(state.get("lastErrorCategory") or "") != "send_unconfirmed"
+        or streak_state._parse_time(state.get("resetAt")) != now_dt
+    ):
+        return False
+    history[target_name] = history_entry
+    queue[target_name] = queue_entry
+    account["message_history"] = history
     account["failure_queue"] = queue
     return True
 
@@ -386,6 +431,15 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
             target["username"] = username
             target["cookies"] = cookies
             target.setdefault("enabled", True)
+            for key in (
+                "account_failure",
+                "account_health",
+                "account_identity_mismatch",
+                "identity_mismatch",
+                "login_required",
+                "needs_relogin",
+            ):
+                target.pop(key, None)
             _dedupe_account_records(
                 accounts,
                 unique_id=unique_id,
@@ -398,6 +452,15 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
             existing["username"] = username
             existing["cookies"] = cookies
             existing.setdefault("enabled", True)
+            for key in (
+                "account_failure",
+                "account_health",
+                "account_identity_mismatch",
+                "identity_mismatch",
+                "login_required",
+                "needs_relogin",
+            ):
+                existing.pop(key, None)
             _dedupe_account_records(
                 accounts,
                 unique_id=unique_id,
@@ -1047,13 +1110,38 @@ def create_app():
         account_copy["targets"] = [target_name]
         config = get_config(force_reload=True)
         config["taskCount"] = 1
+        run_id = uuid.uuid4().hex
+        started_at = datetime.now(timezone.utc)
+        run_status = "completed"
 
         try:
-            with task_run_lock():
-                await run_browser_tasks(config, [account_copy])
-        except Exception as exc:
-            flash(request, f"Retry failed for {account.get('username', 'Account')} / {target_name}: {exc}", "error")
-            return redirect("/ops/send-console")
+            try:
+                with task_run_lock():
+                    await run_browser_tasks(
+                        config,
+                        [account_copy],
+                        run_id=run_id,
+                        allow_retry=True,
+                    )
+            except Exception as exc:
+                run_status = "failed"
+                flash(request, f"Retry failed for {account.get('username', 'Account')} / {target_name}: {exc}", "error")
+                return redirect("/ops/send-console")
+        finally:
+            try:
+                _append_streak_run_report(
+                    run_id,
+                    started_at,
+                    config,
+                    get_userData(force_reload=True),
+                    run_status=run_status,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to append manual streak retry report for %s / %s",
+                    account.get("username", "Account"),
+                    target_name,
+                )
 
         updated_account = find_account(get_userData(force_reload=True), unique_id) or {}
         if _target_sent_today(updated_account, target_name):
@@ -1066,7 +1154,14 @@ def create_app():
             account_failure = dict(updated_account.get("account_failure") or {})
             affected_targets = list(account_failure.get("affectedTargets") or [])
             failure_entry = dict(updated_account.get("failure_queue") or {}).get(target_name) or {}
-            if target_name in affected_targets:
+            if any(
+                streak_state.target_keys_match(
+                    updated_account,
+                    target_name,
+                    affected_target,
+                )
+                for affected_target in affected_targets
+            ):
                 reason = str(account_failure.get("reason") or "Account-level browser failure.")
             else:
                 reason = str(failure_entry.get("reason") or "Retry did not confirm a successful send.")
@@ -1123,7 +1218,11 @@ def create_app():
             changed_count = 0
             for account in accounts:
                 for target_name in list(account.get("targets") or []):
-                    entry = dict(account.get("message_history") or {}).get(target_name) or {}
+                    entry = streak_state.history_entry(
+                        account,
+                        target_name,
+                        datetime.now(_schedule_timezone()).tzinfo,
+                    )
                     sent_at = _parse_sent_at(entry.get("sentAt"))
                     if not sent_at or sent_at.date() != datetime.now(_schedule_timezone()).date():
                         continue
