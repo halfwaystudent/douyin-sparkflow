@@ -1206,6 +1206,45 @@ class MergeDuplicateAccountTests(unittest.TestCase):
 class ReloginOverwriteTests(unittest.TestCase):
     """Re-logging into a chosen account must overwrite it, not be refused."""
 
+    def test_overwrite_keeps_targets_and_ledger_and_adds_no_row(self):
+        accounts = [
+            {
+                "unique_id": "123",
+                "username": "Old",
+                "account_ref": "acc-1",
+                "targets": ["A", "B"],
+                "target_states": {"A": {"done": True}},
+                "cookies": [{"name": "old", "value": "1"}],
+            }
+        ]
+
+        def fake_update(mutator, **_kwargs):
+            return mutator(accounts)
+
+        with patch.object(app_module, "update_user_data", side_effect=fake_update):
+            account, action = app_module.save_exported_login_result(
+                {
+                    "unique_id": "999",
+                    "username": "New",
+                    "cookies": [
+                        {"name": "sessionid", "value": "x"},
+                        {"name": "sid_guard", "value": "y"},
+                    ],
+                },
+                relogin_account_ref="acc-1",
+                relogin_unique_id="123",
+            )
+
+        # Identity and login state are overwritten...
+        self.assertEqual("999", account["unique_id"])
+        self.assertEqual("New", account["username"])
+        # ...while the operator's targets and send ledger survive, and no second
+        # row is created for the same person.
+        self.assertEqual(["A", "B"], account["targets"])
+        self.assertEqual({"A": {"done": True}}, account["target_states"])
+        self.assertEqual(1, len(accounts))
+        self.assertEqual("updated", action)
+
     def test_differing_uid_is_accepted_so_the_account_is_overwritten(self):
         import asyncio
         from unittest.mock import AsyncMock
@@ -1239,6 +1278,48 @@ class ReloginOverwriteTests(unittest.TestCase):
         self.assertEqual("", reason)
         self.assertEqual("", category)
         self.assertEqual("999", identity["unique_id"])
+
+
+class ScheduleWindowLockTests(unittest.TestCase):
+    """The send window may only be edited from outside a running window."""
+
+    def setUp(self):
+        self.client = TestClient(app_module.app)
+        self.principal = {
+            "username": "admin",
+            "role": "admin",
+            "account_refs": [],
+            "session_id": "session-1",
+        }
+
+    def test_save_is_refused_while_the_window_is_running(self):
+        with (
+            patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(
+                app_module,
+                "schedule_window_state",
+                return_value={
+                    "enabled": True,
+                    "inside": True,
+                    "startHour": 10,
+                    "endHour": 18,
+                    "label": "10:00-18:00/20m",
+                },
+            ),
+            patch.object(app_module, "update_daily_schedule") as update,
+        ):
+            response = self.client.post(
+                "/ops/schedule",
+                data={"csrf_token": "t", "daily_schedule": "08:00-09:00"},
+                follow_redirects=False,
+            )
+
+        # Refused, and crucially nothing was written: no partial config change and
+        # no cron rewrite while the window is running.
+        self.assertEqual(303, response.status_code)
+        update.assert_not_called()
 
 
 class MergeRedirectContractTests(unittest.TestCase):
