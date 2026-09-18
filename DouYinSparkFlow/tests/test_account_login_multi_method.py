@@ -1158,6 +1158,39 @@ class MergeDuplicateAccountTests(unittest.TestCase):
         # Enabled is the union so a merge cannot silently disable sending.
         self.assertTrue(stored[0]["enabled"])
 
+    def test_merge_keeps_the_kept_rows_value_on_a_conflicting_key(self):
+        accounts = [
+            {
+                "unique_id": "1",
+                "username": "Same",
+                "targets": ["A"],
+                "target_states": {"A": {"owner": "kept"}},
+                "target_refs": {"A": {"ref": "kept"}},
+            },
+            {
+                "unique_id": "2",
+                "username": "Same",
+                "targets": ["A"],
+                "target_states": {"A": {"owner": "source"}},
+                "target_refs": {"A": {"ref": "source"}},
+                "friend_index_meta": {"A": {"scanned": 2}},
+                "message_history": {"A": [2]},
+            },
+        ]
+        merged, changed, stored = self._merge(accounts)
+
+        self.assertTrue(changed)
+        # A conflicting key must resolve in the kept row's favour. Switching
+        # setdefault to update would silently overwrite it and this test fails.
+        self.assertEqual({"owner": "kept"}, merged["target_states"]["A"])
+        self.assertEqual({"ref": "kept"}, merged["target_refs"]["A"])
+        # Keys the kept row lacks are still carried over, including the maps the
+        # other test never touches.
+        self.assertEqual({"scanned": 2}, merged["friend_index_meta"]["A"])
+        self.assertEqual([2], merged["message_history"]["A"])
+        self.assertEqual(["A"], merged["targets"])
+        self.assertEqual(["1"], [item["unique_id"] for item in stored])
+
     def test_merge_refuses_self_and_missing_accounts(self):
         from utils import config
 
