@@ -751,16 +751,19 @@
         } catch (error) {
           const candidate = error.payload && error.payload.duplicate_candidate;
           if (!candidate) throw error;
-          // Creating a second row with the same nickname is what produced the
-          // duplicate accounts, so the server asks instead of guessing.
+          // "Cancel" must mean "do nothing": binding it to "create a duplicate
+          // anyway" is the opposite of what the button suggests and is how a
+          // second identical account gets created by accident.
           const update = window.confirm(
             `已有一个同名账号（${candidate.username || "未命名"}）。\n\n` +
               "点“确定”＝更新这个已有账号，保留它的目标与发送记录；\n" +
-              "点“取消”＝仍然新建一个单独的账号。",
+              "点“取消”＝放弃本次保存，不做任何改动。",
           );
-          data = await saveLogin(
-            update ? { merge_with: candidate.account_ref } : { allow_duplicate: "1" },
-          );
+          if (!update) {
+            setStatus("已取消保存：没有改动任何账号。若确实要新建一个同名账号，请先确认它和已有账号不是同一个人。");
+            return;
+          }
+          data = await saveLogin({ merge_with: candidate.account_ref });
         }
         renderWorkspace(data.workspace);
         if (data.verified === false) {

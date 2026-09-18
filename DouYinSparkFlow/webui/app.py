@@ -2689,13 +2689,26 @@ def create_app():
                     operation = "relogin"
             if (
                 not existing
-                and operation != "relogin"
                 and str(form.get("allow_duplicate", "")).strip() != "1"
             ):
+                # No account matched this unique_id, so creating a row is the
+                # only remaining outcome. Ask first if the nickname already
+                # exists, otherwise a changed unique_id silently duplicates the
+                # account. This deliberately does not depend on the requested
+                # mode: a crafted relogin request without a target would skip it.
                 # Adding an account whose nickname already exists usually means
                 # the same person came back with a different unique_id; creating
                 # a second row is what produced the duplicate accounts. Ask first.
-                exported_name = str(exported.get("username") or "").strip()
+                # Fall back to the unique_id when the export carries no nickname,
+                # otherwise an empty name silently skips the duplicate check.
+                exported_name = str(
+                    exported.get("username") or exported.get("unique_id") or ""
+                ).strip()
+                if str(form.get("allow_duplicate", "")).strip() == "1":
+                    logger.info(
+                        "Login save creates a separate account past a same-name match: scanned_uid=%s",
+                        normalize_unique_id(exported.get("unique_id")),
+                    )
                 same_name = [
                     item
                     for item in find_same_name_account(
