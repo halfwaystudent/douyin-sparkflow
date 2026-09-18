@@ -405,6 +405,10 @@
             <span class="account-avatar">{{ (account.username or "A")[:1] }}</span>
             <span>
               <strong>{{ account.username }}</strong>
+              {% set duplicate_count = duplicate_display_names(accounts).get(account.username, 0) %}
+              {% if duplicate_count > 1 %}
+              <span class="status-chip warning" title="同名账号通常来自重复保存登录态，建议确认后合并或删除多余的记录">同名 {{ duplicate_count }} 个</span>
+              {% endif %}
               <small>{{ account.targets|length }} 个目标 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
             </span>
           </span>

@@ -95,6 +95,7 @@ from webui.ops import (
     get_overview_snapshot,
     get_ops_snapshot,
     cache_age_label,
+    duplicate_display_names,
     log_file_path,
     read_log_tail,
     summarize_log_tail,
@@ -118,6 +119,7 @@ STATIC_DIR = BASE_DIR / "static"
 DEBUG_ARTIFACTS_DIR = BASE_DIR.parent / "logs" / "debug_artifacts"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["cache_age_label"] = cache_age_label
+templates.env.globals["duplicate_display_names"] = duplicate_display_names
 
 
 def _dedupe_targets(values):

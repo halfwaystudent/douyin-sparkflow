@@ -837,6 +837,21 @@ def _next_window_trigger(now, window):
 FRIENDS_CACHE_TTL_HOURS = 168
 
 
+def duplicate_display_names(accounts):
+    """Return {nickname: count} for nicknames shared by more than one account.
+
+    A duplicate row usually means a re-login came back with a different
+    unique_id; the console should say so instead of leaving the operator to
+    notice two identical cards.
+    """
+    counts: dict[str, int] = {}
+    for item in accounts or []:
+        name = str((item or {}).get("username") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return {name: count for name, count in counts.items() if count > 1}
+
+
 def cache_age_label(value, ttl_hours=FRIENDS_CACHE_TTL_HOURS):
     """Human label for a cached-friends timestamp, flagging a stale cache."""
     parsed = _parse_sent_at(value, _schedule_timezone())
