@@ -599,6 +599,11 @@
             —— {{ alignment.detail }}
             {% if not alignment.aligned %}<span class="status-chip warning">需要核对</span>{% endif %}
           </p>
+          {% if alignment.missingTriggers %}
+          <p class="muted compact schedule-preview-warning">
+            ⚠ 已配置发送窗口且已过窗口开始时间，但任务日志里没有任何触发记录：请确认定时任务是否真的在执行。
+          </p>
+          {% endif %}
           {% if alignment.lines %}
           <ul class="schedule-lines muted compact">
             {% for line in alignment.lines %}<li><code>{{ line }}</code></li>{% endfor %}

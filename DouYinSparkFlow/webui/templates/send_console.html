@@ -82,6 +82,18 @@
     </button>
   </div>
 
+  <div class="status-banner {% if summary.today_attention_targets %}warning{% else %}success{% endif %}" data-today-summary>
+    <strong>
+      <i data-lucide="{% if summary.today_attention_targets %}triangle-alert{% else %}circle-check{% endif %}"></i>
+      <span>
+        今日结论：强确认 {{ summary.today_confirmed_targets }} · 仅页面回显 {{ summary.today_page_echo_targets }} ·
+        待核验 {{ summary.today_unconfirmed_targets }} · 失败 {{ summary.today_failed_targets }} ·
+        受账号阻断 {{ summary.today_account_blocked_targets }} · 待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
+        （共 {{ summary.total_targets }} 个目标，{{ summary.enabled_accounts }} 个启用账号）
+      </span>
+    </strong>
+  </div>
+
   <section class="metric-grid" aria-label="发送状态汇总">
     <article class="metric-card info">
       <div class="metric-label">总目标</div>

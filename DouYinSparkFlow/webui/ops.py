@@ -600,6 +600,14 @@ def get_schedule_alignment():
             detail = "按单次固定时间调度（该模式的时间保存在任务行内）"
         else:
             detail = "配置未启用发送窗口，但 spool 中仍存在窗口式任务行"
+    triggers = recent_trigger_lines()
+    missing_triggers = False
+    if enabled:
+        try:
+            now = datetime.now(_schedule_timezone())
+            missing_triggers = now.hour >= int(window.get("startHour") or 0) and not triggers
+        except (TypeError, ValueError):
+            missing_triggers = False
     return {
         "windowEnabled": enabled,
         "configLabel": _format_window_schedule(window) if enabled else "",
@@ -608,6 +616,8 @@ def get_schedule_alignment():
         "kinds": kinds,
         "aligned": aligned,
         "detail": detail,
+        "recentTriggerCount": len(triggers),
+        "missingTriggers": missing_triggers,
     }
 
 
