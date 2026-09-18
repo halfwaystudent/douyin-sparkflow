@@ -1776,7 +1776,7 @@ def create_app():
     async def login_workspace_watchdog():
         """Reap abandoned leases even when no browser request arrives."""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
             try:
                 await _expire_login_workspace()
             except asyncio.CancelledError:
@@ -2184,6 +2184,39 @@ def create_app():
         else:
             cancel_login_request(username=current["username"], session_id=current.get("session_id", ""))
         return JSONResponse({"ok": True, "workspace": _workspace_payload(request)})
+
+    @app.post("/login-desktop/release")
+    async def login_desktop_release(request: Request):
+        """Owner-only, non-forcing release used when the page goes away.
+
+        Unlike /close this must never force-reset the shared workspace: an admin
+        tab closing is not an admin asking to reset everyone's session.
+        """
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+        current = principal(request)
+        active = get_login_lock()
+        if not owns_login_lock(
+            active,
+            username=current.get("username", ""),
+            session_id=current.get("session_id", ""),
+        ):
+            return JSONResponse({"ok": True, "released": False})
+        ticket = str(form.get("ticket", "")).strip()
+        if ticket and str(active.get("ticket", "")) != ticket:
+            return JSONResponse({"ok": True, "released": False})
+        begin_login_release(
+            username=current["username"],
+            session_id=current.get("session_id", ""),
+            ticket=active.get("ticket", ""),
+            account_ref=active.get("account_ref", ""),
+        )
+        await _reset_and_promote()
+        return JSONResponse({"ok": True, "released": True})
 
     @app.post("/login-desktop/reset")
     async def login_desktop_reset(request: Request):

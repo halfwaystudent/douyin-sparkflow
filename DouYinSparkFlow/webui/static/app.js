@@ -421,6 +421,8 @@
   };
 
   const renderWorkspace = (next) => {
+    const previousState = workspace.state;
+    const previousTicket = workspace.ticket;
     workspace = next || { state: "closed", active: false, position: 0, ticket: "" };
     if (workspace.state === "queued") {
       setStatus(`登录工作区排队中，前面还有 ${Math.max(0, Number(workspace.position || 1) - 1)} 人。`, "warning");
@@ -434,41 +436,77 @@
     if (workspace.state === "active" && workspace.active) {
       const remaining = Math.max(0, Number(workspace.remaining_seconds || 0));
       const tone = remaining > 0 && remaining <= 60 ? "warning" : "success";
+      const promoted = previousState !== "active" || previousTicket !== workspace.ticket;
+      if (promoted) {
+        // The queue just promoted this session: load the workspace and the QR
+        // code right away instead of making the operator click again.
+        if (section && !section.open) section.open = true;
+        loadFrame(true);
+        qrPollStartedAt = Date.now();
+        setQrButtons("读取中…", { busy: true });
+        refreshLoginQr(500);
+      }
       if (displayMode === "native") {
         if (nativePanel) nativePanel.hidden = false;
         if (frameWrap) {
           frameWrap.hidden = false;
           frameWrap.classList.add("native-login-mode");
         }
-        setStatus(`Windows 本地登录浏览器已打开，剩余 ${remaining} 秒。完成扫码后请保存登录态。`, tone);
+        setStatus(
+          promoted
+            ? `已轮到你：Windows 本地登录浏览器已打开，剩余 ${remaining} 秒。完成扫码后请保存登录态。`
+            : `Windows 本地登录浏览器已打开，剩余 ${remaining} 秒。完成扫码后请保存登录态。`,
+          tone,
+        );
       } else {
-        setStatus(`登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`, tone);
+        setStatus(
+          promoted
+            ? `已轮到你：登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`
+            : `登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`,
+          tone,
+        );
       }
       return;
     }
     setStatus("登录工作区当前关闭。请从账号卡片点击“重新登录”。");
   };
 
-  const refreshLoginQr = async (delay = 0, retries = 60) => {
+  let qrPollStartedAt = 0;
+  const setQrButtons = (label, { busy = false, stopped = false } = {}) => {
+    document.querySelectorAll("[data-refresh-login-qr]").forEach((button) => {
+      const text = button.querySelector("span");
+      if (text) text.textContent = label;
+      button.disabled = busy;
+      button.dataset.qrStopped = stopped ? "1" : "";
+    });
+  };
+  const qrWaitLabel = () => {
+    if (!qrPollStartedAt) return "";
+    return `（已等待 ${Math.round((Date.now() - qrPollStartedAt) / 1000)} 秒）`;
+  };
+
+  const refreshLoginQr = async (delay = 0, retries = 400) => {
     if (!qrImage || workspace.state !== "active" || !workspace.active) return;
     window.clearTimeout(qrRefreshTimer);
     qrRefreshTimer = window.setTimeout(async () => {
-      if (qrStatus) qrStatus.textContent = "正在读取登录二维码...";
-      const retryLater = (message) => {
+      if (qrStatus) qrStatus.textContent = `正在读取登录二维码…${qrWaitLabel()}`;
+      const retryLater = (message, delayMs = 1500) => {
         if (retries > 1 && workspace.state === "active") {
-          if (qrStatus) qrStatus.textContent = `${message} 继续等待...`;
-          refreshLoginQr(1500, retries - 1);
+          if (qrStatus) qrStatus.textContent = `${message} 继续等待…${qrWaitLabel()}`;
+          refreshLoginQr(delayMs, retries - 1);
         } else if (qrStatus) {
           qrStatus.textContent = `${message} 已停止自动重试，请点击“刷新二维码”。`;
+          setQrButtons("已停止，点此重试", { stopped: true });
         }
       };
       try {
         const response = await fetch(`/login-desktop/qr?t=${Date.now()}`, { credentials: "same-origin", cache: "no-store" });
         if (response.status === 409) {
           // Only an explicit refresh regenerates an expired QR code, so stop
-          // polling instead of promising a new code that never arrives.
+          // polling and put the button into a visible retry state.
           const data = await response.json().catch(() => ({}));
-          if (qrStatus) qrStatus.textContent = data.message || "二维码已过期，请点击“刷新二维码”。";
+          if (qrStatus) qrStatus.textContent = data.message || "二维码已过期。点击“刷新二维码”重新生成。";
+          setQrButtons("已停止，点此重试", { stopped: true });
           return;
         }
         if (response.status === 202) {
@@ -481,7 +519,11 @@
         }
         if (response.status === 503) {
           const data = await response.json().catch(() => ({}));
-          retryLater(data.message || "登录页正在处理上一个请求");
+          const retryAfter = Number(response.headers.get("Retry-After") || data.retry_after || 0);
+          retryLater(
+            data.message || "登录页正在处理上一个请求",
+            retryAfter > 0 ? retryAfter * 1000 : 1500,
+          );
           return;
         }
         if (response.status === 502) {
@@ -504,7 +546,8 @@
         qrImage.dataset.objectUrl = objectUrl;
         qrImage.hidden = false;
         if (previous) URL.revokeObjectURL(previous);
-        if (qrStatus) qrStatus.textContent = "二维码已加载。如果过期，点击刷新。";
+        if (qrStatus) qrStatus.textContent = `二维码已加载。如果过期，点击刷新。${qrWaitLabel()}`;
+        setQrButtons("刷新二维码");
       } catch {
         retryLater("登录页正在加载");
       }
@@ -524,7 +567,12 @@
       renderWorkspace(data.workspace);
       if (workspace.state === "active" && workspace.active) {
         loadFrame();
-        if (data.logged_in) setStatus(`当前浏览器已登录：${data.username}，请保存登录态。`, "success");
+        if (data.logged_in) {
+          setStatus(`当前浏览器已登录：${data.username}，请保存登录态。`, "success");
+        } else if (data.login_state === "unknown") {
+          // The page was mid-operation, so "not logged in" would be a guess.
+          setStatus("正在检查登录状态…（页面正忙，请稍候再保存）", "warning");
+        }
       } else {
         closeFrame();
       }
@@ -583,6 +631,7 @@
   document.querySelectorAll("[data-refresh-login-qr]").forEach((button) => {
     button.addEventListener("click", async () => {
       button.disabled = true;
+      qrPollStartedAt = Date.now();
       try {
         const refreshForm = new FormData();
         refreshForm.set("csrf_token", csrfToken);
@@ -727,10 +776,43 @@
     const remaining = workspace.remaining_seconds;
     setStatus(`登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`, remaining <= 60 ? "warning" : "success");
   }, 1000);
+  // Releasing the workspace when the page goes away lets the next operator in
+  // immediately. Switching tabs only counts after a grace period, because a
+  // quick glance elsewhere should not drop the lease.
+  let hiddenReleaseTimer = null;
+  const releaseWorkspace = () => {
+    if (!workspace.ticket || workspace.state !== "active") return;
+    const body = new FormData();
+    body.set("csrf_token", csrfToken);
+    body.set("ticket", workspace.ticket);
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon("/login-desktop/release", body);
+    } else {
+      fetch("/login-desktop/release", {
+        method: "POST",
+        body,
+        credentials: "same-origin",
+        keepalive: true,
+      }).catch(() => {});
+    }
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      hiddenReleaseTimer = window.setTimeout(releaseWorkspace, 15000);
+    } else if (hiddenReleaseTimer) {
+      window.clearTimeout(hiddenReleaseTimer);
+      hiddenReleaseTimer = null;
+    }
+  });
   window.addEventListener("pagehide", () => {
     window.clearInterval(timer);
     window.clearInterval(heartbeatTimer);
     window.clearInterval(countdownTimer);
+    if (hiddenReleaseTimer) {
+      window.clearTimeout(hiddenReleaseTimer);
+      hiddenReleaseTimer = null;
+    }
+    releaseWorkspace();
   });
 })();
 

@@ -435,11 +435,14 @@ class LoginDesktopManager:
         username = ""
         unique_id = ""
         current_url = ""
+        login_state_known = True
 
         if not self.context or self._context_is_closed():
             payload = {
                 "running": False,
                 "logged_in": False,
+                "login_state": "logged_out",
+                "login_state_known": True,
                 "username": "",
                 "unique_id": "",
                 "current_url": "",
@@ -484,12 +487,27 @@ class LoginDesktopManager:
                     logged_in = True
                     username = result["username"]
                     unique_id = result["unique_id"]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # The page may simply not expose the identity yet; reporting
+                    # "logged out" here made a just-finished QR scan look like a
+                    # failure and invited a duplicate save.
+                    login_state_known = False
+                    logger.warning(
+                        "Login state could not be collected from the login page: %s",
+                        type(exc).__name__,
+                    )
+            else:
+                # The page is mid-operation (for example refreshing the QR code),
+                # so its state is genuinely unknown right now.
+                login_state_known = False
 
         payload = {
             "running": True,
             "logged_in": logged_in,
+            "login_state": (
+                "logged_in" if logged_in else ("logged_out" if login_state_known else "unknown")
+            ),
+            "login_state_known": login_state_known,
             "username": username,
             "unique_id": unique_id,
             "current_url": current_url,

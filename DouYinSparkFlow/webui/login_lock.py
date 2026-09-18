@@ -27,7 +27,7 @@ def _default_lock_path() -> Path:
 
 
 LOCK_PATH = _default_lock_path()
-LOCK_TTL_SECONDS = 180
+LOCK_TTL_SECONDS = 60
 QUEUE_MAX_SIZE = 32
 _MUTEX = threading.Lock()
 
