@@ -50,6 +50,7 @@ from utils.config import (
     normalize_unique_id,
     save_app_settings,
     update_config,
+    merge_user_account_into,
     update_user_data,
 )
 from webui.auth import (
@@ -1552,6 +1553,64 @@ def create_app():
                 "index_updated": index_updated,
                 "message": f"已刷新 {len(friends)} 个好友"
                 + ("，并已重建发送索引" if index_updated else ""),
+            }
+        )
+
+    @app.post("/accounts/{unique_id}/merge-into")
+    async def merge_duplicate_account(request: Request, unique_id: str):
+        """Move the targets and ledgers of a duplicate row into the row to keep."""
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"redirect": "/login"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+
+        _, source, access_error = account_for_request(request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"ok": False, "error": "Forbidden" if access_error.status_code == 403 else "Account not found"},
+                status_code=access_error.status_code,
+            )
+
+        target_ref = str(form.get("target_account_ref", "")).strip()
+        accounts, _ = ensure_account_refs(get_userData(force_reload=True))
+        target = account_by_ref(accounts, target_ref)
+        if not target or not can_access_account(principal(request), target):
+            return JSONResponse({"ok": False, "error": "要保留的账号不存在或无权访问"}, status_code=404)
+
+        source_name = str(source.get("username") or "").strip()
+        target_name = str(target.get("username") or "").strip()
+        if not source_name or source_name != target_name:
+            # Same nickname is the whole point: it is what makes two rows look
+            # like one account, and merging different people would be data loss.
+            return JSONResponse(
+                {"ok": False, "error": "只能合并昵称相同的账号，请确认这两条确实是同一个账号"},
+                status_code=400,
+            )
+        if normalize_unique_id(source.get("unique_id")) == normalize_unique_id(target.get("unique_id")):
+            return JSONResponse({"ok": False, "error": "两条记录指向同一个账号，无需合并"}, status_code=400)
+
+        merged, changed = merge_user_account_into(
+            source.get("unique_id"), target.get("unique_id")
+        )
+        if not changed:
+            return JSONResponse({"ok": False, "error": "合并失败：账号可能已被其他操作改动"}, status_code=409)
+        logger.info(
+            "Merged duplicate account: kept_uid=%s removed_uid=%s targets=%s",
+            normalize_unique_id(target.get("unique_id")),
+            normalize_unique_id(source.get("unique_id")),
+            len(merged.get("targets") or []) if merged else 0,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "kept": {
+                    "account_ref": target.get("account_ref", ""),
+                    "unique_id": target.get("unique_id", ""),
+                    "username": target.get("username", ""),
+                },
+                "targets": len((merged or {}).get("targets") or []),
             }
         )
 

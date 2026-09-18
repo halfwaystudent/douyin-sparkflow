@@ -1105,6 +1105,71 @@ class DuplicateAccountGuardTests(unittest.TestCase):
         self.assertEqual({}, ops.duplicate_display_names(None))
 
 
+class MergeDuplicateAccountTests(unittest.TestCase):
+    """Merging a duplicate row must carry its targets and ledgers over."""
+
+    def _merge(self, accounts):
+        import json as json_module
+        import tempfile
+        from pathlib import Path as PathClass
+
+        from utils import config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = PathClass(tmp) / "usersData.json"
+            path.write_text(json_module.dumps(accounts, ensure_ascii=False), encoding="utf-8")
+            merged, changed = config.merge_user_account_into("2", "1", path=path)
+            stored = json_module.loads(path.read_text(encoding="utf-8"))
+        return merged, changed, stored
+
+    def test_merge_carries_targets_and_ledgers_then_removes_source(self):
+        accounts = [
+            {
+                "unique_id": "1",
+                "username": "Same",
+                "account_ref": "acc-keep",
+                "enabled": False,
+                "targets": ["A"],
+                "target_states": {"A": {"done": True}},
+                "friend_index": {"A": {"stableKeys": ["k1"]}},
+            },
+            {
+                "unique_id": "2",
+                "username": "Same",
+                "account_ref": "acc-drop",
+                "enabled": True,
+                "targets": ["B"],
+                "target_states": {"B": {"done": False}},
+                "friend_index": {"B": {"stableKeys": ["k2"]}},
+                "cookies": [{"name": "sid"}],
+            },
+        ]
+        merged, changed, stored = self._merge(accounts)
+
+        self.assertTrue(changed)
+        self.assertEqual("1", merged["unique_id"])
+        self.assertEqual(["A", "B"], merged["targets"])
+        self.assertEqual({"A", "B"}, set(merged["target_states"]))
+        self.assertEqual({"A", "B"}, set(merged["friend_index"]))
+        # The source row is gone and no other row was touched.
+        self.assertEqual(["1"], [item["unique_id"] for item in stored])
+        # Identity fields stay the kept account's: cookies never move across.
+        self.assertNotIn("cookies", stored[0])
+        # Enabled is the union so a merge cannot silently disable sending.
+        self.assertTrue(stored[0]["enabled"])
+
+    def test_merge_refuses_self_and_missing_accounts(self):
+        from utils import config
+
+        with self.assertRaises(ValueError):
+            config.merge_user_account_into("1", "1")
+        _, changed, stored = self._merge(
+            [{"unique_id": "1", "username": "Same", "targets": []}]
+        )
+        self.assertFalse(changed)
+        self.assertEqual(1, len(stored))
+
+
 class WebUiQrProxyTests(unittest.TestCase):
     """The WebUI proxy must relay QR states instead of wrapping them as images."""
 

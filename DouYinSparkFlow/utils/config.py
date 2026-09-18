@@ -371,6 +371,67 @@ def upsert_user_account(unique_id, username, cookies, targets, extra=None):
     return update_user_data(mutate, force_reload=True)
 
 
+MERGE_MAP_KEYS = (
+    "target_states",
+    "target_refs",
+    "friend_index",
+    "friend_index_meta",
+    "message_history",
+)
+
+
+def merge_user_account_into(source_unique_id, target_unique_id, *, path=None):
+    """Merge one account row into another, then drop the source row.
+
+    Duplicate rows appear when a re-login returns a different unique_id than the
+    stored one. The targets and send history live on the row the operator is
+    about to remove, so they are carried over instead of being deleted with it.
+    Identity fields (unique_id, cookies, health) always stay the target's, and
+    disagreements resolve in the target's favour.
+    """
+    source_id = normalize_unique_id(source_unique_id)
+    target_id = normalize_unique_id(target_unique_id)
+    if not source_id or not target_id or source_id == target_id:
+        raise ValueError("merge needs two different accounts")
+
+    def mutate(accounts):
+        source = next(
+            (item for item in accounts if normalize_unique_id(item.get("unique_id")) == source_id),
+            None,
+        )
+        target = next(
+            (item for item in accounts if normalize_unique_id(item.get("unique_id")) == target_id),
+            None,
+        )
+        if source is None or target is None:
+            return None, False
+
+        targets = list(target.get("targets") or [])
+        for name in source.get("targets") or []:
+            if name not in targets:
+                targets.append(name)
+        target["targets"] = targets
+
+        for key in MERGE_MAP_KEYS:
+            merged = dict(target.get(key) or {})
+            for name, value in (source.get(key) or {}).items():
+                merged.setdefault(name, value)
+            if merged:
+                target[key] = merged
+
+        if source.get("enabled") and not target.get("enabled"):
+            target["enabled"] = True
+        if not (target.get("friends_cache") or []) and (source.get("friends_cache") or []):
+            target["friends_cache"] = list(source.get("friends_cache") or [])
+            if source.get("friends_cache_updated_at"):
+                target["friends_cache_updated_at"] = source["friends_cache_updated_at"]
+
+        accounts.remove(source)
+        return target, True
+
+    return update_user_data(mutate, path=path, force_reload=True, return_changed=True)
+
+
 def delete_user_account(unique_id):
     normalized_id = normalize_unique_id(unique_id)
 

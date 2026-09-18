@@ -490,6 +490,30 @@
                 <span>{% if account.enabled|default(true) %}停用自动发送{% else %}启用自动发送{% endif %}</span>
               </button>
             </form>
+            {% if duplicate_count > 1 %}
+            <form
+              method="post"
+              action="/accounts/{{ account.unique_id }}/merge-into"
+              data-confirm-title="合并重复账号"
+              data-confirm="将把“{{ account.username }}”这条记录的目标与发送账本合并到所选账号，然后删除这条重复记录。此操作无法撤销。"
+              data-confirm-accept="确认合并"
+            >
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <label class="muted compact">
+                保留
+                <select name="target_account_ref">
+                  {% for other in accounts %}
+                  {% if other.unique_id != account.unique_id and other.username == account.username %}
+                  <option value="{{ other.account_ref }}">{{ other.username }}（{{ other.unique_id }}）</option>
+                  {% endif %}
+                  {% endfor %}
+                </select>
+              </label>
+              <button class="button button-quiet" type="submit">
+                <i data-lucide="combine"></i><span>合并到此账号</span>
+              </button>
+            </form>
+            {% endif %}
             {% if is_admin %}
             <form
               method="post"
