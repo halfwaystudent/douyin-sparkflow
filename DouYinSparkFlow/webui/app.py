@@ -2719,9 +2719,9 @@ def create_app():
                 if same_name:
                     duplicate = same_name[0]
                     logger.info(
-                        "Login save paused for confirmation: scanned_uid=%s matches_existing_name=%s",
+                        "Login save paused for confirmation: scanned_uid=%s candidates=%s",
                         normalize_unique_id(exported.get("unique_id")),
-                        bool(duplicate.get("account_ref")),
+                        len(same_name),
                     )
                     return JSONResponse(
                         {
@@ -2732,6 +2732,17 @@ def create_app():
                                 "username": duplicate.get("username", ""),
                                 "unique_id": duplicate.get("unique_id", ""),
                             },
+                            # More than one candidate means the console cannot
+                            # guess which row the operator means; the frontend
+                            # refuses instead of merging into the wrong account.
+                            "duplicate_candidates": [
+                                {
+                                    "account_ref": item.get("account_ref", ""),
+                                    "username": item.get("username", ""),
+                                    "unique_id": item.get("unique_id", ""),
+                                }
+                                for item in same_name
+                            ],
                         },
                         status_code=409,
                     )

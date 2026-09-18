@@ -751,6 +751,19 @@
         } catch (error) {
           const candidate = error.payload && error.payload.duplicate_candidate;
           if (!candidate) throw error;
+          const candidates =
+            (error.payload && error.payload.duplicate_candidates) || [candidate];
+          if (candidates.length > 1) {
+            // Guessing here could merge the login into the wrong account, so the
+            // operator is asked to resolve the duplicates first.
+            setStatus(
+              `有 ${candidates.length} 个同名账号（${candidates
+                .map((item) => item.unique_id || item.account_ref)
+                .join("、")}）：请先在账号管理里确认要更新的是哪一个（删除多余的那条或先改昵称）再保存。`,
+              "danger",
+            );
+            return;
+          }
           // "Cancel" must mean "do nothing": binding it to "create a duplicate
           // anyway" is the opposite of what the button suggests and is how a
           // second identical account gets created by accident.
