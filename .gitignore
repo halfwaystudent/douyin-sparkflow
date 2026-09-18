@@ -25,3 +25,4 @@ DouYinSparkFlow/*.lock
 /.comet/*
 !/.comet/config.yaml
 # <<< Comet managed project state <<<
+.data-backups/

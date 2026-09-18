@@ -4,6 +4,7 @@ import os
 import secrets
 import sys
 import tempfile
+import time
 import uuid
 from copy import deepcopy
 from enum import Enum
@@ -273,6 +274,35 @@ def save_userData(accounts):
     return deepcopy(userData)
 
 
+DATA_BACKUP_DIR = ".data-backups"
+DATA_BACKUP_KEEP = 10
+
+
+def _snapshot_user_data(target: Path) -> None:
+    """Keep a dated copy of account data before a destructive write.
+
+    Account data had no rolling backups at all, so a bad identity match or a
+    mistaken delete left nothing to fall back to except a month-old snapshot.
+    """
+    try:
+        if not target.exists():
+            return
+        content = target.read_text(encoding="utf-8")
+        backup_dir = target.parent / DATA_BACKUP_DIR
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = backup_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{target.name}"
+        if not destination.exists():
+            destination.write_text(content, encoding="utf-8")
+        keep = sorted(backup_dir.glob(f"*-{target.name}"))
+        for stale in keep[:-DATA_BACKUP_KEEP]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        logger.warning("Could not snapshot %s before writing", target, exc_info=True)
+
+
 def update_user_data(
     mutator,
     *,
@@ -293,6 +323,7 @@ def update_user_data(
         if isinstance(result, tuple) and len(result) == 2:
             result, changed = result
         if changed:
+            _snapshot_user_data(target)
             if path is None:
                 save_userData(accounts)
             else:
