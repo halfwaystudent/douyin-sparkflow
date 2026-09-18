@@ -2687,9 +2687,20 @@ def create_app():
                     relogin_account_ref = candidate.get("account_ref", "")
                     relogin_unique_id = candidate.get("unique_id", "")
                     operation = "relogin"
+            # Read once, before the guard below: the audit line has to stay
+            # reachable, and inside the guard `allow_duplicate == "1"` is always
+            # false, which made the first version of this log dead code.
+            allow_duplicate_requested = (
+                str(form.get("allow_duplicate", "")).strip() == "1"
+            )
+            if allow_duplicate_requested and not existing:
+                logger.info(
+                    "Login save creates a separate account past a same-name match: scanned_uid=%s",
+                    normalize_unique_id(exported.get("unique_id")),
+                )
             if (
                 not existing
-                and str(form.get("allow_duplicate", "")).strip() != "1"
+                and not allow_duplicate_requested
             ):
                 # No account matched this unique_id, so creating a row is the
                 # only remaining outcome. Ask first if the nickname already
@@ -2704,11 +2715,6 @@ def create_app():
                 exported_name = str(
                     exported.get("username") or exported.get("unique_id") or ""
                 ).strip()
-                if str(form.get("allow_duplicate", "")).strip() == "1":
-                    logger.info(
-                        "Login save creates a separate account past a same-name match: scanned_uid=%s",
-                        normalize_unique_id(exported.get("unique_id")),
-                    )
                 same_name = [
                     item
                     for item in find_same_name_account(
