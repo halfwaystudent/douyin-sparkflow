@@ -790,7 +790,20 @@
           window.setTimeout(() => window.location.reload(), 1500);
           return;
         }
-        setStatus(`已保存登录账号：${data.account?.username || ""}`, "success");
+        // A login save starts a friend refresh; when it could not start, say why
+        // instead of leaving the operator waiting for a list that never updates.
+        const refreshNote =
+          data.friend_refresh === "started"
+            ? ""
+            : data.friend_refresh === "busy"
+              ? "（发送任务正在运行，好友列表稍后会自动刷新）"
+              : data.friend_refresh === "running"
+                ? "（好友列表正在刷新中）"
+                : "（好友列表未自动刷新，可手动点刷新）";
+        setStatus(
+          `已保存登录账号：${data.account?.username || ""}${refreshNote}`,
+          data.friend_refresh === "started" ? "success" : "warning",
+        );
         closeFrame();
         window.setTimeout(() => window.location.reload(), 800);
       } catch (error) {
