@@ -573,7 +573,7 @@ def schedule_line_kind(line):
     return "fixed"
 
 
-def get_schedule_alignment():
+def get_schedule_alignment(recent_triggers=None):
     """Compare the configured send window with the task lines that are live.
 
     ``dailySendWindow.enabled`` is false both for "no automatic sending" and for
@@ -600,7 +600,7 @@ def get_schedule_alignment():
             detail = "按单次固定时间调度（该模式的时间保存在任务行内）"
         else:
             detail = "配置未启用发送窗口，但 spool 中仍存在窗口式任务行"
-    triggers = recent_trigger_lines()
+    triggers = recent_trigger_lines() if recent_triggers is None else recent_triggers
     missing_triggers = False
     if enabled:
         try:
@@ -1788,9 +1788,9 @@ def recent_trigger_lines(limit=5):
     return hits[-max(1, int(limit)) :]
 
 
-def _guarded_schedule_alignment():
+def _guarded_schedule_alignment(recent_triggers=None):
     try:
-        return get_schedule_alignment()
+        return get_schedule_alignment(recent_triggers=recent_triggers)
     except Exception:
         logger.warning("get_schedule_alignment failed", exc_info=True)
         return {
@@ -1804,6 +1804,25 @@ def _guarded_schedule_alignment():
         }
 
 
+CACHE_TTL_SECONDS = 5
+_snapshot_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cached(key, producer, ttl=CACHE_TTL_SECONDS):
+    """Short-lived cache for the expensive parts of a panel snapshot.
+
+    Every dashboard render used to shell out to docker three times and read the
+    log tail more than once, which made the whole console feel sluggish.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    entry = _snapshot_cache.get(key)
+    if entry is not None and now - entry[0] < ttl:
+        return entry[1]
+    value = producer()
+    _snapshot_cache[key] = (now, value)
+    return value
+
+
 def get_ops_snapshot(account_refs=None):
     """Collect operational metrics for the dashboard.
 
@@ -1811,18 +1830,19 @@ def get_ops_snapshot(account_refs=None):
     renders, even when Docker or crontab are not available.
     """
     send_console = get_send_console_snapshot(account_refs=account_refs)
+    triggers = _cached("recent-triggers", recent_trigger_lines)
     return {
         "compose_root": str(compose_root()),
         "compose_file": str(compose_file_path() or ""),
-        "containers": get_container_status(),
-        "task_containers": get_task_container_rows(),
+        "containers": _cached("containers", get_container_status),
+        "task_containers": _cached("task-containers", get_task_container_rows),
         "send_console": send_console,
         "task_lock": task_run_lock_status(),
         "daily_schedule": current_daily_schedule(),
-        "schedule_alignment": _guarded_schedule_alignment(),
-        "recent_triggers": recent_trigger_lines(),
+        "schedule_alignment": _guarded_schedule_alignment(triggers),
+        "recent_triggers": triggers,
         "schedule": get_schedule_snapshot(),
-        "crontab": read_crontab(),
-        "log_tail": read_log_tail(120),
-        "image_present": _check_image_present(),
+        "crontab": _cached("crontab", read_crontab),
+        "log_tail": _cached("log-tail", lambda: read_log_tail(120)),
+        "image_present": _cached("image-present", _check_image_present),
     }
