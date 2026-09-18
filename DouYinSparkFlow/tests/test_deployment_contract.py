@@ -86,7 +86,7 @@ class DeploymentContractTests(unittest.TestCase):
             "20 18 * * * /bin/bash -lc 'docker ps --format \"{{.Names}}\" | "
             "grep douyin-web; docker exec douyin-web sh -lc \"cd /app && "
             "env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 "
-            "python main.py --doTask\"' >> /var/log/douyin-sparkflow.log 2>&1"
+            "python main.py --doTask\"' >> /app/logs/douyin-sparkflow.log 2>&1"
         )
         migrated = migrate_legacy_line(legacy)
 

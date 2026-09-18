@@ -1780,7 +1780,10 @@ def create_app():
 
         def mutate(account, accounts):
             del accounts
-            return mark_target_unconfirmed(account, target_name)
+            # The button is only offered for confirmed records, and it must always
+            # take effect: without force, a record from an earlier day was silently
+            # refused, so the click looked successful but changed nothing.
+            return mark_target_unconfirmed(account, target_name, force=True)
 
         account, changed, access_error = mutate_account_for_request(
             request,
@@ -1796,46 +1799,7 @@ def create_app():
         if changed:
             flash(request, f"已将 {account.get('username', 'Account')} / {target_name} 标记为待核验/待补发。", "warning")
         else:
-            flash(request, f"{target_name} 已是强确认记录或不是今日记录，未自动重置。", "info")
-        return redirect("/ops/send-console")
-
-    @app.post("/ops/reset-today-unconfirmed")
-    async def reset_today_unconfirmed(request: Request):
-        maybe_redirect = require_admin(request)
-        if maybe_redirect:
-            return maybe_redirect
-
-        form = await request.form()
-        if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return Response("Invalid CSRF token", status_code=403)
-
-        def mutate(accounts):
-            changed_count = 0
-            for account in accounts:
-                for target_name in list(account.get("targets") or []):
-                    entry = streak_state.history_entry(
-                        account,
-                        target_name,
-                        datetime.now(_schedule_timezone()).tzinfo,
-                    )
-                    sent_at = _parse_sent_at(entry.get("sentAt"))
-                    if not sent_at or sent_at.date() != datetime.now(_schedule_timezone()).date():
-                        continue
-                    if _history_entry_strong_confirmed_today(entry):
-                        continue
-                    if mark_target_unconfirmed(
-                        account,
-                        target_name,
-                        reason="batch_reset_today_suspicious_success",
-                    ):
-                        changed_count += 1
-            return changed_count, changed_count > 0
-
-        changed_count = update_user_data(mutate, force_reload=True)
-        if changed_count:
-            flash(request, f"已将 {changed_count} 条今日可疑成功记录标记为待核验/待补发。", "warning")
-        else:
-            flash(request, "没有找到需要重置的今日可疑成功记录。", "info")
+            flash(request, f"{target_name} 没有可重置或不是今日记录，未自动重置。", "info")
         return redirect("/ops/send-console")
 
     @app.post("/config")

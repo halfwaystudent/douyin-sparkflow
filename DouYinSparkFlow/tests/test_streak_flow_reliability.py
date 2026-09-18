@@ -2447,6 +2447,67 @@ class StreakRunReportTests(unittest.TestCase):
         self.assertGreaterEqual(fsync.call_count, 3)
 
 
+class ReceiptOnlyConfirmationTests(unittest.TestCase):
+    """A server receipt alone must not count as a strong confirmation."""
+
+    STRONG_RECEIPT = {
+        "ok": True,
+        "httpStatus": 200,
+        "call": "message_send",
+        "jsonOk": True,
+    }
+
+    def test_strong_receipt_without_a_dom_bubble_is_receipt_only(self):
+        user = {
+            "username": "demo",
+            "unique_id": "1",
+            "targets": ["Alice"],
+            "message_history": {},
+        }
+        accounts = [user]
+
+        def fake_update(mutator, **kwargs):
+            # Mirror the real update_user_data contract: a mutator may return
+            # (result, changed), which is unwrapped before the caller sees it.
+            result = mutator(accounts)
+            changed = True
+            if isinstance(result, tuple) and len(result) == 2:
+                result, changed = result
+            if kwargs.get("return_changed"):
+                return result, changed
+            return result
+
+        with patch.object(tasks, "update_user_data", side_effect=fake_update):
+            tasks._persist_browser_send_success(
+                user,
+                "Alice",
+                "hi",
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                server_receipt=dict(self.STRONG_RECEIPT),
+                dom_bubble_seen=False,
+            )
+
+        entry = dict((user.get("message_history") or {}).get("Alice") or {})
+        self.assertEqual("receipt_only", entry.get("confirmationLevel"))
+        self.assertEqual("sent_receipt_only", entry.get("status"))
+        self.assertTrue(entry.get("needsVerification"))
+
+    def test_receipt_only_today_is_never_resent(self):
+        now = datetime(2026, 9, 18, 11, 0, tzinfo=timezone.utc)
+        user = {
+            "message_history": {
+                "Alice": {
+                    "status": "sent_receipt_only",
+                    "confirmationLevel": "receipt_only",
+                    "sentAt": "2026-09-18T10:00:00+00:00",
+                }
+            }
+        }
+        # Handled today, so no send or resend path repeats it...
+        self.assertTrue(tasks._target_sent_today(user, "Alice", now))
+        # ...but it is still not a strong confirmation, and not resendable.
+        self.assertFalse(tasks._target_unconfirmed_today(user, "Alice", now))
+
 class StreakTaskIntegrationTests(unittest.TestCase):
     @staticmethod
     def _update_side_effect(accounts):

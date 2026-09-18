@@ -173,9 +173,9 @@ write_default_cron() {
     echo "DEFAULT_SCHEDULE=$DEFAULT_SCHEDULE will be saved to .env. The initial cron file uses the built-in 10:00-18:00/20m schedule; adjust it from the Web UI after first login." >&2
   fi
   cat > /tmp/douyin-sparkflow-cron <<'CRON'
-*/20 10-17 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
-0 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
-20 18 * * * env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 PYTHONUNBUFFERED=1 SPARKFLOW_TRIGGER_LABEL='unsent fallback' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
+*/20 10-17 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /app/logs/douyin-sparkflow.log 2>&1
+0 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /app/logs/douyin-sparkflow.log 2>&1
+20 18 * * * env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 PYTHONUNBUFFERED=1 SPARKFLOW_TRIGGER_LABEL='unsent fallback' bash /app/scripts/run_scheduled_task.sh >> /app/logs/douyin-sparkflow.log 2>&1
 CRON
   run_root cp /tmp/douyin-sparkflow-cron "$cron_file"
   rm -f /tmp/douyin-sparkflow-cron

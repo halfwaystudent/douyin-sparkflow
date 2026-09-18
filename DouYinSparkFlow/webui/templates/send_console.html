@@ -86,7 +86,7 @@
     <strong>
       <i data-lucide="{% if summary.today_attention_targets %}triangle-alert{% else %}circle-check{% endif %}"></i>
       <span>
-        今日结论：强确认 {{ summary.today_confirmed_targets }} · 仅页面回显 {{ summary.today_page_echo_targets }} ·
+        今日结论：强确认 {{ summary.today_confirmed_targets }} · 仅页面回显 {{ summary.today_page_echo_targets }} · 仅回执未确认 {{ summary.today_receipt_only_targets }} ·
         待核验 {{ summary.today_unconfirmed_targets }} · 失败 {{ summary.today_failed_targets }} ·
         受账号阻断 {{ summary.today_account_blocked_targets }} · 待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
         （共 {{ summary.total_targets }} 个目标，{{ summary.enabled_accounts }} 个启用账号）
@@ -103,7 +103,7 @@
     <article class="metric-card success">
       <div class="metric-label">已发送（今日）</div>
       <div class="metric-value" data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets }}</div>
-      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b></div>
+      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> · 仅回执未确认 <b data-overview-value="receiptOnly">{{ summary.today_receipt_only_targets }}</b></div>
     </article>
     <article class="metric-card danger">
       <div class="metric-label">需要处理</div>
@@ -133,8 +133,9 @@
       {% set exception_count = account.unconfirmed_targets|length + account.failed_targets|length + account.account_blocked_targets|length %}
       {% set success_count = account.confirmed_targets|length %}
       {% set page_echo_count = account.page_echo_count %}
+      {% set receipt_only_count = account.receipt_only_targets|length %}
       {% set waiting_targets = account.pending_targets + account.unprocessed_targets %}
-      {% set default_segment = "exceptions" if exception_count else ("success" if success_count else ("page_echo" if page_echo_count else "pending")) %}
+      {% set default_segment = "exceptions" if exception_count else ("success" if success_count else ("page_echo" if page_echo_count else ("receipt_only" if receipt_only_count else "pending"))) %}
       <details
         class="account-console state-{{ account.state }}"
         id="account-{{ account.unique_id }}"
@@ -194,6 +195,9 @@
             </button>
             <button class="segment-button {% if default_segment == 'page_echo' %}active{% endif %}" type="button" data-segment-target="page_echo">
               <i data-lucide="send"></i><span>已发出·仅回显 {{ page_echo_count }}</span>
+            </button>
+            <button class="segment-button {% if default_segment == 'receipt_only' %}active{% endif %}" type="button" data-segment-target="receipt_only">
+              <i data-lucide="receipt"></i><span>已回执·未确认 {{ receipt_only_count }}</span>
             </button>
             <button class="segment-button {% if default_segment == 'pending' %}active{% endif %}" type="button" data-segment-target="pending">
               <i data-lucide="clock-3"></i><span>待发送 {{ waiting_targets|length }}</span>
@@ -315,6 +319,37 @@
               </article>
               {% else %}
               <div class="empty-state">该账号今天没有“已发出但仅页面回显”的目标。</div>
+              {% endfor %}
+            </div>
+          </div>
+
+          <div data-segment-panel="receipt_only" {% if default_segment != "receipt_only" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in account.receipt_only_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>服务端回执成功，但页面未见新气泡 · 已尝试 {{ item.attemptCount or 0 }} 次</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
+                  {{ item.confirmationDetail or item.reason or "服务端回执成功，但页面没有出现新的消息气泡" }}
+                </div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
+                <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
+                <form
+                  method="post"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  data-confirm-title="标记为待核验并重发"
+                  data-confirm="将把“{{ item.target }}”标记为待核验并加入补发队列，今日会再发一次。确认继续吗？"
+                  data-confirm-accept="标记并重发"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-quiet" type="submit"><i data-lucide="repeat"></i><span>不确定，重发</span></button>
+                </form>
+              </article>
+              {% else %}
+              <div class="empty-state">该账号今天没有“服务端回执成功但页面未见气泡”的目标。</div>
               {% endfor %}
             </div>
           </div>

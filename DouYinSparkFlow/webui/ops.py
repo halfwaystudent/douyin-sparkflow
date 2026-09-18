@@ -1369,7 +1369,11 @@ def _build_target_status(account, target_name, now, send_window):
         )
         item.update(
             {
-                "status": "sent_page_echo" if page_echo_evidence else "unconfirmed",
+                "status": (
+                    "sent_receipt_only"
+                    if confirmation_level == "receipt_only"
+                    else ("sent_page_echo" if page_echo_evidence else "unconfirmed")
+                ),
                 "message": str(history_entry.get("message") or failure_entry.get("message") or ""),
                 "sentAt": sent_at.isoformat(timespec="seconds"),
                 "lastAttemptAt": last_attempt_at.isoformat(timespec="seconds") if failure_is_today else "",
@@ -1487,6 +1491,7 @@ def get_send_console_snapshot(account_refs=None):
         "today_confirmed_targets": 0,
         "today_unconfirmed_targets": 0,
         "today_page_echo_targets": 0,
+        "today_receipt_only_targets": 0,
         "today_legacy_unverified_targets": 0,
         "today_failed_targets": 0,
         "today_pending_targets": 0,
@@ -1514,6 +1519,7 @@ def get_send_console_snapshot(account_refs=None):
         # finished for today (the engine will not resend it), so it belongs to
         # the "sent" side of the board, not to "needs attention".
         page_echo_targets = [item for item in statuses if item["status"] == "sent_page_echo"]
+        receipt_only_targets = [item for item in statuses if item["status"] == "sent_receipt_only"]
         sent_targets = confirmed_targets + page_echo_targets
         unconfirmed_targets = [item for item in statuses if item["status"] == "unconfirmed"]
         failed_targets = [item for item in statuses if item["status"] == "failed"]
@@ -1610,6 +1616,7 @@ def get_send_console_snapshot(account_refs=None):
         summary["today_confirmed_targets"] += len(confirmed_targets)
         summary["today_unconfirmed_targets"] += len(unconfirmed_targets)
         summary["today_page_echo_targets"] += len(page_echo_targets)
+        summary["today_receipt_only_targets"] += len(receipt_only_targets)
         summary["today_legacy_unverified_targets"] += len(legacy_unverified_targets)
         summary["today_failed_targets"] += len(failed_targets)
         summary["today_pending_targets"] += len(pending_targets)
@@ -1644,7 +1651,9 @@ def get_send_console_snapshot(account_refs=None):
                 "sent_targets": sent_targets,
                 "confirmed_targets": confirmed_targets,
                 "page_echo_targets": page_echo_targets,
+                "receipt_only_targets": receipt_only_targets,
                 "page_echo_count": len(page_echo_targets),
+                "receipt_only_count": len(receipt_only_targets),
                 "unconfirmed_targets": unconfirmed_targets,
                 "legacy_unverified_targets": legacy_unverified_targets,
                 "failed_targets": failed_targets,
@@ -1705,6 +1714,7 @@ def get_overview_snapshot(account_refs=None):
                 "total": row["total_targets"],
                 "confirmed": len(row["confirmed_targets"]),
                 "pageEcho": row["page_echo_count"],
+                "receiptOnly": row.get("receipt_only_count", 0),
                 "attention": row["attention_count"],
                 "pending": row["pending_count"],
                 "lastConfirmedAt": row["last_confirmed_at"],
@@ -1728,6 +1738,7 @@ def get_overview_snapshot(account_refs=None):
             "total": summary["total_targets"],
             "confirmed": summary["today_confirmed_targets"],
             "pageEcho": summary["today_page_echo_targets"],
+            "receiptOnly": summary.get("today_receipt_only_targets", 0),
             "unconfirmed": summary["today_unconfirmed_targets"],
             "failed": summary["today_failed_targets"],
             "blocked": summary["today_account_blocked_targets"],

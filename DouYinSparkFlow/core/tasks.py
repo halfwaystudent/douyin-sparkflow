@@ -1808,12 +1808,30 @@ def _unsent_retry_max_attempts():
 
 
 def _target_sent_today(user, target_name, now):
-    return target_is_strong_confirmed_today(user, target_name, now)
+    if target_is_strong_confirmed_today(user, target_name, now):
+        return True
+    # A receipt-only attempt was accepted by the server even though the page did
+    # not corroborate it. It is not a strong confirmation for reporting, but every
+    # send and resend path must treat it as already handled today, otherwise the
+    # same message would be delivered twice.
+    history = streak_state.history_entry(user, target_name, now.tzinfo)
+    sent_at = _parse_sent_at(history.get("sentAt"), now.tzinfo)
+    return bool(
+        str(history.get("confirmationLevel") or "") == "receipt_only"
+        and sent_at
+        and streak_state.same_calendar_day(sent_at, now)
+    )
 
 
 def _target_unconfirmed_today(user, target_name, now):
     history = streak_state.history_entry(user, target_name, now.tzinfo)
     sent_at = _parse_sent_at(history.get("sentAt"), now.tzinfo)
+    # A receipt-only attempt was accepted by the server but not corroborated by the
+    # page. Treating it as "unconfirmed, therefore resendable" would send the
+    # operator a duplicate of a message that was already delivered, so it is
+    # excluded from the automatic resend queue here.
+    if str(history.get("confirmationLevel") or "") == "receipt_only":
+        return False
     if (
         sent_at
         and streak_state.same_calendar_day(sent_at, now)
@@ -2584,9 +2602,16 @@ def _persist_browser_send_success(
     sent_at,
     server_receipt=None,
     detail="",
+    dom_bubble_seen=None,
 ):
     state_now = parse_sent_at(sent_at, timezone.utc) or datetime.now(timezone.utc)
     strong_receipt = streak_state.receipt_is_strong(server_receipt)
+    # A strong receipt means the server accepted the message, but a receipt alone
+    # must not be reported as a strong confirmation when the page itself showed no
+    # new own-message bubble. Such an attempt is neither confirmed nor a candidate
+    # for the automatic resend queue: resending would duplicate a message the
+    # server already accepted.
+    receipt_only = bool(strong_receipt and dom_bubble_seen is False)
     receipt_summary = ""
     if isinstance(server_receipt, dict):
         receipt_summary = "message_send http={} logid={}".format(
@@ -2596,23 +2621,35 @@ def _persist_browser_send_success(
     strong_entry = {
         "message": message,
         "sentAt": sent_at,
-        "status": "confirmed" if strong_receipt else streak_state.STATE_SENT_UNVERIFIED,
-        "confirmationLevel": "strong" if strong_receipt else "weak",
+        "status": (
+            "sent_receipt_only"
+            if receipt_only
+            else ("confirmed" if strong_receipt else streak_state.STATE_SENT_UNVERIFIED)
+        ),
+        "confirmationLevel": (
+            "receipt_only"
+            if receipt_only
+            else ("strong" if strong_receipt else "weak")
+        ),
         "confirmationSource": (
-            "cdp_message_send_receipt"
-            if strong_receipt
-            else "browser_visible_count_increased"
+            "cdp_message_send_receipt_without_dom_bubble"
+            if receipt_only
+            else (
+                "cdp_message_send_receipt"
+                if strong_receipt
+                else "browser_visible_count_increased"
+            )
         ),
         "confirmationDetail": (
             receipt_summary
-            if strong_receipt
+            if strong_receipt and not receipt_only
             else str(
                 detail
                 or receipt_summary
                 or "browser_visible_count_increased"
             )
         ),
-        "needsVerification": not strong_receipt,
+        "needsVerification": not strong_receipt or receipt_only,
     }
     if server_receipt:
         strong_entry["serverReceipt"] = server_receipt
@@ -3467,6 +3504,11 @@ async def _do_user_task_locked(
                         message,
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         server_receipt=send_receipt,
+                        # The observer proves the server accepted the message; the
+                        # own-message bubble count proves the page rendered it. With
+                        # the observer enabled only the former was required, so a
+                        # receipt without a visible bubble used to count as success.
+                        dom_bubble_seen=bool(sent_ok),
                     )
                     interval = _random_delay_seconds(
                         send_strategy,
