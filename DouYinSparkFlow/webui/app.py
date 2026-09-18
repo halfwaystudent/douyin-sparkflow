@@ -2658,6 +2658,51 @@ def create_app():
                 raise RuntimeError("login-desktop export did not return ok")
             exported = payload.get("result", {}) or {}
             existing = account_by_unique_id(get_userData(force_reload=True), exported.get("unique_id"))
+            merge_with = str(form.get("merge_with", "")).strip()
+            if merge_with:
+                # The operator confirmed that a same-name account is the one they
+                # are re-logging into, so update it instead of adding a duplicate.
+                candidate = account_by_ref(get_userData(force_reload=True), merge_with)
+                if candidate and can_access_account(current, candidate):
+                    existing = candidate
+                    relogin_account_ref = candidate.get("account_ref", "")
+                    relogin_unique_id = candidate.get("unique_id", "")
+                    operation = "relogin"
+            if (
+                not existing
+                and operation != "relogin"
+                and str(form.get("allow_duplicate", "")).strip() != "1"
+            ):
+                # Adding an account whose nickname already exists usually means
+                # the same person came back with a different unique_id; creating
+                # a second row is what produced the duplicate accounts. Ask first.
+                exported_name = str(exported.get("username") or "").strip()
+                same_name = [
+                    item
+                    for item in get_userData(force_reload=True)
+                    if exported_name
+                    and str(item.get("username") or "").strip() == exported_name
+                    and can_access_account(current, item)
+                ]
+                if same_name:
+                    duplicate = same_name[0]
+                    logger.info(
+                        "Login save paused for confirmation: scanned_uid=%s matches_existing_name=%s",
+                        normalize_unique_id(exported.get("unique_id")),
+                        bool(duplicate.get("account_ref")),
+                    )
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": "已有同名账号，请确认是更新它还是新建",
+                            "duplicate_candidate": {
+                                "account_ref": duplicate.get("account_ref", ""),
+                                "username": duplicate.get("username", ""),
+                                "unique_id": duplicate.get("unique_id", ""),
+                            },
+                        },
+                        status_code=409,
+                    )
             if existing and str(existing.get("account_ref", "")) != relogin_account_ref and not can_access_account(current, existing):
                 raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
             if operation == "add" and current.get("role") == "user" and existing:

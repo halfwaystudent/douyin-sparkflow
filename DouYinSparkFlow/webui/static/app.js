@@ -739,8 +739,29 @@
 
   document.querySelectorAll(".login-desktop-save").forEach((button) => {
     button.addEventListener("click", async () => {
+      const saveLogin = (extra = {}) =>
+        postForm("/login-desktop/save", {
+          relogin_unique_id: button.dataset.reloginUniqueId || "",
+          ...extra,
+        });
       try {
-        const data = await postForm("/login-desktop/save", { relogin_unique_id: button.dataset.reloginUniqueId || "" });
+        let data;
+        try {
+          data = await saveLogin();
+        } catch (error) {
+          const candidate = error.payload && error.payload.duplicate_candidate;
+          if (!candidate) throw error;
+          // Creating a second row with the same nickname is what produced the
+          // duplicate accounts, so the server asks instead of guessing.
+          const update = window.confirm(
+            `已有一个同名账号（${candidate.username || "未命名"}）。\n\n` +
+              "点“确定”＝更新这个已有账号，保留它的目标与发送记录；\n" +
+              "点“取消”＝仍然新建一个单独的账号。",
+          );
+          data = await saveLogin(
+            update ? { merge_with: candidate.account_ref } : { allow_duplicate: "1" },
+          );
+        }
         renderWorkspace(data.workspace);
         if (data.verified === false) {
           // The cookies were stored, but the login state is not usable: show the
