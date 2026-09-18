@@ -2,11 +2,34 @@ import asyncio
 import logging
 
 from core.browser import douyin_network_modes, get_browser
+from core.login import collect_login_result
+from utils.config import normalize_unique_id
 
 
 logger = logging.getLogger(__name__)
 
 
+CATEGORY_LOGIN_REQUIRED = "login_required"
+CATEGORY_NETWORK_UNAVAILABLE = "network_unavailable"
+CATEGORY_STRUCTURE_CHANGED = "structure_changed"
+
+CATEGORY_LABELS = {
+    CATEGORY_LOGIN_REQUIRED: "登录失效",
+    CATEGORY_NETWORK_UNAVAILABLE: "网络不可用",
+    CATEGORY_STRUCTURE_CHANGED: "页面结构变化",
+}
+
+
+class FriendRefreshError(RuntimeError):
+    """Friend refresh failure carrying a user-actionable category."""
+
+    def __init__(self, message, *, category=CATEGORY_STRUCTURE_CHANGED):
+        super().__init__(message)
+        self.category = category
+
+
+CREATOR_HOME_URL = "https://creator.douyin.com/"
+LOGIN_IDENTITY_TIMEOUT_MS = 20000
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
@@ -80,8 +103,11 @@ async def _ensure_logged_in(page):
         try:
             locator = page.locator(selector).first
             if await locator.count() > 0 and await locator.is_visible():
-                raise RuntimeError("账号登录已失效，请重新扫码登录")
-        except RuntimeError:
+                raise FriendRefreshError(
+                    "账号登录已失效，请重新扫码登录",
+                    category=CATEGORY_LOGIN_REQUIRED,
+                )
+        except FriendRefreshError:
             raise
         except Exception:
             continue
@@ -191,13 +217,18 @@ async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY
         await asyncio.sleep(0.5)
 
     summary = await _friend_list_dom_summary(page)
-    raise RuntimeError(
+    # The chat page loaded but never exposed friend rows: a page/selector change,
+    # not a transport failure.
+    raise FriendRefreshError(
         "friend list did not become ready within timeout; "
-        f"dom={summary}"
+        f"dom={summary}",
+        category=CATEGORY_STRUCTURE_CHANGED,
     )
 
 
 async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOUT_SECONDS):
+    if not timeout_seconds:
+        timeout_seconds = FRIEND_LIST_READY_TIMEOUT_SECONDS
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
         await _ensure_logged_in(page)
@@ -207,7 +238,10 @@ async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOU
         except Exception:
             pass
         await asyncio.sleep(0.5)
-    raise RuntimeError("chat page did not load within timeout")
+    raise FriendRefreshError(
+        "chat page did not load within timeout",
+        category=CATEGORY_STRUCTURE_CHANGED,
+    )
 
 
 async def collect_friend_names(page):
@@ -309,7 +343,13 @@ async def collect_friend_names(page):
             return found_names
 
 
-async def _fetch_account_friends_once(account, network_mode):
+async def _fetch_account_friends_once(
+    account,
+    network_mode,
+    *,
+    auth_only=False,
+    identity_timeout_ms=LOGIN_IDENTITY_TIMEOUT_MS,
+):
     cookies = list(account.get("cookies") or [])
     playwright = browser = context = page = None
     try:
@@ -319,6 +359,43 @@ async def _fetch_account_friends_once(account, network_mode):
         context.set_default_timeout(120000)
         page = await context.new_page()
         await context.add_cookies(cookies)
+
+        if auth_only:
+            # Only the creator home page exposes the logged-in identity, and a
+            # redirect away from it is itself proof that the session is invalid.
+            await page.goto(CREATOR_HOME_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
+            try:
+                identity = await collect_login_result(
+                    page,
+                    context,
+                    timeout_ms=max(1000, identity_timeout_ms // 2),
+                )
+            except FriendRefreshError:
+                raise
+            except Exception as exc:
+                if _left_creator_host(page):
+                    # The page bounced away from the creator host: the session is
+                    # not usable.
+                    raise FriendRefreshError(
+                        "Cookie 无法登录抖音创作者中心，请重新获取 Cookie",
+                        category=CATEGORY_LOGIN_REQUIRED,
+                    ) from exc
+                # Still on the creator host but the identity did not render: this
+                # is a slow or changed page, so let the caller try other routes
+                # instead of blaming the Cookie.
+                raise _with_category(
+                    exc,
+                    classify_refresh_error(exc),
+                ) from exc
+            # Also require the friend private-message page to be readable, so a
+            # session that cannot reach the friend list is not reported healthy.
+            await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
+            await _wait_for_chat_or_login(page)
+            return {
+                "unique_id": normalize_unique_id(identity.get("unique_id")),
+                "username": str(identity.get("username") or "").strip(),
+            }
+
         await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
         await asyncio.sleep(1)
 
@@ -351,16 +428,157 @@ async def _fetch_account_friends_once(account, network_mode):
                 logger.debug("Failed to stop friend refresh Playwright", exc_info=True)
 
 
+async def verify_account_session(account, *, auth_only=False, network_mode=None):
+    """Verify a stored cookie set by actually loading the friend chat page.
+
+    Returns ``{"verified": True, "friends": [...], "identity": {...}}`` when the
+    login state is usable. Raises :class:`FriendRefreshError` with a user
+    actionable category when the login state is not usable or the page could not
+    be read.
+    """
+    cookies = list(account.get("cookies") or [])
+    if not cookies:
+        raise FriendRefreshError(
+            "账号没有保存 Cookie，无法验证登录态",
+            category=CATEGORY_LOGIN_REQUIRED,
+        )
+
+    modes = [network_mode] if network_mode else douyin_network_modes()
+    last_category = CATEGORY_NETWORK_UNAVAILABLE
+    last_error = None
+    for mode in modes:
+        try:
+            payload = await _fetch_account_friends_once(
+                account,
+                mode,
+                auth_only=auth_only,
+            )
+        except FriendRefreshError as exc:
+            if exc.category == CATEGORY_LOGIN_REQUIRED:
+                raise
+            last_category = exc.category
+            last_error = exc
+            logger.warning("Session verification route=%s failed: %s", mode, exc)
+            continue
+        except RuntimeError as exc:
+            last_category = classify_refresh_error(exc)
+            if last_category == CATEGORY_LOGIN_REQUIRED:
+                raise FriendRefreshError(
+                    str(exc),
+                    category=CATEGORY_LOGIN_REQUIRED,
+                ) from exc
+            last_error = exc
+            logger.warning("Session verification route=%s failed: %s", mode, exc)
+            continue
+        except Exception as exc:
+            last_category = classify_refresh_error(exc)
+            last_error = exc
+            logger.warning("Session verification route=%s failed: %s", mode, exc)
+            continue
+        if auth_only:
+            identity = dict(payload or {})
+            friends = []
+        else:
+            friends = list(payload or [])
+            identity = {}
+        logger.info(
+            "Session verification route=%s identity=%s",
+            mode,
+            "resolved" if identity.get("unique_id") else "unresolved",
+        )
+        return {
+            "verified": True,
+            "friends": friends,
+            "identity": identity,
+        }
+
+    raise FriendRefreshError(
+        f"无法读取好友私信页，无法验证登录态：{last_error}",
+        category=last_category,
+    )
+
+
+STRUCTURE_ERROR_MARKERS = (
+    "did not become ready",
+    "did not load",
+    "dom=",
+    "好友列表已加载但未找到",
+    "未找到好友列表滚动容器",
+    "未找到朋友私信标签",
+)
+
+NETWORK_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "net::",
+    "err_",
+    "proxy",
+    "connection",
+    "connect",
+    "dns",
+    "目标计算机积极拒绝",
+    "network",
+    "网络",
+)
+
+LOGIN_ERROR_MARKERS = ("login", "cookie", "scan", "登录", "扫码")
+
+
+def _with_category(error, category):
+    """Attach a category to an error without losing its type or message."""
+    if category == CATEGORY_LOGIN_REQUIRED:
+        return FriendRefreshError(str(error), category=category)
+    try:
+        setattr(error, "category", category)
+        return error
+    except (AttributeError, TypeError):
+        return FriendRefreshError(str(error), category=category)
+
+
+def _left_creator_host(page):
+    """True when the page is no longer on the Douyin creator host."""
+    try:
+        current_url = str(page.url or "")
+    except Exception:
+        return False
+    if not current_url:
+        return False
+    return "creator.douyin.com" not in current_url
+
+
+def classify_refresh_error(exc):
+    """Map a refresh failure to one of the three user-facing categories.
+
+    Categories are attached where the failure is detected; this helper only
+    classifies raw/unknown errors, and it distinguishes a loaded page with
+    missing DOM from a transport failure.
+    """
+    if isinstance(exc, FriendRefreshError):
+        return exc.category
+    text = str(exc or "").lower()
+    if any(marker in text for marker in STRUCTURE_ERROR_MARKERS):
+        return CATEGORY_STRUCTURE_CHANGED
+    if any(marker in text for marker in LOGIN_ERROR_MARKERS):
+        return CATEGORY_LOGIN_REQUIRED
+    if any(marker in text for marker in NETWORK_ERROR_MARKERS):
+        return CATEGORY_NETWORK_UNAVAILABLE
+    return CATEGORY_STRUCTURE_CHANGED
+
+
 async def fetch_account_friends(account):
     cookies = list(account.get("cookies") or [])
     if not cookies:
-        raise RuntimeError("account has no cookies; scan login QR code first")
+        raise FriendRefreshError(
+            "account has no cookies; scan login QR code first",
+            category=CATEGORY_LOGIN_REQUIRED,
+        )
 
     modes = douyin_network_modes()
     last_error = None
     for index, network_mode in enumerate(modes):
         try:
-            friends = await _fetch_account_friends_once(account, network_mode)
+            payload = await _fetch_account_friends_once(account, network_mode)
+            friends = list(payload or [])
             logger.info(
                 "Friend refresh route=%s count=%s attempt=%s/%s",
                 network_mode,
@@ -374,13 +592,22 @@ async def fetch_account_friends(account):
                 "Friend refresh route=%s returned zero friends; trying next route",
                 network_mode,
             )
-        except RuntimeError as exc:
-            text = str(exc).lower()
-            if any(marker in text for marker in ("login", "cookie", "scan", "登录", "扫码")):
+        except FriendRefreshError as exc:
+            if exc.category == CATEGORY_LOGIN_REQUIRED:
                 raise
             last_error = exc
             logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
-        except Exception as exc:
-            last_error = exc
+        except RuntimeError as exc:
+            category = classify_refresh_error(exc)
+            if category == CATEGORY_LOGIN_REQUIRED:
+                raise FriendRefreshError(str(exc), category=category) from exc
+            last_error = _with_category(exc, category)
             logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
-    raise RuntimeError(f"friend refresh failed after routes {modes}: {last_error}")
+        except Exception as exc:
+            last_error = _with_category(exc, classify_refresh_error(exc))
+            logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
+    raise FriendRefreshError(
+        f"friend refresh failed after routes {modes}: {last_error}",
+        category=classify_refresh_error(last_error),
+    )
+

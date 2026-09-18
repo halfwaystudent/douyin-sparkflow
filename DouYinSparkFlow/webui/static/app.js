@@ -437,33 +437,55 @@
     setStatus("登录工作区当前关闭。请从账号卡片点击“重新登录”。");
   };
 
-  const refreshLoginQr = async (delay = 0, retries = 40) => {
+  const refreshLoginQr = async (delay = 0, retries = 60) => {
     if (!qrImage || workspace.state !== "active" || !workspace.active) return;
     window.clearTimeout(qrRefreshTimer);
     qrRefreshTimer = window.setTimeout(async () => {
       if (qrStatus) qrStatus.textContent = "正在读取登录二维码...";
+      const retryLater = (message) => {
+        if (retries > 1 && workspace.state === "active") {
+          if (qrStatus) qrStatus.textContent = `${message} 继续等待...`;
+          refreshLoginQr(1500, retries - 1);
+        } else if (qrStatus) {
+          qrStatus.textContent = `${message} 已停止自动重试，请点击“刷新二维码”。`;
+        }
+      };
       try {
         const response = await fetch(`/login-desktop/qr?t=${Date.now()}`, { credentials: "same-origin", cache: "no-store" });
-        if (response.status === 202) {
-          if (retries > 1 && workspace.state === "active") {
-            if (qrStatus) qrStatus.textContent = "浏览器正在生成二维码，继续等待...";
-            refreshLoginQr(1400, retries - 1);
-          } else if (qrStatus) {
-            qrStatus.textContent = "登录页面在规定时间内没有生成二维码，请稍后重试。";
-          }
+        if (response.status === 409) {
+          // Only an explicit refresh regenerates an expired QR code, so stop
+          // polling instead of promising a new code that never arrives.
+          const data = await response.json().catch(() => ({}));
+          if (qrStatus) qrStatus.textContent = data.message || "二维码已过期，请点击“刷新二维码”。";
           return;
         }
-        if (response.status === 409) {
-          if (qrStatus) qrStatus.textContent = "二维码已过期，请点击刷新二维码。";
+        if (response.status === 202) {
+          const data = await response.json().catch(() => ({}));
+          if (data.logged_in || data.state === "qr_logged_in") {
+            if (qrStatus) qrStatus.textContent = data.message || "检测到浏览器里还保留着登录状态，已重置，正在生成新的二维码...";
+          }
+          retryLater(data.message || "浏览器正在生成二维码");
+          return;
+        }
+        if (response.status === 503) {
+          const data = await response.json().catch(() => ({}));
+          retryLater(data.message || "登录页正在处理上一个请求");
           return;
         }
         if (response.status === 502) {
           const data = await response.json().catch(() => ({}));
-          if (qrStatus) qrStatus.textContent = data.error || "无法访问抖音创作者中心，请检查服务器网络出口。";
+          if (qrStatus) qrStatus.textContent = data.message || data.error || "登录桌面服务暂时不可用，请稍后点击刷新二维码。";
           return;
         }
         if (!response.ok) throw new Error(String(response.status));
         const blob = await response.blob();
+        if (blob.type && blob.type.includes("json")) {
+          const data = await blob.text().then((text) => JSON.parse(text)).catch(() => ({}));
+          if (data.message || data.error) {
+            retryLater(data.message || data.error);
+            return;
+          }
+        }
         const previous = qrImage.dataset.objectUrl || "";
         const objectUrl = URL.createObjectURL(blob);
         qrImage.src = objectUrl;
@@ -472,12 +494,7 @@
         if (previous) URL.revokeObjectURL(previous);
         if (qrStatus) qrStatus.textContent = "二维码已加载。如果过期，点击刷新。";
       } catch {
-        if (retries > 1 && workspace.state === "active") {
-          if (qrStatus) qrStatus.textContent = "登录页正在加载，继续等待二维码...";
-          refreshLoginQr(1400, retries - 1);
-        } else if (qrStatus) {
-          qrStatus.textContent = "二维码还未准备好，请确认自己已经获得登录工作区。";
-        }
+        retryLater("登录页正在加载");
       }
     }, delay);
   };
@@ -555,7 +572,28 @@
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        await postForm("/login-desktop/qr/refresh", { ticket: workspace.ticket });
+        const refreshForm = new FormData();
+        refreshForm.set("csrf_token", csrfToken);
+        refreshForm.set("ticket", workspace.ticket);
+        const response = await fetch("/login-desktop/qr/refresh", {
+          method: "POST",
+          body: refreshForm,
+          credentials: "same-origin",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok === false) {
+          // A 202 with ok:false means the page did not produce a QR code yet.
+          if (qrStatus) {
+            qrStatus.textContent = `刷新二维码未完成：${data.message || data.error || response.status}`;
+          }
+          if (data.state === "logged_in" || data.logged_in) {
+            if (qrStatus) {
+              qrStatus.textContent = data.message || "检测到浏览器里还保留着登录状态，已重置，正在生成新的二维码...";
+            }
+          }
+          refreshLoginQr(1200);
+          return;
+        }
         refreshLoginQr(500);
       } catch (error) {
         if (qrStatus) qrStatus.textContent = `刷新二维码失败：${error.message}`;
@@ -565,11 +603,62 @@
     });
   });
 
+  document.querySelectorAll("[data-cookie-login]").forEach((panel) => {
+    const input = panel.querySelector("[data-cookie-input]");
+    const displayName = panel.querySelector("[data-cookie-display-name]");
+    const reloginToggle = panel.querySelector("[data-cookie-relogin-mode]");
+    const reloginRow = panel.querySelector("[data-cookie-relogin-row]");
+    const reloginSelect = panel.querySelector("[data-cookie-relogin-select]");
+    const submit = panel.querySelector("[data-cookie-login-submit]");
+    const status = panel.querySelector("[data-cookie-login-status]");
+
+    reloginToggle?.addEventListener("change", () => {
+      if (reloginRow) reloginRow.hidden = !reloginToggle.checked;
+    });
+
+    submit?.addEventListener("click", async () => {
+      const cookieInput = String(input?.value || "").trim();
+      if (!cookieInput) {
+        if (status) status.textContent = "请先粘贴 Cookie 内容。";
+        return;
+      }
+      submit.disabled = true;
+      const previousLabel = status ? status.textContent : "";
+      if (status) status.textContent = "正在验证 Cookie 并登录，请稍候...";
+      try {
+        const data = await postForm("/accounts/cookies", {
+          cookie_input: cookieInput,
+          display_name: String(displayName?.value || "").trim(),
+          relogin_unique_id: reloginToggle?.checked ? String(reloginSelect?.value || "") : "",
+        });
+        if (status) status.textContent = data.message || "Cookie 登录成功，页面即将刷新。";
+        if (input) input.value = "";
+        window.setTimeout(() => window.location.reload(), 900);
+      } catch (error) {
+        if (status) status.textContent = `Cookie 登录失败：${error.message}`;
+        else if (previousLabel) status.textContent = previousLabel;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  });
+
   document.querySelectorAll(".login-desktop-save").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
         const data = await postForm("/login-desktop/save", { relogin_unique_id: button.dataset.reloginUniqueId || "" });
         renderWorkspace(data.workspace);
+        if (data.verified === false) {
+          // The cookies were stored, but the login state is not usable: show the
+          // reason instead of a success toast.
+          setStatus(
+            `已保存登录态，但验证未通过：${data.verification_error || "登录态不可用"}`,
+            "danger",
+          );
+          closeFrame();
+          window.setTimeout(() => window.location.reload(), 1500);
+          return;
+        }
         setStatus(`已保存登录账号：${data.account?.username || ""}`, "success");
         closeFrame();
         window.setTimeout(() => window.location.reload(), 800);
@@ -713,6 +802,24 @@
       render();
     });
     search?.addEventListener("input", render);
+    // This element is the only place the last successful refresh time is shown,
+    // so remember its initial text and keep it visible while reporting failures.
+    const initialStatusText = String(status?.textContent || "").trim();
+    let lastSuccessAt = "";
+    const describeLastSuccess = () => {
+      const previous = String(lastSuccessAt || "").trim();
+      if (previous) return `上次成功刷新：${previous}`;
+      return initialStatusText || "尚未读取好友列表";
+    };
+    const showRefreshOutcome = (message) => {
+      if (!status) return;
+      status.textContent = message;
+      const detail = document.createElement("span");
+      detail.className = "friend-picker-last-refresh";
+      detail.textContent = describeLastSuccess();
+      status.append(" ", detail);
+    };
+
     refreshButton?.addEventListener("click", async () => {
       refreshButton.disabled = true;
       if (status) status.textContent = "正在读取好友列表...";
@@ -725,12 +832,20 @@
           credentials: "same-origin",
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "刷新失败");
+        if (!response.ok) {
+          // Keep an in-session timestamp when this failure body omits it (busy,
+          // forbidden, or unexpected errors).
+          lastSuccessAt = data.previousUpdatedAt || lastSuccessAt;
+          const label = data.categoryLabel ? `（${data.categoryLabel}）` : "";
+          throw new Error(`${data.error || "刷新失败"}${label}`);
+        }
+        lastSuccessAt = data.updated_at || lastSuccessAt;
         friends = data.friends || [];
         if (status) status.textContent = data.message || "好友列表已刷新";
         render();
       } catch (error) {
-        if (status) status.textContent = `刷新失败：${error.message}`;
+        // Keep the previous successful refresh time visible after a failure.
+        showRefreshOutcome(`刷新失败：${error.message}`);
       } finally {
         refreshButton.disabled = false;
       }

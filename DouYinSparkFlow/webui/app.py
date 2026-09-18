@@ -20,7 +20,21 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from core import streak_state
-from core.friends import fetch_account_friends
+from core.cookies import (
+    CookieParseError,
+    cookie_summary,
+    parse_cookie_input,
+    require_auth_cookies,
+)
+from core.friends import (
+    CATEGORY_LABELS,
+    CATEGORY_LOGIN_REQUIRED,
+    CATEGORY_NETWORK_UNAVAILABLE,
+    CATEGORY_STRUCTURE_CHANGED,
+    FriendRefreshError,
+    fetch_account_friends,
+    verify_account_session,
+)
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
 from core.tasks import (
     _append_streak_run_report,
@@ -340,6 +354,34 @@ def fetch_login_desktop_asset(asset_path: str, query: str = ""):
         raise RuntimeError(f"login-desktop noVNC proxy failed: {exc}") from exc
 
 
+def call_login_desktop_json(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20):
+    """Call the login-desktop API and keep the upstream status and body."""
+    url = f"{login_desktop_api_url()}{path}"
+    data = None
+    headers = login_desktop_api_headers()
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    request = urllib.request.Request(url, method=method, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status = int(getattr(response, "status", 200))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        status = int(exc.code)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(f"login-desktop unavailable: {reason}") from exc
+    try:
+        parsed = json.loads(body) if body.strip() else {}
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return status, parsed
+
+
 def call_login_desktop(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20) -> dict:
     url = f"{login_desktop_api_url()}{path}"
     data = None
@@ -389,6 +431,20 @@ async def _run_websocket_relays(*coroutines):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+_FRIEND_REFRESH_TIMEOUT_SECONDS = 300
+_friend_refresh_active = set()
+
+
+def friend_refresh_conflict(unique_id):
+    """Return a conflict reason when this account already has a refresh running."""
+    if normalize_unique_id(unique_id) in _friend_refresh_active:
+        return "该账号已有好友刷新正在进行，请稍后重试"
+    active = get_login_lock()
+    if active:
+        return "登录工作区正在被使用，请等扫码登录结束后再刷新好友"
+    return ""
+
+
 def _dedupe_account_records(accounts: list[dict], *, unique_id: str, keep_ref: str) -> set[str]:
     normalized = normalize_unique_id(unique_id)
     removed_refs = set()
@@ -407,12 +463,52 @@ def _dedupe_account_records(accounts: list[dict], *, unique_id: str, keep_ref: s
     return removed_refs
 
 
-def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "", relogin_account_ref: str = "", display_name: str = "") -> tuple[dict, str]:
+HEALTH_CLEARING_KEYS = (
+    "account_failure",
+    "account_health",
+    "account_identity_mismatch",
+    "identity_mismatch",
+    "login_required",
+    "needs_relogin",
+    "pending_login_verification",
+)
+
+
+def save_exported_login_result(
+    login_result: dict,
+    *,
+    relogin_unique_id: str = "",
+    relogin_account_ref: str = "",
+    display_name: str = "",
+    is_healthy: bool = True,
+    verification_reason: str = "",
+) -> tuple[dict, str]:
     unique_id = normalize_unique_id(login_result.get("unique_id"))
     username = str(display_name or login_result.get("username") or "").strip()
     cookies = list(login_result.get("cookies") or [])
-    if not unique_id or not username or not cookies:
+    if not unique_id or not cookies:
         raise RuntimeError("Exported login result is incomplete")
+    if not username:
+        username = unique_id
+
+    def apply_health(account):
+        """Clear login failure markers only for a verified-usable login state."""
+        if is_healthy:
+            for key in HEALTH_CLEARING_KEYS:
+                account.pop(key, None)
+            account.pop("pending_login_verification", None)
+            return
+        account["pending_login_verification"] = True
+        account["login_required"] = True
+        existing_health = dict(account.get("account_health") or {})
+        existing_health.update(
+            {
+                "healthy": False,
+                "category": CATEGORY_LOGIN_REQUIRED,
+                "reason": verification_reason or "login state could not be verified after login",
+            }
+        )
+        account["account_health"] = existing_health
 
     def mutate(accounts):
         for item in accounts:
@@ -427,19 +523,19 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
             )
             if not target:
                 raise RuntimeError("Target account not found for relogin")
+            previous_unique_id = normalize_unique_id(target.get("unique_id"))
             target["unique_id"] = unique_id
             target["username"] = username
             target["cookies"] = cookies
             target.setdefault("enabled", True)
-            for key in (
-                "account_failure",
-                "account_health",
-                "account_identity_mismatch",
-                "identity_mismatch",
-                "login_required",
-                "needs_relogin",
-            ):
-                target.pop(key, None)
+            apply_health(target)
+            if previous_unique_id and previous_unique_id != unique_id:
+                target["identity_mismatch"] = {
+                    "expected": previous_unique_id,
+                    "actual": unique_id,
+                    "detectedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "reason": "relogin exported a different Douyin account",
+                }
             _dedupe_account_records(
                 accounts,
                 unique_id=unique_id,
@@ -452,15 +548,7 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
             existing["username"] = username
             existing["cookies"] = cookies
             existing.setdefault("enabled", True)
-            for key in (
-                "account_failure",
-                "account_health",
-                "account_identity_mismatch",
-                "identity_mismatch",
-                "login_required",
-                "needs_relogin",
-            ):
-                existing.pop(key, None)
+            apply_health(existing)
             _dedupe_account_records(
                 accounts,
                 unique_id=unique_id,
@@ -476,11 +564,69 @@ def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "
             "targets": [],
             "enabled": True,
         }
+        apply_health(account)
         accounts.append(account)
         return dict(account), "created", True
 
     account, action, _ = update_user_data(mutate, force_reload=True)
     return account, action
+
+
+async def verify_login_result(login_result, *, relogin_account_ref="", relogin_unique_id=""):
+    """Verify a freshly exported or pasted login result against the real pages.
+
+    Returns ``(verified, reason, identity, category)`` and never raises for a
+    plain login-state failure: the caller records the reason on the account and
+    reports the real category to the user.
+    """
+    cookies = list(login_result.get("cookies") or [])
+    identity = {
+        "unique_id": normalize_unique_id(login_result.get("unique_id")),
+        "username": str(login_result.get("username") or "").strip(),
+    }
+    try:
+        require_auth_cookies(cookies)
+    except CookieParseError as exc:
+        return False, str(exc), identity, getattr(exc, "category", "cookie_format_invalid")
+
+    account = {
+        "cookies": cookies,
+        "unique_id": identity["unique_id"],
+        "username": identity["username"],
+        "account_ref": relogin_account_ref,
+    }
+    try:
+        result = await verify_account_session(account, auth_only=True)
+    except FriendRefreshError as exc:
+        return False, str(exc), identity, exc.category or CATEGORY_LOGIN_REQUIRED
+    except Exception as exc:  # noqa: BLE001 - report any verification failure
+        logger.warning("Login verification failed unexpectedly: %s", exc)
+        return False, f"登录态验证失败：{exc}", identity, CATEGORY_LOGIN_REQUIRED
+
+    resolved = dict(result.get("identity") or {})
+    if resolved.get("unique_id"):
+        identity = {
+            "unique_id": normalize_unique_id(resolved["unique_id"]),
+            "username": str(resolved.get("username") or identity["username"]).strip(),
+        }
+    if not identity["unique_id"]:
+        # Without a stable identity the account cannot be matched or created, so
+        # report a categorised failure instead of an opaque save error.
+        return (
+            False,
+            "登录态已通过但无法读取账号身份，请稍后重试或改用扫码登录",
+            identity,
+            CATEGORY_LOGIN_REQUIRED,
+        )
+    if relogin_unique_id and identity["unique_id"]:
+        if normalize_unique_id(relogin_unique_id) != identity["unique_id"]:
+            return (
+                False,
+                "扫码得到的账号与要重新登录的账号不一致，请确认后重试",
+                identity,
+                CATEGORY_LOGIN_REQUIRED,
+            )
+    return True, "", identity, ""
 
 
 def public_app_settings():
@@ -1016,35 +1162,98 @@ def create_app():
         if access_error:
             return JSONResponse({"error": "Forbidden" if access_error.status_code == 403 else "Account not found."}, status_code=access_error.status_code)
 
-        try:
-            friends = await fetch_account_friends(account)
-            updated_at = datetime.now().isoformat(timespec="seconds")
-
-            def mutate(updated_account, accounts):
-                del accounts
-                updated_account["friends_cache"] = friends
-                updated_account["friends_cache_updated_at"] = updated_at
-                return None
-
-            _, _, access_error = mutate_account_for_request(
-                request,
-                unique_id,
-                mutate,
+        normalized_id = normalize_unique_id(unique_id)
+        conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            # 429 keeps the caller's account data untouched and tells the caller
+            # to retry later; no second browser is started.
+            return JSONResponse(
+                {"error": conflict, "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "5"},
             )
-            if access_error:
-                return JSONResponse(
-                    {"error": "Forbidden" if access_error == 403 else "Account not found."},
-                    status_code=access_error,
-                )
+
+        _friend_refresh_active.add(normalized_id)
+        try:
+            friends = await asyncio.wait_for(
+                fetch_account_friends(account),
+                timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Friend refresh timed out for %s after %ss",
+                account.get("username", normalized_id),
+                _FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
             return JSONResponse(
                 {
-                    "friends": friends,
-                    "updated_at": updated_at,
-                    "message": f"已刷新 {len(friends)} 个好友",
-                }
+                    "error": f"读取好友列表超时（超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒），已保留上一次的好友数据",
+                    "category": CATEGORY_NETWORK_UNAVAILABLE,
+                    "categoryLabel": CATEGORY_LABELS[CATEGORY_NETWORK_UNAVAILABLE],
+                    "retryable": True,
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                },
+                status_code=504,
+            )
+        except FriendRefreshError as exc:
+            category = exc.category or CATEGORY_STRUCTURE_CHANGED
+            logger.warning(
+                "Friend refresh failed for %s category=%s: %s",
+                account.get("username", normalized_id),
+                category,
+                exc,
+            )
+            status_code = 401 if category == CATEGORY_LOGIN_REQUIRED else 502
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "category": category,
+                    "categoryLabel": CATEGORY_LABELS.get(category, CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED]),
+                    "retryable": category != CATEGORY_LOGIN_REQUIRED,
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                },
+                status_code=status_code,
             )
         except RuntimeError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "category": CATEGORY_STRUCTURE_CHANGED,
+                    "categoryLabel": CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED],
+                    "retryable": True,
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                },
+                status_code=502,
+            )
+        finally:
+            _friend_refresh_active.discard(normalized_id)
+
+        updated_at = datetime.now().isoformat(timespec="seconds")
+
+        def mutate(updated_account, accounts):
+            del accounts
+            updated_account["friends_cache"] = friends
+            updated_account["friends_cache_updated_at"] = updated_at
+            return None
+
+        _, _, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+        )
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error == 403 else "Account not found."},
+                status_code=access_error,
+            )
+        return JSONResponse(
+            {
+                "friends": friends,
+                "updated_at": updated_at,
+                "previous_updated_at": account.get("friends_cache_updated_at", ""),
+                "message": f"已刷新 {len(friends)} 个好友",
+            }
+        )
 
     @app.post("/accounts/{unique_id}/delete")
     async def delete_account(request: Request, unique_id: str):
@@ -1622,24 +1831,78 @@ def create_app():
                     if close:
                         close()
             upstream_status, upstream_headers, content = await asyncio.to_thread(read_qr_response)
-            if upstream_status == 202:
-                retry_after = upstream_headers.get("Retry-After", "2")
-                return JSONResponse(
-                    {"ok": False, "state": "starting", "retry_after": int(retry_after or 2)},
-                    status_code=202,
-                    headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            upstream_content_type = _header_value(upstream_headers, "Content-Type")
+            if upstream_status == 202 or "application/json" in upstream_content_type:
+                # JSON bodies carry a machine-readable QR state (not-generated,
+                # page busy, existing session). Forwarding them as image/png
+                # would show the browser a broken image instead of the reason.
+                retry_after = _header_value(upstream_headers, "Retry-After") or "2"
+                return _qr_state_response(
+                    content,
+                    state="starting",
+                    status_code=upstream_status,
+                    retry_after=retry_after,
                 )
+            if upstream_status in {409, 503}:
+                # Upstream already classified the reason; forward it instead of
+                # collapsing every failure into "service unavailable".
+                return _qr_state_response(content, state="retrying", status_code=upstream_status)
             return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store, max-age=0"})
         except urllib.error.HTTPError as exc:
-            if exc.code in {404, 409, 202}:
-                return JSONResponse(
-                    {"ok": False, "state": "starting", "retry_after": 2},
-                    status_code=202,
-                    headers={"Retry-After": "2", "Cache-Control": "no-store"},
+            if exc.code in {202, 409, 503}:
+                return _qr_state_response(
+                    _safe_json_bytes(exc),
+                    state="retrying",
+                    status_code=exc.code,
+                    retry_after=_header_value(exc.headers, "Retry-After") or "2",
                 )
             return PlainTextResponse("login QR service is unavailable", status_code=502)
         except (urllib.error.URLError, TimeoutError):
             return PlainTextResponse("login QR service is unavailable", status_code=502)
+
+    def _header_value(headers, name):
+        """Read a response header case-insensitively (HTTP header names are)."""
+        if not headers:
+            return ""
+        target = str(name).lower()
+        try:
+            for key, value in headers.items():
+                if str(key).lower() == target:
+                    return str(value)
+        except (AttributeError, TypeError):
+            return ""
+        try:
+            return str(headers.get(name) or "")
+        except (AttributeError, TypeError):
+            return ""
+
+    def _safe_json_bytes(exc):
+        try:
+            return exc.read()
+        except Exception:
+            return b"{}"
+
+    def _qr_state_response(content, *, state, status_code, retry_after=None):
+        payload = {}
+        try:
+            decoded = json.loads(content.decode("utf-8"))
+            if isinstance(decoded, dict):
+                payload = decoded
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            payload = {}
+        payload.setdefault("ok", False)
+        payload.setdefault("state", state)
+        # Upstream already classifies which QR states are retryable; an expired
+        # QR code is not, because only an explicit refresh regenerates it.
+        retryable = bool(payload.get("retryable", status_code in {202, 503}))
+        payload["retryable"] = retryable
+        delay = int(retry_after or payload.get("retry_after") or 2)
+        payload["retry_after"] = delay
+        return JSONResponse(
+            payload,
+            status_code=status_code,
+            headers={"Retry-After": str(delay), "Cache-Control": "no-store"},
+        )
 
     @app.post("/login-desktop/qr/refresh")
     async def login_desktop_qr_refresh(request: Request):
@@ -1658,10 +1921,45 @@ def create_app():
             ticket=str(form.get("ticket", "")),
         )
         try:
-            payload = call_login_desktop("/refresh-qr", method="POST", payload={}, timeout=90)
-            return JSONResponse({"ok": True, "result": payload, "workspace": _workspace_payload(request)})
+            status, payload = await asyncio.to_thread(
+                call_login_desktop_json,
+                "/refresh-qr",
+                method="POST",
+                payload={},
+                timeout=90,
+            )
         except RuntimeError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "state": "qr_service_unavailable",
+                    "error": str(exc),
+                    "message": "登录桌面服务暂时不可用，请稍后重试",
+                    "retryable": True,
+                    "retry_after": 3,
+                },
+                status_code=503,
+                headers={"Retry-After": "3", "Cache-Control": "no-store"},
+            )
+        if status >= 400 or not payload.get("ok", False):
+            # 202-qr_not_ready and any ok:false payload are real failures; the UI
+            # must not report a successful refresh when no QR code was produced.
+            message = str(payload.get("message") or payload.get("error") or "二维码尚未生成，请稍后重试")
+            delay = int(payload.get("retry_after") or 2)
+            return JSONResponse(
+                {
+                    **payload,
+                    "ok": False,
+                    "state": payload.get("state") or payload.get("code") or "qr_not_ready",
+                    "error": message,
+                    "message": message,
+                    "retryable": bool(payload.get("retryable", status == 503)),
+                    "retry_after": delay,
+                },
+                status_code=status if status >= 400 else 202,
+                headers={"Retry-After": str(delay), "Cache-Control": "no-store"},
+            )
+        return JSONResponse({"ok": True, "result": payload, "workspace": _workspace_payload(request)})
 
     @app.post("/login-desktop/focus")
     async def login_desktop_focus(request: Request):
@@ -1817,6 +2115,164 @@ def create_app():
         await _reset_and_promote()
         return JSONResponse({"ok": True, "workspace": _workspace_payload(request)})
 
+    @app.post("/login-desktop/clear-state")
+    async def login_desktop_clear_state(request: Request):
+        """Drop the shared persistent-profile login state (used after cookie login)."""
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"redirect": "/login"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+        # Clearing the shared profile while another session owns (or is about to
+        # take) the login workspace would fight that session for the same browser.
+        current = principal(request)
+        if current.get("role") != "admin":
+            active = get_login_lock()
+            if not active or not owns_login_lock(
+                active,
+                username=current["username"],
+                session_id=current.get("session_id", ""),
+            ):
+                return JSONResponse(
+                    {"ok": False, "error": "登录工作区当前未由本会话占用"},
+                    status_code=423,
+                )
+        try:
+            payload = call_login_desktop("/clear-login-state", method="POST", payload={}, timeout=60)
+            return JSONResponse({"ok": True, "result": payload})
+        except RuntimeError as exc:
+            logger.warning("Clearing the shared login state failed: %s", exc)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+
+    @app.post("/accounts/cookies")
+    async def login_with_cookies(request: Request):
+        """Sign in by pasting an existing Cookie instead of scanning a QR code."""
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+
+        current = principal(request)
+        raw_cookies = str(form.get("cookie_input", ""))
+        display_name = str(form.get("display_name", "")).strip()
+        relogin_unique_id = str(form.get("relogin_unique_id", "")).strip()
+        relogin_account_ref = ""
+
+        if relogin_unique_id:
+            _, account, access_error = account_for_request(request, relogin_unique_id)
+            if access_error:
+                return JSONResponse(
+                    {"ok": False, "error": "无权操作该账号"},
+                    status_code=access_error.status_code,
+                )
+            relogin_account_ref = str(account.get("account_ref", ""))
+            relogin_unique_id = str(account.get("unique_id", ""))
+
+        try:
+            cookies = parse_cookie_input(raw_cookies)
+            require_auth_cookies(cookies)
+        except CookieParseError as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "category": getattr(exc, "category", "cookie_format_invalid"),
+                    "retryable": False,
+                },
+                status_code=400,
+            )
+
+        verified, verification_reason, identity, verification_category = await verify_login_result(
+            {"cookies": cookies},
+            relogin_unique_id=relogin_unique_id,
+        )
+        if not verified:
+            # Reject without touching any account: the pasted state was not usable.
+            category = verification_category or CATEGORY_LOGIN_REQUIRED
+            logger.warning(
+                "Cookie login rejected for user=%s category=%s reason=%s",
+                current.get("username", ""),
+                category,
+                verification_reason,
+            )
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": verification_reason or "Cookie 验证失败",
+                    "category": category,
+                    "categoryLabel": CATEGORY_LABELS.get(
+                        category,
+                        CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED],
+                    ),
+                    # A transport or page problem is worth retrying; a rejected
+                    # Cookie is not.
+                    "retryable": category != CATEGORY_LOGIN_REQUIRED,
+                },
+                status_code=400,
+            )
+
+        if not relogin_account_ref and identity.get("unique_id"):
+            existing = account_by_unique_id(get_userData(force_reload=True), identity["unique_id"])
+            if existing:
+                if not can_access_account(current, existing):
+                    return JSONResponse(
+                        {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
+                        status_code=403,
+                    )
+                relogin_account_ref = str(existing.get("account_ref", ""))
+
+        login_result = {
+            "unique_id": identity.get("unique_id", ""),
+            "username": identity.get("username", ""),
+            "cookies": cookies,
+            "cookie_source": "pasted",
+        }
+        try:
+            account, action = save_exported_login_result(
+                login_result,
+                relogin_unique_id=relogin_unique_id,
+                relogin_account_ref=relogin_account_ref,
+                display_name=display_name,
+                is_healthy=True,
+            )
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+        if current.get("role") == "user":
+            refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
+            update_web_user(current["username"], account_refs=refs)
+
+        try:
+            call_login_desktop("/clear-login-state", method="POST", payload={}, timeout=60)
+        except RuntimeError as exc:
+            logger.warning("Cookie login saved but clearing the shared login state failed: %s", exc)
+
+        summary = cookie_summary(cookies)
+        logger.info(
+            "Cookie login saved by user=%s action=%s cookies=%s auth=%s",
+            current.get("username", ""),
+            action,
+            summary["count"],
+            ",".join(summary["auth_names"]),
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "action": action,
+                "message": f"Cookie 登录成功，已{'更新' if action == 'updated' else '添加'}账号 {account.get('username', '')}",
+                "account": {
+                    "account_ref": account.get("account_ref"),
+                    "unique_id": account.get("unique_id"),
+                    "username": account.get("username"),
+                    "enabled": account.get("enabled", True),
+                    "healthy": True,
+                },
+            }
+        )
+
     @app.post("/login-desktop/save")
     async def login_desktop_save(request: Request):
         maybe_redirect = require_user(request)
@@ -1854,11 +2310,18 @@ def create_app():
                 relogin_account_ref = existing.get("account_ref", "")
                 relogin_unique_id = existing.get("unique_id", "")
                 operation = "relogin"
+            verified, verification_reason, _identity, verification_category = await verify_login_result(
+                exported,
+                relogin_account_ref=relogin_account_ref,
+                relogin_unique_id=relogin_unique_id,
+            )
             account, action = save_exported_login_result(
                 exported,
                 relogin_unique_id=relogin_unique_id,
                 relogin_account_ref=relogin_account_ref,
                 display_name=display_name,
+                is_healthy=verified,
+                verification_reason=verification_reason,
             )
             if operation == "add" and current.get("role") == "user":
                 refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
@@ -1868,11 +2331,15 @@ def create_app():
             return JSONResponse({
                 "ok": True,
                 "action": action,
+                "verified": verified,
+                "verification_error": verification_reason,
+                "verification_category": verification_category,
                 "account": {
                     "account_ref": account.get("account_ref"),
                     "unique_id": account.get("unique_id"),
                     "username": account.get("username"),
                     "enabled": account.get("enabled", True),
+                    "healthy": bool(verified),
                 },
                 "workspace": _workspace_payload(request),
             })

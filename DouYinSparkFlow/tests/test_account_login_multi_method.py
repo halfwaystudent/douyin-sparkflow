@@ -1,0 +1,1119 @@
+import asyncio
+import json
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+import login_desktop_server
+from core import cookies as cookie_module
+from core import friends as friends_module
+from core import streak_state
+from webui import app as app_module
+from webui import login_lock
+
+ACCOUNT_ID = "1234567890"
+
+
+def _json_export():
+    return json.dumps(
+        [
+            {
+                "domain": ".douyin.com",
+                "name": "sessionid",
+                "value": "abc123",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "expirationDate": 4102444800,
+            },
+            {"name": "sid_guard", "value": "def456"},
+        ]
+    )
+
+
+class CookieInputParsingTests(unittest.TestCase):
+    def test_json_array_export_is_normalized(self):
+        cookies = cookie_module.parse_cookie_input(_json_export())
+
+        self.assertEqual(2, len(cookies))
+        self.assertEqual("sessionid", cookies[0]["name"])
+        self.assertEqual(".douyin.com", cookies[0]["domain"])
+        self.assertEqual("/", cookies[0]["path"])
+        self.assertTrue(cookies[0]["httpOnly"])
+        self.assertAlmostEqual(4102444800.0, cookies[0]["expires"])
+
+    def test_header_string_gains_domain_and_path(self):
+        cookies = cookie_module.parse_cookie_input("Cookie: sessionid=abc; sid_guard=def")
+
+        self.assertEqual(["sessionid", "sid_guard"], [item["name"] for item in cookies])
+        self.assertEqual({".douyin.com"}, {item["domain"] for item in cookies})
+        self.assertEqual({"/"}, {item["path"] for item in cookies})
+
+    def test_single_cookie_value_is_accepted(self):
+        cookies = cookie_module.parse_cookie_input("sessionid=only-value")
+
+        self.assertEqual(1, len(cookies))
+        self.assertEqual("only-value", cookies[0]["value"])
+
+    def test_domain_gains_leading_dot_and_empty_path_defaults(self):
+        cookies = cookie_module.parse_cookie_input(
+            json.dumps([{"name": "sessionid", "value": "v", "domain": "creator.douyin.com", "path": ""}])
+        )
+
+        self.assertEqual(".creator.douyin.com", cookies[0]["domain"])
+        self.assertEqual("/", cookies[0]["path"])
+
+    def test_unparseable_input_is_rejected(self):
+        with self.assertRaises(cookie_module.CookieParseError):
+            cookie_module.parse_cookie_input("this is not a cookie")
+
+        with self.assertRaises(cookie_module.CookieParseError):
+            cookie_module.parse_cookie_input("")
+
+        with self.assertRaises(cookie_module.CookieParseError):
+            cookie_module.parse_cookie_input(json.dumps([]))
+
+    def test_missing_auth_cookie_is_rejected(self):
+        cookies = cookie_module.parse_cookie_input("ttwid=no-auth-here")
+
+        self.assertEqual([], cookie_module.auth_cookie_names(cookies))
+        with self.assertRaises(cookie_module.CookieParseError) as caught:
+            cookie_module.require_auth_cookies(cookies)
+        self.assertEqual("cookie_auth_missing", caught.exception.category)
+
+    def test_cookie_summary_never_contains_values(self):
+        cookies = cookie_module.parse_cookie_input(_json_export())
+
+        summary = cookie_module.cookie_summary(cookies)
+        rendered = json.dumps(summary)
+
+        self.assertEqual(2, summary["count"])
+        self.assertNotIn("abc123", rendered)
+        self.assertNotIn("def456", rendered)
+
+
+class FriendRefreshCategoryTests(unittest.TestCase):
+    def test_login_failures_are_classified_as_login_required(self):
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            friends_module.classify_refresh_error(RuntimeError("账号登录已失效，请重新扫码登录")),
+        )
+
+    def test_transport_failures_are_classified_as_network(self):
+        self.assertEqual(
+            friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            friends_module.classify_refresh_error(RuntimeError("net::ERR_PROXY_CONNECTION_FAILED")),
+        )
+
+    def test_other_failures_are_classified_as_structure_change(self):
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            friends_module.classify_refresh_error(
+                RuntimeError("好友列表已加载但未找到可读取的好友行")
+            ),
+        )
+
+    def test_missing_dom_is_structure_change_not_network(self):
+        # A loaded page with missing DOM used to be reported as a network failure
+        # because the message contains the word "timeout".
+        for message in (
+            "friend list did not become ready within timeout; dom={}",
+            "chat page did not load within timeout",
+        ):
+            self.assertEqual(
+                friends_module.CATEGORY_STRUCTURE_CHANGED,
+                friends_module.classify_refresh_error(RuntimeError(message)),
+                message,
+            )
+
+    def test_categories_attached_by_raisers_survive_classification(self):
+        error = friends_module.FriendRefreshError(
+            "friend list did not become ready within timeout",
+            category=friends_module.CATEGORY_LOGIN_REQUIRED,
+        )
+
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            friends_module.classify_refresh_error(error),
+        )
+
+
+class _FakeLocator:
+    def __init__(self, count):
+        self._count = count
+
+    async def count(self):
+        return self._count
+
+
+class _FakePage:
+    """Minimal page double that records navigation and reports #sub-app."""
+
+    def __init__(self, *, sub_app_count=1, url="https://creator.douyin.com/", redirect_to=None):
+        self.url = url
+        self.sub_app_count = sub_app_count
+        self.redirect_to = redirect_to
+        self.visited = []
+
+    async def goto(self, url, **kwargs):
+        self.visited.append(url)
+        self.url = self.redirect_to or url
+
+    def locator(self, selector):
+        if selector == "#sub-app":
+            return _FakeLocator(self.sub_app_count)
+        return _FakeLocator(0)
+
+    async def wait_for_selector(self, selector, timeout=None):
+        return None
+
+    async def close(self):
+        return None
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self._page = page
+        self.added_cookies = []
+        self.closed = False
+
+    async def add_cookies(self, cookies):
+        self.added_cookies.extend(cookies)
+
+    async def new_page(self):
+        return self._page
+
+    async def cookies(self, *args, **kwargs):
+        return [{"name": "sessionid", "value": "v"}]
+
+    def set_default_navigation_timeout(self, value):
+        return None
+
+    def set_default_timeout(self, value):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeBrowser:
+    def __init__(self, context):
+        self._context = context
+        self.closed = False
+
+    async def new_context(self):
+        return self._context
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakePlaywright:
+    def __init__(self):
+        self.stopped = False
+
+    async def stop(self):
+        self.stopped = True
+
+
+class AuthOnlyFetchTests(unittest.TestCase):
+    """Exercise the real auth_only branch instead of stubbing it out."""
+
+    def _run(self, page, identity):
+        context = _FakeContext(page)
+        browser = _FakeBrowser(context)
+        playwright = _FakePlaywright()
+
+        async def fake_get_browser(*args, **kwargs):
+            return playwright, browser
+
+        async def fake_login_result(page_arg, context_arg, timeout_ms=300000):
+            return identity
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=fake_login_result),
+        ):
+            result = asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+        return result, page, context, browser, playwright
+
+    def test_auth_only_visits_creator_home_then_chat_and_returns_identity(self):
+        page = _FakePage(sub_app_count=1)
+
+        result, page, context, browser, playwright = self._run(
+            page,
+            {"unique_id": f" {ACCOUNT_ID} ", "username": " Tester "},
+        )
+
+        self.assertEqual(ACCOUNT_ID, result["unique_id"])
+        self.assertEqual("Tester", result["username"])
+        self.assertEqual(
+            [friends_module.CREATOR_HOME_URL, friends_module.CHAT_PAGE_URL],
+            page.visited,
+        )
+        self.assertTrue(browser.closed)
+        self.assertTrue(context.closed)
+        self.assertTrue(playwright.stopped)
+
+    def test_auth_only_without_identity_on_creator_host_is_not_login_required(self):
+        # Still on the creator host: a slow or changed page must not be reported
+        # as a bad Cookie, so other routes can still be tried.
+        page = _FakePage(sub_app_count=1, url="https://creator.douyin.com/login")
+
+        async def failing_login_result(page_arg, context_arg, timeout_ms=300000):
+            raise RuntimeError("net::ERR_TIMED_OUT waiting for READY_SELECTOR")
+
+        context = _FakeContext(page)
+        browser = _FakeBrowser(context)
+
+        async def fake_get_browser(*args, **kwargs):
+            return _FakePlaywright(), browser
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=failing_login_result),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+
+        self.assertEqual(
+            friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            caught.exception.category,
+        )
+
+    def test_auth_only_redirected_away_from_creator_is_login_required(self):
+        # The creator home URL bounces to the public site, which proves the
+        # Cookie is not usable.
+        page = _FakePage(sub_app_count=1, redirect_to="https://www.douyin.com/")
+
+        async def failing_login_result(page_arg, context_arg, timeout_ms=300000):
+            raise RuntimeError("READY_SELECTOR not found")
+
+        context = _FakeContext(page)
+        browser = _FakeBrowser(context)
+
+        async def fake_get_browser(*args, **kwargs):
+            return _FakePlaywright(), browser
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=failing_login_result),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            caught.exception.category,
+        )
+
+    def test_auth_only_without_chat_page_is_structure_change(self):
+        # Identity resolves but the friend page never exposes #sub-app.
+        page = _FakePage(sub_app_count=0)
+
+        async def fake_login_result(page_arg, context_arg, timeout_ms=300000):
+            return {"unique_id": ACCOUNT_ID, "username": "Tester"}
+
+        context = _FakeContext(page)
+        browser = _FakeBrowser(context)
+
+        async def fake_get_browser(*args, **kwargs):
+            return _FakePlaywright(), browser
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=fake_login_result),
+            patch.object(
+                friends_module._wait_for_chat_or_login,
+                "__defaults__",
+                (0.2,),
+            ),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            caught.exception.category,
+        )
+
+    def test_chat_wait_accepts_a_missing_timeout(self):
+        page = _FakePage(sub_app_count=1)
+
+        # Must not raise: a None timeout previously produced a TypeError that was
+        # misreported as a network failure.
+        with patch.object(
+            friends_module._wait_for_chat_or_login,
+            "__defaults__",
+            (0.2,),
+        ):
+            asyncio.run(friends_module._wait_for_chat_or_login(page, timeout_seconds=None))
+
+
+class StoredSessionVerificationTests(unittest.TestCase):
+    def test_missing_cookies_raise_login_required(self):
+        with self.assertRaises(friends_module.FriendRefreshError) as caught:
+            asyncio.run(friends_module.verify_account_session({"cookies": []}))
+
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            caught.exception.category,
+        )
+
+    def test_unreachable_routes_raise_network_category(self):
+        async def boom(account, network_mode, **kwargs):
+            raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=boom),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module.verify_account_session({"cookies": [{"name": "sessionid", "value": "v"}]})
+            )
+
+        self.assertEqual(
+            friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            caught.exception.category,
+        )
+
+    def test_verified_session_returns_identity(self):
+        async def ok(account, network_mode, **kwargs):
+            return {"unique_id": ACCOUNT_ID, "username": "Tester"}
+
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=ok) as fetch,
+        ):
+            result = asyncio.run(
+                friends_module.verify_account_session(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    auth_only=True,
+                )
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(ACCOUNT_ID, result["identity"]["unique_id"])
+        self.assertTrue(fetch.call_args.kwargs.get("auth_only"))
+
+    def test_verification_raises_login_required_when_page_shows_login_mask(self):
+        async def login_required(account, network_mode, **kwargs):
+            raise RuntimeError("账号登录已失效，请重新扫码登录")
+
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=login_required),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module.verify_account_session({"cookies": [{"name": "sessionid", "value": "v"}]})
+            )
+
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            caught.exception.category,
+        )
+
+
+class SavedLoginHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = __import__("tempfile").TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        from pathlib import Path
+
+        self.users_path = Path(self.temp_dir.name) / "usersData.json"
+        self.users_path.write_text("[]", encoding="utf-8")
+        self.users_patch = patch(
+            "utils.config.users_data_path",
+            return_value=self.users_path,
+        )
+        self.users_patch.start()
+        self.addCleanup(self.users_patch.stop)
+
+    def test_unverified_login_keeps_failure_markers(self):
+        account, action = app_module.save_exported_login_result(
+            {
+                "unique_id": ACCOUNT_ID,
+                "username": "Tester",
+                "cookies": [{"name": "sessionid", "value": "v", "domain": ".douyin.com", "path": "/"}],
+            },
+            is_healthy=False,
+            verification_reason="登录态仍不可用",
+        )
+
+        self.assertEqual("created", action)
+        self.assertTrue(account["pending_login_verification"])
+        self.assertTrue(account["login_required"])
+        self.assertFalse(account["account_health"]["healthy"])
+
+        preflight = streak_state.preflight_account(account)
+        self.assertFalse(preflight["healthy"])
+        self.assertEqual("login_verification_pending", preflight["category"])
+
+    def test_verified_login_clears_failure_markers(self):
+        app_module.save_exported_login_result(
+            {
+                "unique_id": ACCOUNT_ID,
+                "username": "Tester",
+                "cookies": [{"name": "sessionid", "value": "v", "domain": ".douyin.com", "path": "/"}],
+            },
+            is_healthy=False,
+            verification_reason="登录态仍不可用",
+        )
+
+        account, action = app_module.save_exported_login_result(
+            {
+                "unique_id": ACCOUNT_ID,
+                "username": "Tester",
+                "cookies": [{"name": "sessionid", "value": "fresh", "domain": ".douyin.com", "path": "/"}],
+            },
+            is_healthy=True,
+        )
+
+        self.assertEqual("updated", action)
+        self.assertNotIn("pending_login_verification", account)
+        self.assertNotIn("login_required", account)
+        self.assertNotIn("account_health", account)
+        self.assertTrue(streak_state.preflight_account(account)["healthy"])
+
+    def test_relogin_identity_mismatch_is_recorded(self):
+        app_module.save_exported_login_result(
+            {
+                "unique_id": ACCOUNT_ID,
+                "username": "Tester",
+                "cookies": [{"name": "sessionid", "value": "v", "domain": ".douyin.com", "path": "/"}],
+            },
+            is_healthy=True,
+        )
+
+        account, _ = app_module.save_exported_login_result(
+            {
+                "unique_id": "9999999999",
+                "username": "Other",
+                "cookies": [{"name": "sessionid", "value": "w", "domain": ".douyin.com", "path": "/"}],
+            },
+            relogin_unique_id=ACCOUNT_ID,
+            is_healthy=True,
+        )
+
+        self.assertEqual("9999999999", account["unique_id"])
+        self.assertEqual(ACCOUNT_ID, account["identity_mismatch"]["expected"])
+        self.assertEqual("9999999999", account["identity_mismatch"]["actual"])
+
+
+class WebCookieLoginEndpointTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            login_lock.LOCK_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        self.client = TestClient(app_module.app)
+        self.principal = {
+            "username": "alice",
+            "role": "user",
+            "account_refs": [],
+            "session_id": "session-1",
+        }
+
+    def test_unauthorized_cookie_login_is_rejected(self):
+        response = self.client.post("/accounts/cookies", data={"cookie_input": "sessionid=abc"})
+
+        self.assertEqual(401, response.status_code)
+
+    def test_clear_state_requires_the_workspace_lease_for_normal_users(self):
+        # Non-admins must own the shared login workspace even when no lease is
+        # currently active, so they cannot fight another session for the browser.
+        with (
+            patch.object(app_module, "current_user", return_value="alice"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(app_module, "get_login_lock", return_value=None),
+            patch.object(app_module, "call_login_desktop") as call_login,
+        ):
+            response = self.client.post("/login-desktop/clear-state", data={"csrf_token": "t"})
+
+        self.assertEqual(423, response.status_code)
+        call_login.assert_not_called()
+
+    def test_unparseable_cookie_input_is_rejected_without_touching_accounts(self):
+        with (
+            patch.object(app_module, "current_user", return_value="alice"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(app_module, "update_user_data") as update,
+        ):
+            response = self.client.post(
+                "/accounts/cookies",
+                data={"csrf_token": "t", "cookie_input": "not-a-cookie"},
+            )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("cookie_format_invalid", response.json()["category"])
+        update.assert_not_called()
+
+    def test_failed_verification_does_not_create_or_modify_accounts(self):
+        with (
+            patch.object(app_module, "current_user", return_value="alice"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(
+                app_module,
+                "verify_login_result",
+                return_value=(
+                    False,
+                    "登录态在真实页面中不可用",
+                    {"unique_id": "", "username": ""},
+                    friends_module.CATEGORY_LOGIN_REQUIRED,
+                ),
+            ),
+            patch.object(app_module, "update_user_data") as update,
+        ):
+            response = self.client.post(
+                "/accounts/cookies",
+                data={"csrf_token": "t", "cookie_input": "sessionid=abc; sid_guard=def"},
+            )
+
+        body = response.json()
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("login_required", body["category"])
+        self.assertFalse(body["retryable"])
+        update.assert_not_called()
+
+    def test_transport_verification_failure_keeps_its_category(self):
+        # A network problem during verification must not be presented as a bad
+        # Cookie, and it stays retryable.
+        with (
+            patch.object(app_module, "current_user", return_value="alice"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(
+                app_module,
+                "verify_login_result",
+                return_value=(
+                    False,
+                    "无法读取好友私信页，无法验证登录态：net::ERR_PROXY_CONNECTION_FAILED",
+                    {"unique_id": "", "username": ""},
+                    friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+                ),
+            ),
+            patch.object(app_module, "update_user_data") as update,
+        ):
+            response = self.client.post(
+                "/accounts/cookies",
+                data={"csrf_token": "t", "cookie_input": "sessionid=abc; sid_guard=def"},
+            )
+
+        body = response.json()
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("network_unavailable", body["category"])
+        self.assertTrue(body["retryable"])
+        update.assert_not_called()
+
+    def test_verified_cookie_login_reports_created_account_without_leaking_cookie(self):
+        saved = {
+            "account_ref": "acc-1",
+            "unique_id": ACCOUNT_ID,
+            "username": "Tester",
+            "enabled": True,
+        }
+        with (
+            patch.object(app_module, "current_user", return_value="alice"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(
+                app_module,
+                "verify_login_result",
+                return_value=(True, "", {"unique_id": ACCOUNT_ID, "username": "Tester"}, ""),
+            ),
+            patch.object(app_module, "account_by_unique_id", return_value=None),
+            patch.object(app_module, "save_exported_login_result", return_value=(saved, "created")) as save,
+            patch.object(app_module, "update_web_user") as update_user,
+            patch.object(app_module, "call_login_desktop", return_value={"ok": True}) as clear_state,
+        ):
+            response = self.client.post(
+                "/accounts/cookies",
+                data={"csrf_token": "t", "cookie_input": "sessionid=secret-value; sid_guard=def"},
+            )
+
+        body = response.json()
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(body["ok"])
+        self.assertEqual("created", body["action"])
+        self.assertNotIn("secret-value", response.text)
+        update_user.assert_called_once()
+        clear_state.assert_called_once()
+        self.assertEqual("/clear-login-state", clear_state.call_args.args[0])
+        login_result = save.call_args.args[0]
+        self.assertEqual("pasted", login_result["cookie_source"])
+        self.assertEqual(ACCOUNT_ID, login_result["unique_id"])
+
+
+class FriendRefreshEndpointTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            login_lock.LOCK_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        import json as json_module
+        from pathlib import Path
+
+        self.temp_dir = __import__("tempfile").TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.users_path = Path(self.temp_dir.name) / "usersData.json"
+        self.principal = {
+            "username": "alice",
+            "role": "admin",
+            "account_refs": [],
+            "session_id": "session-1",
+        }
+        self.account = {
+            "account_ref": "acc-1",
+            "unique_id": ACCOUNT_ID,
+            "username": "Tester",
+            "cookies": [{"name": "sessionid", "value": "v"}],
+            "friends_cache": ["Old Friend"],
+            "friends_cache_updated_at": "2026-01-01T00:00:00",
+        }
+        self.users_path.write_text(
+            json_module.dumps([self.account], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.path_patch = patch(
+            "utils.config.users_data_path",
+            return_value=self.users_path,
+        )
+        self.path_patch.start()
+        self.addCleanup(self.path_patch.stop)
+        self.client = TestClient(app_module.app)
+        self.addCleanup(lambda: app_module._friend_refresh_active.discard(ACCOUNT_ID))
+
+    def _stored_account(self):
+        import json as json_module
+
+        accounts = json_module.loads(self.users_path.read_text(encoding="utf-8"))
+        return accounts[0] if accounts else {}
+
+    def _post(self):
+        return self.client.post(
+            f"/accounts/{ACCOUNT_ID}/friends/refresh",
+            data={"csrf_token": "t"},
+        )
+
+    def _run_refresh(self, fetch):
+        """Drive the real route and data layer; only the browser fetch is mocked."""
+        with (
+            patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            fetch as fetch_mock,
+        ):
+            response = self._post()
+        return response, fetch_mock
+
+    def test_busy_account_returns_conflict_and_touches_nothing(self):
+        app_module._friend_refresh_active.add(ACCOUNT_ID)
+
+        response, fetch = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends"),
+        )
+
+        # The acceptance criterion requires 429 or 423 for a concurrent refresh.
+        self.assertIn(response.status_code, {429, 423})
+        self.assertEqual(429, response.status_code)
+        self.assertEqual("5", response.headers["retry-after"])
+        self.assertTrue(response.json()["retryable"])
+        fetch.assert_not_called()
+        self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
+
+    def test_login_failure_keeps_previous_friends_cache(self):
+        def fake_fetch(account):
+            raise friends_module.FriendRefreshError(
+                "账号登录已失效，请重新扫码登录",
+                category=friends_module.CATEGORY_LOGIN_REQUIRED,
+            )
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(401, response.status_code)
+        self.assertEqual("login_required", body["category"])
+        self.assertFalse(body["retryable"])
+        self.assertEqual(self.account["friends_cache_updated_at"], body["previousUpdatedAt"])
+        stored = self._stored_account()
+        self.assertEqual(["Old Friend"], stored["friends_cache"])
+        self.assertEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+
+    def test_network_failure_is_reported_as_retryable_and_keeps_cache(self):
+        def fake_fetch(account):
+            raise friends_module.FriendRefreshError(
+                "无法连接抖音",
+                category=friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            )
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(502, response.status_code)
+        self.assertEqual("network_unavailable", body["category"])
+        self.assertTrue(body["retryable"])
+        self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
+
+    def test_structure_failure_keeps_previous_cache(self):
+        def fake_fetch(account):
+            raise friends_module.FriendRefreshError(
+                "好友列表已加载但未找到可读取的好友行",
+                category=friends_module.CATEGORY_STRUCTURE_CHANGED,
+            )
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(502, response.status_code)
+        self.assertEqual("structure_changed", body["category"])
+        self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
+
+    def test_failure_responses_carry_previous_updated_at_for_the_ui(self):
+        # The dashboard keeps the previous successful refresh time visible after a
+        # failure, so every failure branch must report it.
+        def fake_fetch(account):
+            raise friends_module.FriendRefreshError(
+                "无法连接抖音",
+                category=friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            )
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual("2026-01-01T00:00:00", body["previousUpdatedAt"])
+        self.assertEqual("网络不可用", body["categoryLabel"])
+
+    def test_timeout_keeps_previous_cache(self):
+        async def slow_fetch(account):
+            raise asyncio.TimeoutError()
+
+        async def fake_wait_for(awaitable, timeout):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError()
+
+        with patch.object(app_module.asyncio, "wait_for", side_effect=fake_wait_for):
+            response, _ = self._run_refresh(
+                patch.object(app_module, "fetch_account_friends", side_effect=slow_fetch),
+            )
+
+        body = response.json()
+        self.assertEqual(504, response.status_code)
+        self.assertEqual("network_unavailable", body["category"])
+        self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
+
+    def test_successful_refresh_writes_cache(self):
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", return_value=["Alice", "Bob"]),
+        )
+
+        body = response.json()
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(["Alice", "Bob"], body["friends"])
+        self.assertEqual(self.account["friends_cache_updated_at"], body["previous_updated_at"])
+        stored = self._stored_account()
+        self.assertEqual(["Alice", "Bob"], stored["friends_cache"])
+        self.assertNotEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+        self.assertEqual([], list(app_module._friend_refresh_active))
+
+
+class LoginDesktopQrPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(login_desktop_server.app)
+
+    def test_qr_reports_not_ready_with_retry_after(self):
+        class Candidate:
+            def __init__(self):
+                self.count_value = 0
+
+            async def count(self):
+                return 0
+
+        class FakePage:
+            url = "https://creator.douyin.com/"
+
+            def locator(self, selector):
+                return Candidate()
+
+        async def fake_page():
+            return FakePage()
+
+        async def not_logged_in(page, *, probe_timeout_ms=800):
+            return {"state": "login_form", "logged_in": False, "url": page.url}
+
+        with (
+            patch.object(login_desktop_server.manager, "_get_active_page", side_effect=fake_page),
+            patch.object(login_desktop_server.manager, "_login_page_state", side_effect=not_logged_in),
+        ):
+            response = self.client.get("/qr")
+
+        body = response.json()
+        self.assertEqual(202, response.status_code)
+        self.assertEqual("qr_not_ready", body["state"])
+        self.assertEqual(2, body["retry_after"])
+        self.assertTrue(body["retryable"])
+
+    def test_qr_reports_busy_when_page_lock_is_held(self):
+        with patch.object(
+            login_desktop_server.manager._page_operation_lock,
+            "locked",
+            return_value=True,
+        ):
+            response = self.client.get("/qr")
+
+        body = response.json()
+        self.assertEqual(503, response.status_code)
+        self.assertEqual("qr_page_busy", body["state"])
+        self.assertIn("重试", body["message"])
+        self.assertTrue(body["retryable"])
+        self.assertNotIn("creator", body["message"])
+
+    def test_qr_reports_logged_in_state_without_waiting(self):
+        class Candidate:
+            async def count(self):
+                return 0
+
+        class FakePage:
+            url = "https://creator.douyin.com/"
+
+            def locator(self, selector):
+                return Candidate()
+
+        async def fake_page():
+            return FakePage()
+
+        async def logged_in(page, *, probe_timeout_ms=800):
+            return {"state": "logged_in", "logged_in": True, "url": page.url}
+
+        with (
+            patch.object(login_desktop_server.manager, "_get_active_page", side_effect=fake_page),
+            patch.object(login_desktop_server.manager, "_login_page_state", side_effect=logged_in),
+        ):
+            response = self.client.get("/qr")
+
+        body = response.json()
+        # 202 keeps the logged-in signal retryable through the WebUI proxy, which
+        # forwards JSON instead of wrapping non-202 responses as an image.
+        self.assertEqual(202, response.status_code)
+        self.assertEqual("qr_logged_in", body["state"])
+        self.assertTrue(body["logged_in"])
+        self.assertTrue(body["retryable"])
+        self.assertIn("重置", body["message"])
+
+    def test_qr_expired_is_not_retryable(self):
+        class Candidate:
+            async def count(self):
+                return 1
+
+            class _First:
+                async def is_visible(self):
+                    return True
+
+            @property
+            def first(self):
+                return self._First()
+
+        class FakePage:
+            url = "https://creator.douyin.com/"
+
+            def locator(self, selector):
+                return Candidate()
+
+        async def fake_page():
+            return FakePage()
+
+        with patch.object(login_desktop_server.manager, "_get_active_page", side_effect=fake_page):
+            response = self.client.get("/qr")
+
+        body = response.json()
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("qr_expired", body["state"])
+        self.assertFalse(body["retryable"])
+        self.assertIn("刷新二维码", body["message"])
+
+    def test_clear_login_state_endpoint_reports_cleared_cookies(self):
+        async def cleared():
+            return {"ok": True, "cleared": 3, "url": "https://creator.douyin.com/"}
+
+        with patch.object(login_desktop_server.manager, "clear_login_state", side_effect=cleared):
+            response = self.client.post("/clear-login-state")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(3, response.json()["cleared"])
+
+    def test_open_login_reports_busy_instead_of_internal_error(self):
+        async def busy():
+            raise RuntimeError("login page is busy; retry shortly")
+
+        with patch.object(login_desktop_server.manager, "open_login", side_effect=busy):
+            response = self.client.post("/open-login")
+
+        body = response.json()
+        self.assertEqual(503, response.status_code)
+        self.assertEqual("qr_page_busy", body["state"])
+        self.assertTrue(body["retryable"])
+
+
+class _FakeUpstream:
+    def __init__(self, body, *, status=200, content_type="application/json", retry_after=None):
+        self._body = body
+        self.status = status
+        headers = {"Content-Type": content_type}
+        if retry_after:
+            headers["Retry-After"] = str(retry_after)
+        self.headers = headers
+
+    def read(self):
+        return self._body
+
+    def close(self):
+        return None
+
+
+class DashboardRefreshStatusTests(unittest.TestCase):
+    """A3: the last successful refresh time must survive a failed refresh."""
+
+    def setUp(self):
+        self.script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+
+    def test_failure_path_keeps_the_last_successful_refresh_time(self):
+        self.assertIn("上次成功刷新", self.script)
+        self.assertIn("showRefreshOutcome", self.script)
+        # The failure branch must render the retained timestamp, not only a message.
+        failure_block = self.script[
+            self.script.index("showRefreshOutcome(`刷新失败：") :
+            self.script.index("showRefreshOutcome(`刷新失败：") + 200
+        ]
+        self.assertIn("showRefreshOutcome", failure_block)
+        self.assertIn("lastSuccessAt = data.previousUpdatedAt", self.script)
+        self.assertIn("data.categoryLabel", self.script)
+
+    def test_success_path_records_the_new_refresh_time(self):
+        self.assertIn("lastSuccessAt = data.updated_at", self.script)
+
+
+class WebUiQrProxyTests(unittest.TestCase):
+    """The WebUI proxy must relay QR states instead of wrapping them as images."""
+
+    def setUp(self):
+        self.client = TestClient(app_module.app)
+        self.principal = {
+            "username": "admin",
+            "role": "admin",
+            "account_refs": [],
+            "session_id": "session-1",
+        }
+
+    def _get_qr(self, upstream):
+        with (
+            patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "get_login_lock", return_value={"username": "admin", "session_id": ""}),
+            patch.object(app_module, "owns_login_lock", return_value=True),
+            patch.object(app_module.urllib.request, "urlopen", return_value=upstream),
+        ):
+            return self.client.get("/login-desktop/qr")
+
+    def test_logged_in_json_body_is_relayed_not_wrapped_as_png(self):
+        body = json.dumps(
+            {
+                "ok": False,
+                "state": "qr_logged_in",
+                "message": "检测到浏览器里还保留着登录状态，已重置，正在生成新的二维码",
+                "logged_in": True,
+                "retryable": True,
+            }
+        ).encode("utf-8")
+        upstream = _FakeUpstream(body, status=202, retry_after=2)
+
+        response = self._get_qr(upstream)
+
+        self.assertEqual(202, response.status_code)
+        self.assertIn("application/json", response.headers["content-type"])
+        payload = response.json()
+        self.assertEqual("qr_logged_in", payload["state"])
+        self.assertTrue(payload["logged_in"])
+        self.assertTrue(payload["retryable"])
+
+    def test_busy_message_reaches_the_ui_in_chinese(self):
+        body = json.dumps(
+            {"ok": False, "state": "qr_page_busy", "message": "登录页正在处理上一个请求，请稍后重试"}
+        ).encode("utf-8")
+        upstream = _FakeUpstream(body, status=503, retry_after=2)
+
+        response = self._get_qr(upstream)
+
+        self.assertEqual(503, response.status_code)
+        payload = response.json()
+        self.assertIn("重试", payload["message"])
+        self.assertTrue(payload["retryable"])
+        self.assertNotIn("creator", payload["message"])
+
+    def test_expired_qr_is_not_retryable(self):
+        body = json.dumps(
+            {
+                "ok": False,
+                "state": "qr_expired",
+                "message": "二维码已过期，请点击“刷新二维码”",
+                "retryable": False,
+            }
+        ).encode("utf-8")
+        upstream = _FakeUpstream(body, status=409)
+
+        response = self._get_qr(upstream)
+
+        self.assertEqual(409, response.status_code)
+        payload = response.json()
+        self.assertFalse(payload["retryable"])
+        self.assertIn("刷新二维码", payload["message"])
+
+    def test_png_body_is_still_served_as_an_image(self):
+        upstream = _FakeUpstream(b"fake-png", content_type="image/png")
+
+        response = self._get_qr(upstream)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("image/png", response.headers["content-type"])
+        self.assertEqual(b"fake-png", response.content)
+
+
+if __name__ == "__main__":
+    unittest.main()

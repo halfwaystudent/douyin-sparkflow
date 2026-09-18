@@ -226,6 +226,39 @@
               </a>
             </div>
           </div>
+          <div class="login-qr-panel" data-cookie-login>
+            <strong>用 Cookie 登录（无需扫码）</strong>
+            <p class="muted compact">
+              从已登录的浏览器导出抖音 Cookie 后粘贴到这里。支持扩展导出的 JSON 数组、<code>name=value; …</code> 请求头原串或单个 Cookie 值；
+              保存前会在真实浏览器中验证，验证通过才写入账号。
+            </p>
+            <label>
+              <span>显示名（可选，留空则使用抖音昵称）</span>
+              <input type="text" data-cookie-display-name placeholder="例如：我的大号">
+            </label>
+            <label>
+              <span>Cookie 内容</span>
+              <textarea data-cookie-input rows="4" placeholder="sessionid=...; sid_guard=... 或 [{&quot;name&quot;:&quot;sessionid&quot;,&quot;value&quot;:&quot;...&quot;}]"></textarea>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" data-cookie-relogin-mode>
+              <span>覆盖指定账号的登录态（不勾选则自动匹配或新建）</span>
+            </label>
+            <label data-cookie-relogin-row hidden>
+              <span>要覆盖的账号</span>
+              <select data-cookie-relogin-select>
+                {% for account in accounts %}
+                <option value="{{ account.unique_id }}">{{ account.username }}{% if account.unique_id %}（{{ account.unique_id }}）{% endif %}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <div class="button-row">
+              <button class="button button-soft" type="button" data-cookie-login-submit>
+                <i data-lucide="key-round"></i><span>验证并保存 Cookie</span>
+              </button>
+            </div>
+            <p class="muted compact" data-cookie-login-status>粘贴 Cookie 后点击“验证并保存 Cookie”。</p>
+          </div>
           <div class="button-row">
             <button class="button button-primary login-desktop-open" type="button" data-login-mode="add">
               <i data-lucide="user-plus"></i><span>添加新的抖音账号</span>

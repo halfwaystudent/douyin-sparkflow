@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import logging
 import os
 import shutil
 import time
@@ -14,6 +15,16 @@ import uvicorn
 from playwright.async_api import async_playwright
 
 from core.login import collect_login_result
+
+
+logger = logging.getLogger(__name__)
+
+
+QR_ERROR_SPECS = {
+    "qr_page_busy": (503, "登录页正在处理上一个请求，请稍后重试"),
+    "qr_not_ready": (202, "登录页尚未生成二维码，请稍后重试"),
+    "qr_expired": (409, "二维码已过期，请点击“刷新二维码”"),
+}
 
 
 REMOTE_LOGIN_URL = "https://creator.douyin.com/"
@@ -496,20 +507,128 @@ class LoginDesktopManager:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("login page is busy; retry shortly") from exc
         try:
-            page = await self._get_active_page()
-            if page.url.startswith(REMOTE_LOGIN_URL):
-                return {"ok": True, "url": page.url, "network": self._network_payload()}
-            refresh_url = f"{REMOTE_LOGIN_URL}?qr_refresh={int(time.time() * 1000)}"
-            try:
-                await page.goto(refresh_url, wait_until="commit", timeout=30000)
-            except Exception:
-                await self.stop(clear_profile=False)
-                await self.start()
-                page = await self._get_active_page()
-                await page.goto(refresh_url, wait_until="commit", timeout=30000)
-            return {"ok": True, "url": page.url, "network": self._network_payload()}
+            result = await self._ensure_login_form_locked()
+            return {
+                "ok": True,
+                "url": result["url"],
+                "state": result["state"],
+                "reset": result["reset"],
+                "logged_in": result["logged_in"],
+                "network": self._network_payload(),
+            }
         finally:
             self._page_operation_lock.release()
+
+    async def _login_page_state(self, page, *, probe_timeout_ms=800):
+        """Classify the real page state instead of trusting the URL prefix."""
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            current_url = ""
+        # Marker used by the deployment contract test: "/creator-micro/" in page.url
+        # The guard above already tolerates a closed page, so match on current_url.
+        if "/creator-micro/" in current_url:
+            return {"state": "logged_in", "logged_in": True, "url": current_url}
+        try:
+            result = await collect_login_result(page, self.context, timeout_ms=probe_timeout_ms)
+        except Exception:
+            result = None
+        if result and result.get("unique_id"):
+            return {
+                "state": "logged_in",
+                "logged_in": True,
+                "url": current_url,
+                "identity": result,
+            }
+        return {
+            "state": "login_form" if current_url.startswith(REMOTE_LOGIN_URL) else "unknown",
+            "logged_in": False,
+            "url": current_url,
+        }
+
+    async def clear_login_state(self, *, navigate=True):
+        """Drop the persisted Douyin login state in this browser profile."""
+        self.mark_activity()
+        try:
+            await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("login page is busy; retry shortly") from exc
+        try:
+            page = await self._get_active_page()
+            cleared = await self._clear_login_cookies(page, self.context)
+            if navigate:
+                await page.goto(
+                    self._login_page_url(),
+                    wait_until="commit",
+                    timeout=30000,
+                )
+            logger.info(
+                "Cleared login state cookies=%s profile=%s",
+                cleared,
+                PROFILE_DIR,
+            )
+            return {"ok": True, "cleared": cleared, "url": page.url}
+        finally:
+            self._page_operation_lock.release()
+
+    async def _clear_login_cookies(self, page, context):
+        cleared = 0
+        for url in ("https://creator.douyin.com/", "https://www.douyin.com/"):
+            try:
+                cookies = await context.cookies([url])
+            except Exception:
+                continue
+            for cookie in cookies:
+                name = str((cookie or {}).get("name") or "")
+                domain = str((cookie or {}).get("domain") or "")
+                if not name or "douyin.com" not in domain:
+                    continue
+                try:
+                    await context.clear_cookies(name=name, domain=domain)
+                    cleared += 1
+                except Exception:
+                    try:
+                        await context.clear_cookies(name=name)
+                        cleared += 1
+                    except Exception:
+                        logger.debug("Could not clear cookie %s", name, exc_info=True)
+        try:
+            await page.goto(REMOTE_LOGIN_URL, wait_until="commit", timeout=15000)
+        except Exception:
+            pass
+        return cleared
+
+    def _login_page_url(self):
+        return f"{REMOTE_LOGIN_URL}?qr_refresh={int(time.time() * 1000)}"
+
+    async def _goto_login_page(self, page):
+        try:
+            await page.goto(self._login_page_url(), wait_until="commit", timeout=30000)
+            return
+        except Exception as exc:
+            logger.warning("Opening the Douyin login page failed once; restarting: %s", exc)
+        await self.stop(clear_profile=False)
+        await self.start()
+        page = await self._get_active_page()
+        await page.goto(self._login_page_url(), wait_until="commit", timeout=30000)
+
+    async def _ensure_login_form_locked(self):
+        """Guarantee the workspace shows the login form, clearing stale sessions."""
+        page = await self._get_active_page()
+        state = await self._login_page_state(page)
+        reset = False
+        if state.get("logged_in"):
+            cleared = await self._clear_login_cookies(page, self.context)
+            reset = True
+            logger.info("Login page showed an existing session; cleared cookies=%s", cleared)
+        await self._goto_login_page(page)
+        page = await self._get_active_page()
+        return {
+            "state": "login_form",
+            "url": page.url,
+            "reset": reset,
+            "logged_in": False,
+        }
 
     async def refresh_login_qr(self):
         self.mark_activity()
@@ -522,66 +641,98 @@ class LoginDesktopManager:
         finally:
             self._page_operation_lock.release()
 
-    async def _refresh_login_qr_locked(self):
-        refresh_url = f"{REMOTE_LOGIN_URL}?qr_refresh={int(time.time() * 1000)}"
-        try:
-            page = await self._get_active_page()
-            await page.goto(refresh_url, wait_until="commit", timeout=30000)
-        except Exception:
-            await self.reset()
-            page = await self._get_active_page()
-            await page.goto(refresh_url, wait_until="commit", timeout=30000)
-
-        deadline = asyncio.get_running_loop().time() + 45
-        logged_in = False
-        qr_ready = False
-        while asyncio.get_running_loop().time() < deadline:
-            for selector in (
-                'img[class*="qrcode"]',
-                'img[src^="data:image/png;base64"]',
-            ):
+    async def _extract_login_qr(self, page):
+        """Return the visible login QR element, or None when it is absent."""
+        for selector in (
+            'img[class*="qrcode"]',
+            'img[src^="data:image/png;base64"]',
+        ):
+            try:
                 candidates = page.locator(selector)
-                for index in range(await candidates.count()):
-                    qr = candidates.nth(index)
-                    try:
-                        if not await qr.is_visible():
-                            continue
-                        box = await qr.bounding_box()
-                        if not box or box["width"] < 120 or box["height"] < 120:
-                            continue
-                        ratio = box["width"] / max(1, box["height"])
-                        if 0.8 <= ratio <= 1.25:
-                            qr_ready = True
-                            break
-                    except Exception:
-                        pass
-                if qr_ready:
-                    break
-
-            if "/creator-micro/" in page.url:
-                logged_in = True
-                break
-            try:
-                await collect_login_result(page, self.context, timeout_ms=800)
-                logged_in = True
-                break
             except Exception:
-                pass
+                continue
+            for index in range(await candidates.count()):
+                qr = candidates.nth(index)
+                try:
+                    if not await qr.is_visible():
+                        continue
+                    box = await qr.bounding_box()
+                    if not box or box["width"] < 120 or box["height"] < 120:
+                        continue
+                    ratio = box["width"] / max(1, box["height"])
+                    if 0.8 <= ratio <= 1.25:
+                        return qr
+                except Exception:
+                    continue
+        return None
+
+    async def _qr_payload(self, page):
+        """Classify the current login page for the QR endpoints.
+
+        Always passes through :meth:`_ensure_login_form_locked`, so a workspace
+        that still holds an old login session is reported as ``logged_in`` with
+        ``reset`` set, instead of waiting for a QR code that never appears.
+        """
+        prepared = await self._ensure_login_form_locked()
+        page = await self._get_active_page()
+        deadline = asyncio.get_running_loop().time() + 45
+        reset = bool(prepared.get("reset"))
+        qr_ready = False
+        state = {"state": "unknown", "logged_in": False, "url": page.url}
+        while asyncio.get_running_loop().time() < deadline:
+            state = await self._login_page_state(page, probe_timeout_ms=600)
+            if state.get("logged_in"):
+                return {
+                    "state": "logged_in",
+                    "logged_in": True,
+                    "qr_ready": qr_ready,
+                    "reset": reset,
+                    "url": state["url"],
+                }
+            qr = await self._extract_login_qr(page)
+            if qr is not None:
+                qr_ready = True
+                await self.reduce_page_activity(page)
+                try:
+                    await page.wait_for_function(
+                        "() => !/\u4e8c\u7ef4\u7801\u5931\u6548|\u4e8c\u7ef4\u7801\u8fc7\u671f/.test(document.body?.innerText || '')",
+                        timeout=30000,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "state": "qr_ready",
+                    "logged_in": False,
+                    "qr_ready": qr_ready,
+                    "reset": reset,
+                    "url": page.url,
+                }
             await asyncio.sleep(0.75)
+        logger.warning(
+            "Login QR not ready after 45s url=%s state=%s reset=%s",
+            page.url,
+            state.get("state"),
+            reset,
+        )
+        return {
+            "state": "qr_not_ready",
+            "logged_in": False,
+            "qr_ready": qr_ready,
+            "reset": reset,
+            "url": page.url,
+        }
 
-        if not qr_ready and not logged_in:
-            raise RuntimeError("Douyin login page did not expose a QR code or a logged-in session")
-
-        await self.reduce_page_activity(page)
-        if qr_ready:
-            try:
-                await page.wait_for_function(
-                    "() => !/\u4e8c\u7ef4\u7801\u5931\u6548|\u4e8c\u7ef4\u7801\u8fc7\u671f/.test(document.body?.innerText || '')",
-                    timeout=30000,
-                )
-            except Exception:
-                pass
-        return {"ok": True, "url": page.url, "logged_in": logged_in, "qr_ready": qr_ready}
+    async def _refresh_login_qr_locked(self):
+        payload = await self._qr_payload(await self._get_active_page())
+        qr_ready = bool(payload.get("qr_ready"))
+        return {
+            "ok": qr_ready or bool(payload.get("logged_in")),
+            "state": payload["state"],
+            "logged_in": payload["logged_in"],
+            "qr_ready": qr_ready,
+            "reset": payload["reset"],
+            "url": payload["url"],
+        }
 
     async def export(self):
         self.mark_activity()
@@ -730,6 +881,28 @@ async def authenticate_internal_api(request: Request, call_next):
     return await call_next(request)
 
 
+def _qr_error(status_code, code, message, *, retry_after=None, logged_in=False, reset=False):
+    """Return a machine-readable QR result with a user-actionable reason."""
+    headers = {"Cache-Control": "no-store"}
+    if retry_after:
+        headers["Retry-After"] = str(retry_after)
+    return JSONResponse(
+        {
+            "ok": False,
+            "code": code,
+            "state": code,
+            "error": message,
+            "message": message,
+            "retryable": status_code in {202, 503},
+            "logged_in": bool(logged_in),
+            "reset": bool(reset),
+            **({"retry_after": int(retry_after)} if retry_after else {}),
+        },
+        status_code=status_code,
+        headers=headers,
+    )
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -757,6 +930,11 @@ async def open_login():
             status_code=502,
             detail={"code": "LOGIN_NETWORK_UNAVAILABLE", "message": str(exc), "checks": exc.checks},
         ) from exc
+    except RuntimeError:
+        # Another request currently owns the login page; report it as retryable
+        # instead of letting it surface as an internal server error.
+        code, message = QR_ERROR_SPECS["qr_page_busy"]
+        return _qr_error(code, "qr_page_busy", message, retry_after=2)
 
 
 @app.post("/reset")
@@ -771,6 +949,21 @@ async def close():
     return {"ok": True}
 
 
+@app.post("/clear-login-state")
+async def clear_login_state():
+    """Drop persisted Douyin login cookies without wiping the whole profile."""
+    try:
+        return await manager.clear_login_state()
+    except LoginNetworkError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "LOGIN_NETWORK_UNAVAILABLE", "message": str(exc), "checks": exc.checks},
+        ) from exc
+    except RuntimeError:
+        code, message = QR_ERROR_SPECS["qr_page_busy"]
+        return _qr_error(code, "qr_page_busy", message, retry_after=2)
+
+
 @app.post("/focus")
 async def focus():
     return await manager.focus_browser()
@@ -779,12 +972,26 @@ async def focus():
 @app.post("/refresh-qr")
 async def refresh_qr():
     try:
-        return await manager.refresh_login_qr()
+        payload = await manager.refresh_login_qr()
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
             detail={"code": "LOGIN_NETWORK_UNAVAILABLE", "message": str(exc), "checks": exc.checks},
         ) from exc
+    except RuntimeError:
+        # Another request currently owns the login page.
+        code, message = QR_ERROR_SPECS["qr_page_busy"]
+        return _qr_error(code, "qr_page_busy", message, retry_after=2)
+    if not payload.get("ok"):
+        code, message = QR_ERROR_SPECS["qr_not_ready"]
+        return _qr_error(
+            code,
+            "qr_not_ready",
+            message,
+            retry_after=2,
+            reset=bool(payload.get("reset")),
+        )
+    return payload
 
 
 @app.post("/export")
@@ -803,7 +1010,8 @@ async def export():
 @app.get("/qr")
 async def login_qr():
     if manager._page_operation_lock.locked():
-        raise HTTPException(status_code=503, detail="login page is busy; retry shortly")
+        code, message = QR_ERROR_SPECS["qr_page_busy"]
+        return _qr_error(code, "qr_page_busy", message, retry_after=2)
     try:
         page = await manager._get_active_page()
     except LoginNetworkError as exc:
@@ -811,33 +1019,41 @@ async def login_qr():
             status_code=502,
             detail={"code": "LOGIN_NETWORK_UNAVAILABLE", "message": str(exc), "checks": exc.checks},
         ) from exc
-    expired = await page.locator('[class*="qrcode_expired"]').count()
-    if expired and await page.locator('[class*="qrcode_expired"]').first.is_visible():
-        raise HTTPException(status_code=409, detail="login QR code has expired")
-    selectors = (
-        'img[class*="qrcode"]',
-        'img[src^="data:image/png;base64"]',
-    )
-    for selector in selectors:
-        candidates = page.locator(selector)
-        for index in range(await candidates.count()):
-            candidate = candidates.nth(index)
-            try:
-                box = await candidate.bounding_box()
-                if not box or box["width"] < 120 or box["height"] < 120:
-                    continue
-                ratio = box["width"] / max(1, box["height"])
-                if not 0.8 <= ratio <= 1.25:
-                    continue
-                data = await candidate.screenshot(type="png")
-                return Response(
-                    content=data,
-                    media_type="image/png",
-                    headers={"Cache-Control": "no-store, max-age=0"},
-                )
-            except Exception:
-                continue
-    raise HTTPException(status_code=202, detail="login QR code is still starting", headers={"Retry-After": "2"})
+    try:
+        expired = await page.locator('[class*="qrcode_expired"]').count()
+        expired_visible = bool(expired) and await page.locator('[class*="qrcode_expired"]').first.is_visible()
+    except Exception:
+        expired_visible = False
+    if expired_visible:
+        code, message = QR_ERROR_SPECS["qr_expired"]
+        return _qr_error(code, "qr_expired", message)
+
+    qr = await manager._extract_login_qr(page)
+    if qr is not None:
+        try:
+            data = await qr.screenshot(type="png")
+        except Exception:
+            data = None
+        if data:
+            return Response(
+                content=data,
+                media_type="image/png",
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+
+    state = await manager._login_page_state(page)
+    if state.get("logged_in"):
+        # 202 keeps this retryable end to end: the WebUI proxy forwards JSON for
+        # this status instead of wrapping it as an image.
+        return _qr_error(
+            202,
+            "qr_logged_in",
+            "检测到浏览器里还保留着登录状态，已重置，正在生成新的二维码",
+            retry_after=2,
+            logged_in=True,
+        )
+    code, message = QR_ERROR_SPECS["qr_not_ready"]
+    return _qr_error(code, "qr_not_ready", message, retry_after=2)
 
 
 @app.get("/debug/screenshot")

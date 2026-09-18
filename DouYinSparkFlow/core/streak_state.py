@@ -1503,6 +1503,12 @@ def preflight_account(account, now=None):
             "category": "account_identity_mismatch",
             "reason": "login identity does not match the configured account",
         }
+    if account.get("pending_login_verification"):
+        return {
+            "healthy": False,
+            "category": "login_verification_pending",
+            "reason": "login state has not been verified as usable yet",
+        }
     if account.get("login_required") or account.get("needs_relogin"):
         return {
             "healthy": False,
