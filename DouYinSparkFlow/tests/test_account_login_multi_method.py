@@ -441,6 +441,53 @@ class StoredSessionVerificationTests(unittest.TestCase):
             caught.exception.category,
         )
 
+    def test_structure_failure_does_not_consume_the_second_route(self):
+        calls = []
+
+        async def structural(account, network_mode, **kwargs):
+            calls.append(network_mode)
+            raise friends_module.FriendRefreshError(
+                "creator identity card did not become ready within timeout",
+                category=friends_module.CATEGORY_STRUCTURE_CHANGED,
+            )
+
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct", "mihomo"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=structural),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module.verify_account_session({"cookies": [{"name": "sessionid", "value": "v"}]})
+            )
+
+        self.assertEqual(["direct"], calls)
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            caught.exception.category,
+        )
+
+    def test_network_failure_still_tries_the_next_route(self):
+        calls = []
+
+        async def refused(account, network_mode, **kwargs):
+            calls.append(network_mode)
+            raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct", "mihomo"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=refused),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module.verify_account_session({"cookies": [{"name": "sessionid", "value": "v"}]})
+            )
+
+        self.assertEqual(["direct", "mihomo"], calls)
+        self.assertEqual(
+            friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            caught.exception.category,
+        )
+
 
 class SavedLoginHealthTests(unittest.TestCase):
     def setUp(self):
@@ -1644,6 +1691,40 @@ class IdentityReadBudgetTests(unittest.TestCase):
             caught.exception.category,
         )
         self.assertEqual(1, len(seen))
+
+    def test_full_budget_timeout_is_not_retried(self):
+        seen = []
+
+        async def slow_failure(page_arg, context_arg, timeout_ms=300000):
+            seen.append(timeout_ms)
+            await asyncio.sleep(0.05)
+            raise RuntimeError("creator identity card did not become ready within timeout")
+
+        context = _FakeContext(_FakePage(sub_app_count=1))
+        browser = _FakeBrowser(context)
+
+        async def fake_get_browser(*args, **kwargs):
+            return _FakePlaywright(), browser
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=slow_failure),
+            patch.object(friends_module, "IDENTITY_RETRY_FAST_FAIL_MS", 1),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+
+        self.assertEqual(1, len(seen))
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            friends_module.classify_refresh_error(caught.exception),
+        )
 
 
 class _IdentityLocator:

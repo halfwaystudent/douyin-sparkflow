@@ -53,6 +53,10 @@ CREATOR_HOME_URL = "https://creator.douyin.com/"
 LOGIN_IDENTITY_TIMEOUT_MS = 60000
 IDENTITY_READ_ATTEMPTS = 2
 IDENTITY_RETRY_MIN_TIMEOUT_MS = 15000
+# A retry only makes sense for a failure that came back quickly (a transient blank
+# render). Waiting out the whole budget and then retrying with a shorter one would
+# only double the operator's wait without a chance of succeeding.
+IDENTITY_RETRY_FAST_FAIL_MS = 15000
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
@@ -401,6 +405,7 @@ async def _fetch_account_friends_once(
                     if attempt == 0
                     else max(IDENTITY_RETRY_MIN_TIMEOUT_MS, identity_timeout_ms // 3)
                 )
+                started_at = asyncio.get_running_loop().time()
                 try:
                     identity = await collect_login_result(
                         page,
@@ -412,6 +417,7 @@ async def _fetch_account_friends_once(
                     raise
                 except Exception as exc:
                     last_identity_error = exc
+                    elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
                     if _left_creator_host(page):
                         # The page bounced away from the creator host: the session
                         # is not usable.
@@ -422,10 +428,15 @@ async def _fetch_account_friends_once(
                     if classify_refresh_error(exc) == CATEGORY_LOGIN_REQUIRED:
                         # A visible login form is a real answer, not a slow page.
                         raise _with_category(exc, CATEGORY_LOGIN_REQUIRED) from exc
-                    if attempt + 1 < IDENTITY_READ_ATTEMPTS:
+                    # Only a failure that came back quickly can be a transient
+                    # blank render; a full-budget timeout means the card needs
+                    # longer than the budget, and a shorter retry cannot fix that.
+                    retryable = elapsed_ms < IDENTITY_RETRY_FAST_FAIL_MS
+                    if attempt + 1 < IDENTITY_READ_ATTEMPTS and retryable:
                         logger.info(
-                            "Identity read attempt %s failed (%s); reloading the creator page once",
+                            "Identity read attempt %s failed after %sms (%s); reloading the creator page once",
                             attempt + 1,
+                            round(elapsed_ms),
                             type(exc).__name__,
                         )
                         try:
@@ -516,6 +527,14 @@ async def verify_account_session(account, *, auth_only=False, network_mode=None)
         except FriendRefreshError as exc:
             if exc.category == CATEGORY_LOGIN_REQUIRED:
                 raise
+            if exc.category == CATEGORY_STRUCTURE_CHANGED:
+                # The page loaded on the creator host but its DOM never rendered
+                # the account card; another egress route cannot change that, so
+                # stop here instead of doubling the wait for the same answer.
+                raise FriendRefreshError(
+                    f"无法读取好友私信页，无法验证登录态：{exc}",
+                    category=CATEGORY_STRUCTURE_CHANGED,
+                ) from exc
             last_category = exc.category
             last_error = exc
             logger.warning("Session verification route=%s failed: %s", mode, exc)
