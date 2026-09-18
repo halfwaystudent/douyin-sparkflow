@@ -47,7 +47,12 @@ class FriendRefreshError(RuntimeError):
 
 
 CREATOR_HOME_URL = "https://creator.douyin.com/"
-LOGIN_IDENTITY_TIMEOUT_MS = 20000
+# The creator centre identity card is client-rendered and measured at 25-30s on a
+# cold cookie-only context, so this budget must cover a slow render instead of
+# turning it into a login failure.
+LOGIN_IDENTITY_TIMEOUT_MS = 60000
+IDENTITY_READ_ATTEMPTS = 2
+IDENTITY_RETRY_MIN_TIMEOUT_MS = 15000
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
@@ -386,29 +391,60 @@ async def _fetch_account_friends_once(
             # Only the creator home page exposes the logged-in identity, and a
             # redirect away from it is itself proof that the session is invalid.
             await page.goto(CREATOR_HOME_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
-            try:
-                identity = await collect_login_result(
-                    page,
-                    context,
-                    timeout_ms=max(1000, identity_timeout_ms // 2),
+            identity = None
+            last_identity_error = None
+            for attempt in range(IDENTITY_READ_ATTEMPTS):
+                # The first attempt gets the full render budget; the retry only has
+                # to catch a transient blank render, so it stays short.
+                budget_ms = (
+                    identity_timeout_ms
+                    if attempt == 0
+                    else max(IDENTITY_RETRY_MIN_TIMEOUT_MS, identity_timeout_ms // 3)
                 )
-            except FriendRefreshError:
-                raise
-            except Exception as exc:
-                if _left_creator_host(page):
-                    # The page bounced away from the creator host: the session is
-                    # not usable.
-                    raise FriendRefreshError(
-                        "Cookie 无法登录抖音创作者中心，请重新获取 Cookie",
-                        category=CATEGORY_LOGIN_REQUIRED,
-                    ) from exc
-                # Still on the creator host but the identity did not render: this
-                # is a slow or changed page, so let the caller try other routes
-                # instead of blaming the Cookie.
+                try:
+                    identity = await collect_login_result(
+                        page,
+                        context,
+                        timeout_ms=budget_ms,
+                    )
+                    break
+                except FriendRefreshError:
+                    raise
+                except Exception as exc:
+                    last_identity_error = exc
+                    if _left_creator_host(page):
+                        # The page bounced away from the creator host: the session
+                        # is not usable.
+                        raise FriendRefreshError(
+                            "Cookie 无法登录抖音创作者中心，请重新获取 Cookie",
+                            category=CATEGORY_LOGIN_REQUIRED,
+                        ) from exc
+                    if classify_refresh_error(exc) == CATEGORY_LOGIN_REQUIRED:
+                        # A visible login form is a real answer, not a slow page.
+                        raise _with_category(exc, CATEGORY_LOGIN_REQUIRED) from exc
+                    if attempt + 1 < IDENTITY_READ_ATTEMPTS:
+                        logger.info(
+                            "Identity read attempt %s failed (%s); reloading the creator page once",
+                            attempt + 1,
+                            type(exc).__name__,
+                        )
+                        try:
+                            await page.reload(
+                                wait_until="commit",
+                                timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000,
+                            )
+                        except Exception:
+                            logger.debug("Creator page reload failed", exc_info=True)
+                        continue
+                    # Still on the creator host but the identity did not render: this
+                    # is a slow or changed page, so let the caller try other routes
+                    # instead of blaming the Cookie.
+                    raise _with_category(exc, classify_refresh_error(exc)) from exc
+            if identity is None:
                 raise _with_category(
-                    exc,
-                    classify_refresh_error(exc),
-                ) from exc
+                    last_identity_error or RuntimeError("creator identity could not be read"),
+                    classify_refresh_error(last_identity_error),
+                )
             # Also require the friend private-message page to be readable, so a
             # session that cannot reach the friend list is not reported healthy.
             await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)

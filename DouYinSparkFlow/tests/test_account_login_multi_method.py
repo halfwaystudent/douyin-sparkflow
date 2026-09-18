@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 import login_desktop_server
 from core import cookies as cookie_module
 from core import friends as friends_module
+from core import login as login_module
 from core import streak_state
 from webui import app as app_module
 from webui import login_lock
@@ -1448,6 +1449,330 @@ class WebUiQrProxyTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("image/png", response.headers["content-type"])
         self.assertEqual(b"fake-png", response.content)
+
+
+class UnverifiedLoginAttributionTests(unittest.TestCase):
+    """A page/transport failure must not be recorded as a logged-out account."""
+
+    def setUp(self):
+        self.temp_dir = __import__("tempfile").TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.users_path = Path(self.temp_dir.name) / "usersData.json"
+        self.users_path.write_text("[]", encoding="utf-8")
+        self.users_patch = patch(
+            "utils.config.users_data_path",
+            return_value=self.users_path,
+        )
+        self.users_patch.start()
+        self.addCleanup(self.users_patch.stop)
+
+    def _save(self, **kwargs):
+        account, _action = app_module.save_exported_login_result(
+            {
+                "unique_id": ACCOUNT_ID,
+                "username": "Tester",
+                "cookies": [{"name": "sessionid", "value": "v", "domain": ".douyin.com", "path": "/"}],
+            },
+            is_healthy=False,
+            **kwargs,
+        )
+        return account
+
+    def test_structure_failure_is_not_recorded_as_login_required(self):
+        account = self._save(
+            verification_reason="creator identity card did not become ready within timeout",
+            verification_category=friends_module.CATEGORY_STRUCTURE_CHANGED,
+        )
+
+        self.assertTrue(account["pending_login_verification"])
+        self.assertNotIn("login_required", account)
+        self.assertFalse(account["account_health"]["healthy"])
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            account["account_health"]["category"],
+        )
+        preflight = streak_state.preflight_account(account)
+        self.assertFalse(preflight["healthy"])
+        self.assertEqual("login_verification_pending", preflight["category"])
+
+    def test_network_failure_is_not_recorded_as_login_required(self):
+        account = self._save(
+            verification_reason="无法读取好友私信页，无法验证登录态：Timeout 60000ms exceeded",
+            verification_category=friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+        )
+
+        self.assertNotIn("login_required", account)
+        self.assertEqual(
+            friends_module.CATEGORY_NETWORK_UNAVAILABLE,
+            account["account_health"]["category"],
+        )
+        # An unverified session still blocks sending until it is verified.
+        self.assertFalse(streak_state.preflight_account(account)["healthy"])
+
+    def test_login_failure_still_requires_login(self):
+        account = self._save(
+            verification_reason="账号登录已失效，请重新扫码登录",
+            verification_category=friends_module.CATEGORY_LOGIN_REQUIRED,
+        )
+
+        self.assertTrue(account["login_required"])
+        self.assertTrue(account["pending_login_verification"])
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            account["account_health"]["category"],
+        )
+
+    def test_missing_category_keeps_the_previous_login_failure_marking(self):
+        account = self._save(verification_reason="登录态仍不可用")
+
+        self.assertTrue(account["login_required"])
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            account["account_health"]["category"],
+        )
+
+    def test_page_failure_clears_a_previous_login_failure_marking(self):
+        self._save(
+            verification_reason="账号登录已失效，请重新扫码登录",
+            verification_category=friends_module.CATEGORY_LOGIN_REQUIRED,
+        )
+
+        account = self._save(
+            verification_reason="creator identity card did not become ready within timeout",
+            verification_category=friends_module.CATEGORY_STRUCTURE_CHANGED,
+        )
+
+        self.assertNotIn("login_required", account)
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            account["account_health"]["category"],
+        )
+
+    def test_login_failure_replaces_a_previous_page_failure(self):
+        self._save(
+            verification_reason="creator identity card did not become ready within timeout",
+            verification_category=friends_module.CATEGORY_STRUCTURE_CHANGED,
+        )
+
+        account = self._save(
+            verification_reason="账号登录已失效，请重新扫码登录",
+            verification_category=friends_module.CATEGORY_LOGIN_REQUIRED,
+        )
+
+        self.assertTrue(account["login_required"])
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            account["account_health"]["category"],
+        )
+
+
+class IdentityReadBudgetTests(unittest.TestCase):
+    """The identity read must get the full render budget and one retry."""
+
+    def _run(self, failures):
+        seen = []
+        attempts = {"count": 0}
+
+        async def fake_login_result(page_arg, context_arg, timeout_ms=300000):
+            seen.append(timeout_ms)
+            attempts["count"] += 1
+            if attempts["count"] <= failures:
+                raise RuntimeError("creator identity card did not become ready within timeout")
+            return {"unique_id": " 8940433898798 ", "username": " srx666 "}
+
+        context = _FakeContext(_FakePage(sub_app_count=1))
+        browser = _FakeBrowser(context)
+
+        async def fake_get_browser(*args, **kwargs):
+            return _FakePlaywright(), browser
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=fake_login_result),
+        ):
+            result = asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+        return result, seen
+
+    def test_first_attempt_uses_the_full_render_budget(self):
+        result, seen = self._run(failures=0)
+
+        self.assertEqual("8940433898798", result["unique_id"])
+        self.assertEqual([friends_module.LOGIN_IDENTITY_TIMEOUT_MS], seen)
+
+    def test_slow_identity_read_is_retried_once_with_a_shorter_budget(self):
+        result, seen = self._run(failures=1)
+
+        self.assertEqual("8940433898798", result["unique_id"])
+        self.assertEqual(2, len(seen))
+        self.assertEqual(friends_module.LOGIN_IDENTITY_TIMEOUT_MS, seen[0])
+        self.assertLess(seen[1], seen[0])
+
+    def test_visible_login_form_fails_fast_as_login_required(self):
+        seen = []
+
+        async def fake_login_result(page_arg, context_arg, timeout_ms=300000):
+            seen.append(timeout_ms)
+            raise RuntimeError(login_module.LOGIN_REQUIRED_MESSAGE)
+
+        context = _FakeContext(_FakePage(sub_app_count=1))
+        browser = _FakeBrowser(context)
+
+        async def fake_get_browser(*args, **kwargs):
+            return _FakePlaywright(), browser
+
+        with (
+            patch.object(friends_module, "get_browser", side_effect=fake_get_browser),
+            patch.object(friends_module, "collect_login_result", side_effect=fake_login_result),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module._fetch_account_friends_once(
+                    {"cookies": [{"name": "sessionid", "value": "v"}]},
+                    "direct",
+                    auth_only=True,
+                )
+            )
+
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            caught.exception.category,
+        )
+        self.assertEqual(1, len(seen))
+
+
+class _IdentityLocator:
+    def __init__(self, texts):
+        self._texts = list(texts)
+
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return len(self._texts)
+
+    async def is_visible(self):
+        return bool(self._texts)
+
+    async def inner_text(self):
+        return self._texts[0] if self._texts else ""
+
+
+class _IdentityPage:
+    """Page double keyed by selector, for the login identity reader."""
+
+    def __init__(self, visible=None, url="https://creator.douyin.com/"):
+        self.url = url
+        self.visible = dict(visible or {})
+
+    def locator(self, selector):
+        return _IdentityLocator(self.visible.get(selector, []))
+
+
+class LoginIdentityReaderTests(unittest.TestCase):
+    CARD_TEXT = "srx666抖音号：8940433898798凡我所失，皆非我所有关注4428粉丝"
+
+    def test_nickname_falls_back_to_the_card_text_when_the_name_node_is_gone(self):
+        page = _IdentityPage(
+            {
+                login_module.READY_SELECTOR: [self.CARD_TEXT],
+                login_module.XPATHS["unique_id"]: ["抖音号：8940433898798"],
+            }
+        )
+
+        unique_id, username = asyncio.run(
+            login_module.wait_for_logged_in_identity(page, timeout_ms=1000)
+        )
+
+        self.assertEqual("8940433898798", unique_id)
+        self.assertEqual("srx666", username)
+
+    def test_preferred_name_node_still_wins(self):
+        page = _IdentityPage(
+            {
+                login_module.READY_SELECTOR: [self.CARD_TEXT],
+                login_module.XPATHS["unique_id"]: ["抖音号：8940433898798"],
+                login_module.XPATHS["name"]: ["srx666"],
+            }
+        )
+
+        unique_id, username = asyncio.run(
+            login_module.wait_for_logged_in_identity(page, timeout_ms=1000)
+        )
+
+        self.assertEqual("8940433898798", unique_id)
+        self.assertEqual("srx666", username)
+
+    def test_hidden_name_node_falls_back_to_the_card_text(self):
+        page = _IdentityPage(
+            {
+                login_module.READY_SELECTOR: [self.CARD_TEXT],
+                login_module.XPATHS["unique_id"]: ["抖音号：8940433898798"],
+                login_module.XPATHS["name"]: [],
+                login_module.NICKNAME_FALLBACK_SELECTORS[0]: [],
+            }
+        )
+
+        _unique_id, username = asyncio.run(
+            login_module.wait_for_logged_in_identity(page, timeout_ms=1000)
+        )
+
+        self.assertEqual("srx666", username)
+
+    def test_visible_login_form_is_reported_as_login_required(self):
+        page = _IdentityPage(
+            {
+                login_module.LOGIN_FORM_SELECTORS[0]: ["扫码登录"],
+            }
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(login_module.wait_for_logged_in_identity(page, timeout_ms=1000))
+
+        self.assertIn("登录", str(caught.exception))
+        self.assertEqual(
+            friends_module.CATEGORY_LOGIN_REQUIRED,
+            friends_module.classify_refresh_error(caught.exception),
+        )
+
+    def test_card_without_readable_identity_is_a_structure_problem(self):
+        page = _IdentityPage(
+            {
+                login_module.READY_SELECTOR: [self.CARD_TEXT],
+            }
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(login_module.wait_for_logged_in_identity(page, timeout_ms=1000))
+
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            friends_module.classify_refresh_error(caught.exception),
+        )
+
+    def test_card_that_never_renders_is_a_structure_problem(self):
+        page = _IdentityPage()
+
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(login_module.wait_for_logged_in_identity(page, timeout_ms=100))
+
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            friends_module.classify_refresh_error(caught.exception),
+        )
+
+    def test_card_text_without_the_douyin_id_marker_is_not_guessed(self):
+        self.assertEqual(("", ""), login_module.identity_from_card_text("srx666 关注 4428"))
+        self.assertEqual(
+            ("srx666", "srx666123456"),
+            login_module.identity_from_card_text("srx666抖音号：srx666123456凡我所失"),
+        )
 
 
 if __name__ == "__main__":

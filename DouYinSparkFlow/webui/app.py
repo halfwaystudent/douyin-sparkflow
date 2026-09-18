@@ -511,6 +511,7 @@ def save_exported_login_result(
     display_name: str = "",
     is_healthy: bool = True,
     verification_reason: str = "",
+    verification_category: str = "",
 ) -> tuple[dict, str]:
     unique_id = normalize_unique_id(login_result.get("unique_id"))
     username = str(display_name or login_result.get("username") or "").strip()
@@ -527,13 +528,20 @@ def save_exported_login_result(
                 account.pop(key, None)
             account.pop("pending_login_verification", None)
             return
+        # A verification that failed for a page or transport reason must not
+        # masquerade as a logged-out account: only a real login failure sets
+        # login_required, and the recorded category is the one the verifier found.
+        category = str(verification_category or CATEGORY_LOGIN_REQUIRED)
         account["pending_login_verification"] = True
-        account["login_required"] = True
+        if category in streak_state.LOGIN_FAILURE_CATEGORIES:
+            account["login_required"] = True
+        else:
+            account.pop("login_required", None)
         existing_health = dict(account.get("account_health") or {})
         existing_health.update(
             {
                 "healthy": False,
-                "category": CATEGORY_LOGIN_REQUIRED,
+                "category": category,
                 "reason": verification_reason or "login state could not be verified after login",
             }
         )
@@ -2837,6 +2845,7 @@ def create_app():
                 display_name=display_name,
                 is_healthy=verified,
                 verification_reason=verification_reason,
+                verification_category=verification_category,
             )
             normalized_saved = normalize_unique_id(account.get("unique_id"))
             friend_refresh_state = (

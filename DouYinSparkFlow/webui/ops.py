@@ -57,6 +57,13 @@ CONFIRMATION_LABELS = {
 FAILURE_CATEGORY_LABELS = {
     "send_unconfirmed": "待核验",
     "login_required": "登录失效",
+    "login_verification_pending": "登录态待核验",
+    "protocol_login_required": "协议登录失效",
+    "browser_login_required": "浏览器登录失效",
+    "account_identity_mismatch": "账号身份不匹配",
+    "network_unavailable": "网络不可用",
+    "structure_changed": "页面结构变化",
+    "empty_result": "未读到好友",
     "friend_not_found": "未找到好友",
     "friend_list_unavailable": "好友列表不可用",
     "timeout": "执行超时",
