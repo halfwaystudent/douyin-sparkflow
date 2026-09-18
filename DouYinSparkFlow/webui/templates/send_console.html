@@ -89,9 +89,9 @@
       <div class="metric-help">{{ summary.enabled_accounts }} 个启用账号</div>
     </article>
     <article class="metric-card success">
-      <div class="metric-label">强确认成功</div>
-      <div class="metric-value" data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</div>
-      <div class="metric-help">服务端回执或页面回显</div>
+      <div class="metric-label">已发送（今日）</div>
+      <div class="metric-value" data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets }}</div>
+      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b></div>
     </article>
     <article class="metric-card danger">
       <div class="metric-label">需要处理</div>
@@ -120,8 +120,9 @@
       {% for account in send_console.accounts %}
       {% set exception_count = account.unconfirmed_targets|length + account.failed_targets|length + account.account_blocked_targets|length %}
       {% set success_count = account.confirmed_targets|length %}
+      {% set page_echo_count = account.page_echo_count %}
       {% set waiting_targets = account.pending_targets + account.unprocessed_targets %}
-      {% set default_segment = "exceptions" if exception_count else ("success" if success_count else "pending") %}
+      {% set default_segment = "exceptions" if exception_count else ("success" if success_count else ("page_echo" if page_echo_count else "pending")) %}
       <details
         class="account-console state-{{ account.state }}"
         id="account-{{ account.unique_id }}"
@@ -178,6 +179,9 @@
             </button>
             <button class="segment-button {% if default_segment == 'success' %}active{% endif %}" type="button" data-segment-target="success">
               <i data-lucide="circle-check"></i><span>成功 {{ success_count }}</span>
+            </button>
+            <button class="segment-button {% if default_segment == 'page_echo' %}active{% endif %}" type="button" data-segment-target="page_echo">
+              <i data-lucide="send"></i><span>已发出·仅回显 {{ page_echo_count }}</span>
             </button>
             <button class="segment-button {% if default_segment == 'pending' %}active{% endif %}" type="button" data-segment-target="pending">
               <i data-lucide="clock-3"></i><span>待发送 {{ waiting_targets|length }}</span>
@@ -266,6 +270,36 @@
               </article>
               {% else %}
               <div class="empty-state">该账号今天还没有强确认记录。</div>
+              {% endfor %}
+            </div>
+          </div>
+
+          <div data-segment-panel="page_echo" {% if default_segment != "page_echo" %}hidden{% endif %}>
+            <div class="target-list">
+              {% for item in account.page_echo_targets %}
+              <article class="target-record">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{{ item.confirmationLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
+                  {{ item.reason or item.confirmationDetail or "已发出，但只取得页面回显这一弱证据" }}
+                </div>
+                <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
+                <form
+                  method="post"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  data-confirm-title="标记为待核验并重发"
+                  data-confirm="将把“{{ item.target }}”标记为待核验并加入补发队列，今日会再发一次。确认继续吗？"
+                  data-confirm-accept="标记并重发"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <button class="button button-quiet" type="submit"><i data-lucide="repeat"></i><span>不确定，重发</span></button>
+                </form>
+              </article>
+              {% else %}
+              <div class="empty-state">该账号今天没有“已发出但仅页面回显”的目标。</div>
               {% endfor %}
             </div>
           </div>

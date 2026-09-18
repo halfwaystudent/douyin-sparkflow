@@ -12,12 +12,30 @@ logger = logging.getLogger(__name__)
 CATEGORY_LOGIN_REQUIRED = "login_required"
 CATEGORY_NETWORK_UNAVAILABLE = "network_unavailable"
 CATEGORY_STRUCTURE_CHANGED = "structure_changed"
+CATEGORY_EMPTY_RESULT = "empty_result"
 
 CATEGORY_LABELS = {
     CATEGORY_LOGIN_REQUIRED: "登录失效",
     CATEGORY_NETWORK_UNAVAILABLE: "网络不可用",
     CATEGORY_STRUCTURE_CHANGED: "页面结构变化",
+    CATEGORY_EMPTY_RESULT: "未读到好友",
 }
+
+
+class FriendScanResult(list):
+    """Friend names plus whether the scan provably reached the end of the list.
+
+    Behaves exactly like a list so existing callers keep working, but carries
+    ``complete`` so the caller can decide whether the result is strong enough to
+    refresh the send-time friend index. When completeness is unknown (for
+    example a test double returning a plain list) it stays ``False``.
+    """
+
+    complete = False
+
+    def __init__(self, names=(), *, complete=False):
+        super().__init__(names)
+        self.complete = bool(complete)
 
 
 class FriendRefreshError(RuntimeError):
@@ -249,7 +267,7 @@ async def collect_friend_names(page):
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
     if not target_locator:
-        return []
+        return FriendScanResult()
 
     found_names = []
     seen_names = set()
@@ -260,7 +278,7 @@ async def collect_friend_names(page):
         _, target_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
         if not target_locator:
             if found_names:
-                return found_names
+                return FriendScanResult(found_names)
             raise RuntimeError("好友列表已加载但未找到可读取的好友行")
 
         target_elements = await target_locator.all()
@@ -287,7 +305,7 @@ async def collect_friend_names(page):
 
         no_more_selector, _ = await _first_visible_locator(page, NO_MORE_SELECTORS)
         if no_more_selector:
-            return found_names
+            return FriendScanResult(found_names, complete=True)
 
         loading_selector, _ = await _first_visible_locator(page, LOADING_SELECTORS)
         if loading_selector:
@@ -317,7 +335,7 @@ async def collect_friend_names(page):
 
         if not scrollable_element:
             if found_names:
-                return found_names
+                return FriendScanResult(found_names)
             raise RuntimeError("未找到好友列表滚动容器")
 
         before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
@@ -340,7 +358,7 @@ async def collect_friend_names(page):
             stuck_rounds=stuck_rounds,
         )
         if should_stop:
-            return found_names
+            return FriendScanResult(found_names, complete=True)
 
 
 async def _fetch_account_friends_once(
@@ -400,7 +418,9 @@ async def _fetch_account_friends_once(
         await asyncio.sleep(1)
 
         friends = await collect_friend_names(page)
-        return friends
+        if isinstance(friends, FriendScanResult):
+            return friends
+        return FriendScanResult(friends)
     except RuntimeError:
         raise
     except Exception as exc:
@@ -579,15 +599,17 @@ async def fetch_account_friends(account):
         try:
             payload = await _fetch_account_friends_once(account, network_mode)
             friends = list(payload or [])
+            complete = bool(getattr(payload, "complete", False))
             logger.info(
-                "Friend refresh route=%s count=%s attempt=%s/%s",
+                "Friend refresh route=%s count=%s complete=%s attempt=%s/%s",
                 network_mode,
                 len(friends),
+                complete,
                 index + 1,
                 len(modes),
             )
             if friends or index == len(modes) - 1:
-                return friends
+                return FriendScanResult(friends, complete=complete)
             logger.warning(
                 "Friend refresh route=%s returned zero friends; trying next route",
                 network_mode,

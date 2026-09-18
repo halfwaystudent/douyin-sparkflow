@@ -46,6 +46,45 @@ class WebUiSafetyTests(unittest.TestCase):
         with patch.object(tasks.os, "kill", side_effect=error):
             self.assertFalse(tasks._pid_is_alive(99999999))
 
+    def test_schedule_alignment_flags_window_lines_without_configured_window(self):
+        window_line = (
+            "*/20 10-17 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' "
+            "bash /app/scripts/run_scheduled_task.sh"
+        )
+        with (
+            patch.object(
+                ops,
+                "get_config",
+                return_value={"dailySendWindow": {"enabled": False}},
+            ),
+            patch.object(ops, "read_crontab", return_value=window_line + "\n"),
+            patch.object(ops, "current_daily_schedule", return_value="18:20"),
+        ):
+            alignment = ops.get_schedule_alignment()
+
+        self.assertFalse(alignment["aligned"])
+        self.assertEqual(["window"], alignment["kinds"])
+        self.assertIn("窗口式任务行", alignment["detail"])
+
+    def test_schedule_alignment_accepts_a_fixed_single_run(self):
+        fixed_line = (
+            "20 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' "
+            "bash /app/scripts/run_scheduled_task.sh"
+        )
+        with (
+            patch.object(
+                ops,
+                "get_config",
+                return_value={"dailySendWindow": {"enabled": False}},
+            ),
+            patch.object(ops, "read_crontab", return_value=fixed_line + "\n"),
+            patch.object(ops, "current_daily_schedule", return_value="18:20"),
+        ):
+            alignment = ops.get_schedule_alignment()
+
+        self.assertTrue(alignment["aligned"])
+        self.assertEqual(["fixed"], alignment["kinds"])
+
     def test_missing_optional_runtime_tools_do_not_log_warnings(self):
         with (
             patch.object(ops.subprocess, "run", side_effect=FileNotFoundError("missing")),
@@ -85,6 +124,7 @@ class WebUiSafetyTests(unittest.TestCase):
                 "total_targets": 2,
                 "today_confirmed_targets": 1,
                 "today_unconfirmed_targets": 1,
+                "today_page_echo_targets": 1,
                 "today_failed_targets": 0,
                 "today_account_blocked_targets": 0,
                 "today_attention_targets": 1,
@@ -102,6 +142,8 @@ class WebUiSafetyTests(unittest.TestCase):
                     "state": "attention",
                     "total_targets": 2,
                     "confirmed_targets": [{"message": "secret message"}],
+                    "page_echo_targets": [{"message": "secret page echo"}],
+                    "page_echo_count": 1,
                     "attention_count": 1,
                     "pending_count": 0,
                     "last_confirmed_at": "2026-07-10T21:00:00+08:00",

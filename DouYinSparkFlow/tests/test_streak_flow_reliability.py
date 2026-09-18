@@ -2262,6 +2262,54 @@ class StreakRunReportTests(unittest.TestCase):
         self.assertEqual("missing_cookies", record["category"])
         self.assertEqual("account has no cookies", record["reason"])
 
+    def test_run_report_carries_evidence_level_and_sent_time(self):
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "target_states": {
+                "nickname:alice": {
+                    "targetRef": "nickname:alice",
+                    "displayName": "Alice",
+                    "status": "sent_unverified",
+                    "strategy": "browser",
+                    "attemptCount": 1,
+                    "confirmationSource": "browser_visible_count_increased",
+                    "needsVerification": True,
+                }
+            },
+            "message_history": {
+                "Alice": {
+                    "sentAt": "2026-09-18T10:05:00+08:00",
+                    "confirmationLevel": "weak",
+                    "confirmationSource": "browser_visible_count_increased",
+                    "confirmationDetail": "page echo only",
+                    "needsVerification": True,
+                }
+            },
+        }
+
+        with (
+            patch.object(streak_state, "append_run_report") as append,
+            patch.object(streak_state, "update_weekly_summary"),
+            patch.object(streak_state, "prune_run_reports"),
+        ):
+            tasks._append_streak_run_report(
+                "run-evidence",
+                datetime.now(timezone.utc) - timedelta(seconds=1),
+                {"proxyAddress": ""},
+                [account],
+                run_status="completed",
+            )
+
+        record = append.call_args.args[0]
+        self.assertEqual("sent_unverified", record["status"])
+        self.assertEqual("weak", record["confirmationLevel"])
+        self.assertEqual("browser_visible_count_increased", record["confirmationSource"])
+        self.assertEqual("page echo only", record["confirmationDetail"])
+        self.assertTrue(record["needsVerification"])
+        self.assertTrue(str(record["sentAt"]).startswith("2026-09-18T"))
+
     def test_report_redacts_credentials_from_free_text(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "run.jsonl"

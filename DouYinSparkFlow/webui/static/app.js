@@ -261,6 +261,11 @@
     updateTaskBanner(task);
     setText("[data-overview-value='total']", summary.total || 0);
     setText("[data-overview-value='confirmed']", summary.confirmed || 0);
+    setText(
+      "[data-overview-value='sentTotal']",
+      (summary.confirmed || 0) + (summary.pageEcho || 0),
+    );
+    setText("[data-overview-value='pageEcho']", summary.pageEcho || 0);
     setText("[data-overview-value='attention']", summary.attention || 0);
     setText(
       "[data-overview-value='pending']",

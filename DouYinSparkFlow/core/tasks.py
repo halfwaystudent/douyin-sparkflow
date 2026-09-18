@@ -2406,7 +2406,9 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
                 {
                     "visibleName": record.get("visibleName") or "",
                     "normalizedName": normalized_name,
-                    "stableKeys": list(record.get("stableKeys") or []),
+                    "stableKeys": list(
+                        record.get("stableKeys") or entry.get("stableKeys") or []
+                    ),
                     "lastSeenAt": scanned_at,
                 }
             )
@@ -2446,6 +2448,50 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
         bool(scan_complete),
         list(missing_targets or []),
     )
+
+
+def record_friend_scan(user, names, *, scan_complete, targets=None, missing_targets=None, scanned_at=None):
+    """Persist friend-index data from a name-level console refresh scan.
+
+    The console refresh only collects display names, so it must never erase the
+    stable keys gathered by the send-time scan (``_persist_friend_index`` keeps
+    the previous keys when the new record has none). ``scan_complete`` must be
+    passed truthfully: an incomplete scan is recorded as incomplete so the send
+    flow still rescans instead of trusting a partial list.
+    """
+
+    records = {}
+    for name in names or []:
+        display_name = str(name or "").strip()
+        if not display_name:
+            continue
+        normalized_name = _normalize_target_name(display_name)
+        record = records.setdefault(
+            normalized_name,
+            {
+                "visibleName": display_name,
+                "normalizedName": normalized_name,
+                "stableKeys": [],
+            },
+        )
+        if not record["visibleName"]:
+            record["visibleName"] = display_name
+    if missing_targets is None:
+        found = set(records)
+        missing_targets = [
+            str(target).strip()
+            for target in (targets or [])
+            if str(target or "").strip()
+            and _normalize_target_name(str(target).strip()) not in found
+        ]
+    _persist_friend_index(
+        user,
+        records,
+        scanned_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        scan_complete=bool(scan_complete),
+        missing_targets=list(missing_targets),
+    )
+    return records
 
 
 def _persist_browser_send_failure(user, target_name, message, category, reason, attempted_at, server_receipt=None):
@@ -2878,6 +2924,9 @@ def _append_streak_run_report(
             state_category = str(state.get("lastErrorCategory") or "")
             state_reason = str(state.get("lastErrorReason") or "")
             report_status = str(state.get("status") or "")
+            history_entry = dict(account.get("message_history") or {}).get(target_name) or {}
+            report_sent_at = parse_sent_at(history_entry.get("sentAt"), timezone.utc)
+            state_needs_verification = state.get("needsVerification")
             if preflight_failed:
                 state_category = str(account_health.get("category") or "")
                 state_reason = str(account_health.get("reason") or "")
@@ -2893,6 +2942,22 @@ def _append_streak_run_report(
                 "category": state_category,
                 "reason": state_reason,
                 "confirmationSource": state.get("confirmationSource") or "",
+                "confirmationLevel": str(
+                    state.get("confirmationLevel")
+                    or history_entry.get("confirmationLevel")
+                    or ""
+                ),
+                "confirmationDetail": str(
+                    state.get("confirmationDetail")
+                    or history_entry.get("confirmationDetail")
+                    or ""
+                ),
+                "needsVerification": bool(
+                    history_entry.get("needsVerification")
+                    if state_needs_verification is None
+                    else state_needs_verification
+                ),
+                "sentAt": report_sent_at.isoformat(timespec="seconds") if report_sent_at else "",
                 "durationMs": duration_ms,
                 "networkRoute": network_route,
                 "runStatus": str(run_status or "completed"),

@@ -39,6 +39,10 @@ TASK_SCHEDULE_MARKERS = (
     "run_scheduled_task.sh",
 )
 HOST_CRONTAB_PATH = Path("/host-spool-cron/root")
+# The scheduler container mounts ./DouYinSparkFlow/logs at /app/logs, so trigger
+# output written here stays readable from both the scheduler and the web
+# container (the panel). /var/log is not mounted and silently diverges.
+CRON_LOG_PATH = "/app/logs/douyin-sparkflow.log"
 WINDOWED_SCHEDULE_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})/(\d+)m$", re.IGNORECASE)
 
 CONFIRMATION_LABELS = {
@@ -536,6 +540,77 @@ def validate_time_string(time_string):
     return parsed["hour"], parsed["minute"]
 
 
+def strip_douyin_schedule_lines(crontab_text):
+    """Return the crontab text without any douyin task line."""
+    kept = [
+        raw_line.rstrip("\n")
+        for raw_line in str(crontab_text or "").splitlines()
+        if not any(marker in raw_line for marker in TASK_SCHEDULE_MARKERS)
+    ]
+    normalized = "\n".join(line for line in kept if line.strip())
+    if normalized:
+        normalized += "\n"
+    return normalized
+
+
+def douyin_schedule_lines(crontab_text=None):
+    text = read_crontab() if crontab_text is None else crontab_text
+    return [
+        line
+        for line in str(text or "").splitlines()
+        if any(marker in line for marker in TASK_SCHEDULE_MARKERS)
+    ]
+
+
+def schedule_line_kind(line):
+    """Classify a douyin task line as a windowed schedule or a single fixed run."""
+    fields = str(line or "").split()
+    if len(fields) < 5:
+        return "unknown"
+    minute, hour = fields[0], fields[1]
+    if "/" in minute or "-" in hour or "," in hour:
+        return "window"
+    return "fixed"
+
+
+def get_schedule_alignment():
+    """Compare the configured send window with the task lines that are live.
+
+    ``dailySendWindow.enabled`` is false both for "no automatic sending" and for
+    the single fixed-time mode, whose time is carried by the task line itself
+    (see ``current_daily_schedule``). So the drift worth reporting is a spool
+    that still holds window-style task lines while no window is configured.
+    """
+    window = dict(get_config(force_reload=True).get("dailySendWindow") or {})
+    enabled = bool(window.get("enabled"))
+    lines = douyin_schedule_lines()
+    kinds = sorted({schedule_line_kind(line) for line in lines})
+    if enabled:
+        aligned = bool(lines) and kinds == ["window"]
+        detail = (
+            "配置与实际任务行一致"
+            if aligned
+            else ("配置已启用发送窗口，但 spool 中没有窗口式任务行" if not lines else "配置已启用发送窗口，但 spool 中的任务行形态不一致")
+        )
+    else:
+        aligned = not lines or kinds == ["fixed"]
+        if not lines:
+            detail = "未配置发送窗口，spool 中也没有发送任务行"
+        elif kinds == ["fixed"]:
+            detail = "按单次固定时间调度（该模式的时间保存在任务行内）"
+        else:
+            detail = "配置未启用发送窗口，但 spool 中仍存在窗口式任务行"
+    return {
+        "windowEnabled": enabled,
+        "configLabel": _format_window_schedule(window) if enabled else "",
+        "fixedLabel": current_daily_schedule() if not enabled else "",
+        "lines": lines,
+        "kinds": kinds,
+        "aligned": aligned,
+        "detail": detail,
+    }
+
+
 def replace_douyin_cron_schedule(crontab_text, time_string):
     schedule = parse_schedule_string(time_string)
     scheduled_command = build_scheduled_task_command()
@@ -555,29 +630,29 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
                 updated.append(
                     f"*/{schedule['scheduleIntervalMinutes']} "
                     f"{schedule['startHour']}-22 * * * "
-                    f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+                    f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
                 )
             updated.append(
                 f"0-58/{schedule['scheduleIntervalMinutes']} 23 * * * "
-                f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+                f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
             )
             updated.append(
                 "59 23 * * * "
-                f"{fallback_command} >> /var/log/douyin-sparkflow.log 2>&1"
+                f"{fallback_command} >> {CRON_LOG_PATH} 2>&1"
             )
         else:
             updated.append(
                 f"*/{schedule['scheduleIntervalMinutes']} {schedule['startHour']}-{end_hour - 1} * * * "
-                f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+                f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
             )
             updated.append(
                 f"0 {end_hour} * * * "
-                f"{fallback_command} >> /var/log/douyin-sparkflow.log 2>&1"
+                f"{fallback_command} >> {CRON_LOG_PATH} 2>&1"
             )
     else:
         updated.append(
             f"{schedule['minute']} {schedule['hour']} * * * "
-            f"{scheduled_command} >> /var/log/douyin-sparkflow.log 2>&1"
+            f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
         )
 
     normalized = "\n".join(line for line in updated if line.strip())
@@ -631,12 +706,48 @@ def sync_daily_schedule_from_config():
     config = get_config(force_reload=True)
     window = dict(config.get("dailySendWindow") or {})
     if not window.get("enabled"):
-        return subprocess.CompletedProcess(
-            args=["sync-daily-schedule"],
-            returncode=0,
-            stdout="schedule disabled; existing crontab left unchanged",
-            stderr="",
-        )
+        lines = douyin_schedule_lines()
+        kinds = {schedule_line_kind(line) for line in lines}
+        if not lines or kinds == {"fixed"}:
+            # No window configured, and either nothing is scheduled or a single
+            # fixed run carries its own time in the task line: leave it alone.
+            return subprocess.CompletedProcess(
+                args=["sync-daily-schedule"],
+                returncode=0,
+                stdout="schedule disabled; existing crontab left unchanged",
+                stderr="",
+            )
+        # Window-style task lines survive while no window is configured: that
+        # combination keeps sending on an old window, so reconcile to "off".
+        try:
+            cleaned = strip_douyin_schedule_lines(read_crontab())
+            if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
+                HOST_CRONTAB_PATH.write_text(cleaned, encoding="utf-8")
+                detail = "host spool"
+            else:
+                subprocess.run(
+                    ["crontab", "-"],
+                    input=cleaned,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                detail = "crontab"
+            logger.warning(
+                "No send window is configured but %s stale window task line(s) were live; removed them from the %s",
+                len(lines),
+                detail,
+            )
+            return subprocess.CompletedProcess(
+                args=["sync-daily-schedule"],
+                returncode=0,
+                stdout=f"schedule disabled; removed {len(lines)} stale window task line(s) from the {detail}",
+                stderr="",
+            )
+        except Exception as exc:
+            logger.error("sync_daily_schedule_from_config failed: %s", exc)
+            return _empty_result(stderr=str(exc))
 
     try:
         time_string = _format_window_schedule(window)
@@ -1042,14 +1153,31 @@ def _build_target_status(account, target_name, now, send_window):
         legacy_unverified = not history_entry.get("confirmationLevel")
         if legacy_unverified:
             confirmation_detail = confirmation_detail or "旧格式发送账本缺少强确认字段，已降级为待核验。"
+        # Only a real weak-evidence send counts as "sent with page echo"; a record
+        # that carries nothing but a timestamp (or was manually reset) still needs
+        # verification.
+        page_echo_evidence = bool(
+            not legacy_unverified
+            and confirmation_level == "weak"
+            and confirmation_source
+            not in ("", "legacy_sentAt_only", "manual_reset")
+        )
         item.update(
             {
-                "status": "unconfirmed",
+                "status": "sent_page_echo" if page_echo_evidence else "unconfirmed",
                 "message": str(history_entry.get("message") or failure_entry.get("message") or ""),
                 "sentAt": sent_at.isoformat(timespec="seconds"),
                 "lastAttemptAt": last_attempt_at.isoformat(timespec="seconds") if failure_is_today else "",
                 "category": str(failure_entry.get("category") or "send_unconfirmed"),
-                "reason": str(failure_entry.get("reason") or confirmation_detail or "发送记录缺少强确认，需要核验。"),
+                "reason": str(
+                    failure_entry.get("reason")
+                    or confirmation_detail
+                    or (
+                        "已发出，但只取得页面回显这一弱证据，未取得服务端强确认。"
+                        if page_echo_evidence
+                        else "发送记录缺少强确认，需要核验。"
+                    )
+                ),
                 "attemptCount": int(failure_entry.get("attemptCount") or 0),
                 "confirmationLevel": confirmation_level,
                 "confirmationSource": confirmation_source,
@@ -1148,6 +1276,7 @@ def get_send_console_snapshot(account_refs=None):
         "today_sent_targets": 0,
         "today_confirmed_targets": 0,
         "today_unconfirmed_targets": 0,
+        "today_page_echo_targets": 0,
         "today_legacy_unverified_targets": 0,
         "today_failed_targets": 0,
         "today_pending_targets": 0,
@@ -1171,7 +1300,11 @@ def get_send_console_snapshot(account_refs=None):
         configured_targets = list(account.get("targets") or [])
         statuses = [_build_target_status(account, target_name, now, send_window) for target_name in configured_targets]
         confirmed_targets = [item for item in statuses if item["status"] == "sent"]
-        sent_targets = confirmed_targets
+        # A target that was sent and only produced the weak page-echo evidence is
+        # finished for today (the engine will not resend it), so it belongs to
+        # the "sent" side of the board, not to "needs attention".
+        page_echo_targets = [item for item in statuses if item["status"] == "sent_page_echo"]
+        sent_targets = confirmed_targets + page_echo_targets
         unconfirmed_targets = [item for item in statuses if item["status"] == "unconfirmed"]
         failed_targets = [item for item in statuses if item["status"] == "failed"]
         account_health = dict(account.get("account_health") or {})
@@ -1266,6 +1399,7 @@ def get_send_console_snapshot(account_refs=None):
         summary["today_sent_targets"] += len(sent_targets)
         summary["today_confirmed_targets"] += len(confirmed_targets)
         summary["today_unconfirmed_targets"] += len(unconfirmed_targets)
+        summary["today_page_echo_targets"] += len(page_echo_targets)
         summary["today_legacy_unverified_targets"] += len(legacy_unverified_targets)
         summary["today_failed_targets"] += len(failed_targets)
         summary["today_pending_targets"] += len(pending_targets)
@@ -1299,6 +1433,8 @@ def get_send_console_snapshot(account_refs=None):
                 "total_targets": len(configured_targets),
                 "sent_targets": sent_targets,
                 "confirmed_targets": confirmed_targets,
+                "page_echo_targets": page_echo_targets,
+                "page_echo_count": len(page_echo_targets),
                 "unconfirmed_targets": unconfirmed_targets,
                 "legacy_unverified_targets": legacy_unverified_targets,
                 "failed_targets": failed_targets,
@@ -1358,6 +1494,7 @@ def get_overview_snapshot(account_refs=None):
                 "state": row["state"],
                 "total": row["total_targets"],
                 "confirmed": len(row["confirmed_targets"]),
+                "pageEcho": row["page_echo_count"],
                 "attention": row["attention_count"],
                 "pending": row["pending_count"],
                 "lastConfirmedAt": row["last_confirmed_at"],
@@ -1371,6 +1508,7 @@ def get_overview_snapshot(account_refs=None):
             "enabledAccounts": summary["enabled_accounts"],
             "total": summary["total_targets"],
             "confirmed": summary["today_confirmed_targets"],
+            "pageEcho": summary["today_page_echo_targets"],
             "unconfirmed": summary["today_unconfirmed_targets"],
             "failed": summary["today_failed_targets"],
             "blocked": summary["today_account_blocked_targets"],
@@ -1400,6 +1538,39 @@ def _check_image_present():
         return False
 
 
+def recent_trigger_lines(limit=5):
+    """Most recent scheduling-trigger log lines.
+
+    Trigger output now lands in the mounted log file, so the panel can show
+    whether the configured window actually fired instead of forcing the
+    operator onto the host shell.
+    """
+    try:
+        tail = read_log_tail(400) or []
+    except Exception:
+        logger.warning("recent_trigger_lines could not read the log tail", exc_info=True)
+        return []
+    markers = ("AUTO_TRIGGER", "run_scheduled_task", "scheduled send", "unsent fallback")
+    hits = [line for line in tail if any(marker in line for marker in markers)]
+    return hits[-max(1, int(limit)) :]
+
+
+def _guarded_schedule_alignment():
+    try:
+        return get_schedule_alignment()
+    except Exception:
+        logger.warning("get_schedule_alignment failed", exc_info=True)
+        return {
+            "windowEnabled": False,
+            "configLabel": "",
+            "fixedLabel": "",
+            "lines": [],
+            "kinds": [],
+            "aligned": False,
+            "detail": "无法读取调度状态",
+        }
+
+
 def get_ops_snapshot(account_refs=None):
     """Collect operational metrics for the dashboard.
 
@@ -1415,6 +1586,8 @@ def get_ops_snapshot(account_refs=None):
         "send_console": send_console,
         "task_lock": task_run_lock_status(),
         "daily_schedule": current_daily_schedule(),
+        "schedule_alignment": _guarded_schedule_alignment(),
+        "recent_triggers": recent_trigger_lines(),
         "schedule": get_schedule_snapshot(),
         "crontab": read_crontab(),
         "log_tail": read_log_tail(120),

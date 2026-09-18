@@ -83,7 +83,7 @@ DEFAULT_APP_SETTINGS = {
     "ui_host": "0.0.0.0",
     "ui_port": 8787,
     "login_poll_interval_seconds": 1,
-    "ops_log_file": "/var/log/douyin-sparkflow.log",
+    "ops_log_file": "/app/logs/douyin-sparkflow.log",
     "proxy_refresh_script": "/opt/douyin-sparkflow/refresh_proxy.sh",
     "local_login_helper_url": "http://127.0.0.1:18765",
     "login_desktop_api_url": "http://127.0.0.1:18090",

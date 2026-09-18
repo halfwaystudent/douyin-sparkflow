@@ -108,7 +108,7 @@
       <div class="overview-value" data-overview-value="lastConfirmedAt">
         {{ summary.last_confirmed_display or "-" }}
       </div>
-      <div class="overview-help">以服务端回执或页面回显为准</div>
+      <div class="overview-help">强证据（服务端/协议回执）；仅页面回显单独计数</div>
     </div>
     <div class="overview-cell">
       <div class="overview-label">需要处理</div>
@@ -121,12 +121,12 @@
     <article class="metric-card success">
       <div class="metric-label">确认成功</div>
       <div class="metric-value" data-overview-value="confirmed">{{ confirmed }}</div>
-      <div class="metric-help">强证据确认</div>
+      <div class="metric-help">强证据确认 · 另有 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> 个仅页面回显</div>
     </article>
     <article class="metric-card warning">
       <div class="metric-label">待核验</div>
       <div class="metric-value">{{ summary.today_unconfirmed_targets }}</div>
-      <div class="metric-help">会进入异常补发</div>
+      <div class="metric-help">无任何发送证据，会进入异常补发</div>
     </article>
     <article class="metric-card danger">
       <div class="metric-label">失败或阻断</div>
@@ -583,6 +583,28 @@
             <button class="button button-danger" type="submit"><i data-lucide="power"></i><span>重启代理</span></button>
           </form>
           <a class="button button-quiet" href="/ops/logs"><i data-lucide="scroll-text"></i><span>查看详细日志</span></a>
+        </div>
+        {% set alignment = ops.schedule_alignment %}
+        <div class="schedule-alignment">
+          <p class="muted compact">
+            <strong>调度核对：</strong>
+            {% if alignment.windowEnabled %}配置窗口 {{ alignment.configLabel }}{% else %}未启用发送窗口{% if alignment.fixedLabel %}（固定 {{ alignment.fixedLabel }}）{% endif %}{% endif %}
+            —— {{ alignment.detail }}
+            {% if not alignment.aligned %}<span class="status-chip warning">需要核对</span>{% endif %}
+          </p>
+          {% if alignment.lines %}
+          <ul class="schedule-lines muted compact">
+            {% for line in alignment.lines %}<li><code>{{ line }}</code></li>{% endfor %}
+          </ul>
+          {% endif %}
+          {% if ops.recent_triggers %}
+          <p class="muted compact"><strong>最近触发记录：</strong></p>
+          <ul class="schedule-lines muted compact">
+            {% for line in ops.recent_triggers %}<li><code>{{ line }}</code></li>{% endfor %}
+          </ul>
+          {% else %}
+          <p class="muted compact">最近没有可读的定时触发记录（触发日志写入任务日志文件后此处会显示）。</p>
+          {% endif %}
         </div>
         <form method="post" action="/ops/schedule" class="stack-form section-form">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

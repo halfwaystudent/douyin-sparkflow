@@ -27,6 +27,7 @@ from core.cookies import (
     require_auth_cookies,
 )
 from core.friends import (
+    CATEGORY_EMPTY_RESULT,
     CATEGORY_LABELS,
     CATEGORY_LOGIN_REQUIRED,
     CATEGORY_NETWORK_UNAVAILABLE,
@@ -38,6 +39,7 @@ from core.friends import (
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
 from core.tasks import (
     _append_streak_run_report,
+    record_friend_scan,
     run_browser_tasks,
     task_run_lock,
 )
@@ -1228,6 +1230,30 @@ def create_app():
         finally:
             _friend_refresh_active.discard(normalized_id)
 
+        previous_updated_at = account.get("friends_cache_updated_at", "")
+        previous_cache = list(account.get("friends_cache") or [])
+        scan_complete = bool(getattr(friends, "complete", False))
+        if not friends and previous_cache:
+            # An empty scan is not proof that the friend list is empty, so keep
+            # the last good cache and let the operator retry instead of wiping
+            # the friend picker with a single flaky read.
+            logger.warning(
+                "Friend refresh returned no names for %s (complete=%s); keeping %s cached friends",
+                account.get("username", normalized_id),
+                scan_complete,
+                len(previous_cache),
+            )
+            return JSONResponse(
+                {
+                    "error": "本次没有读到任何好友，已保留上一次的好友数据；请稍后重试，或先确认该账号登录态。",
+                    "category": CATEGORY_EMPTY_RESULT,
+                    "categoryLabel": CATEGORY_LABELS[CATEGORY_EMPTY_RESULT],
+                    "retryable": True,
+                    "previousUpdatedAt": previous_updated_at,
+                },
+                status_code=502,
+            )
+
         updated_at = datetime.now().isoformat(timespec="seconds")
 
         def mutate(updated_account, accounts):
@@ -1246,12 +1272,33 @@ def create_app():
                 {"error": "Forbidden" if access_error == 403 else "Account not found."},
                 status_code=access_error,
             )
+
+        index_updated = False
+        if scan_complete and friends:
+            try:
+                record_friend_scan(
+                    account,
+                    friends,
+                    scan_complete=True,
+                    targets=account.get("targets") or [],
+                )
+                index_updated = True
+            except Exception:
+                logger.warning(
+                    "Friend index update after refresh failed for %s",
+                    account.get("username", normalized_id),
+                    exc_info=True,
+                )
+
         return JSONResponse(
             {
                 "friends": friends,
                 "updated_at": updated_at,
-                "previous_updated_at": account.get("friends_cache_updated_at", ""),
-                "message": f"已刷新 {len(friends)} 个好友",
+                "previous_updated_at": previous_updated_at,
+                "scan_complete": scan_complete,
+                "index_updated": index_updated,
+                "message": f"已刷新 {len(friends)} 个好友"
+                + ("，并已重建发送索引" if index_updated else ""),
             }
         )
 

@@ -788,6 +788,43 @@ class FriendRefreshEndpointTests(unittest.TestCase):
         self.assertTrue(body["retryable"])
         self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
 
+    def test_empty_result_keeps_previous_friends_cache(self):
+        self.assertEqual(["Old Friend"], self.account["friends_cache"])
+
+        def fake_fetch(account):
+            del account
+            return friends_module.FriendScanResult()
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(502, response.status_code)
+        self.assertEqual("empty_result", body["category"])
+        self.assertTrue(body["retryable"])
+        self.assertEqual(self.account["friends_cache_updated_at"], body["previousUpdatedAt"])
+        stored = self._stored_account()
+        self.assertEqual(["Old Friend"], stored["friends_cache"])
+        self.assertEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+
+    def test_complete_scan_updates_cache_and_reports_index(self):
+        def fake_fetch(account):
+            del account
+            return friends_module.FriendScanResult(["Alice", "Bob"], complete=True)
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(body["scan_complete"])
+        self.assertIsInstance(body["index_updated"], bool)
+        stored = self._stored_account()
+        self.assertEqual(["Alice", "Bob"], stored["friends_cache"])
+        self.assertNotEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+
     def test_structure_failure_keeps_previous_cache(self):
         def fake_fetch(account):
             raise friends_module.FriendRefreshError(
