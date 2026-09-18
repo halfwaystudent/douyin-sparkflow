@@ -1170,6 +1170,49 @@ class MergeDuplicateAccountTests(unittest.TestCase):
         self.assertEqual(1, len(stored))
 
 
+class MergeRedirectContractTests(unittest.TestCase):
+    """The merge button is a plain form, so the route must redirect, not return JSON."""
+
+    def setUp(self):
+        self.client = TestClient(app_module.app)
+        self.principal = {
+            "username": "admin",
+            "role": "admin",
+            "account_refs": [],
+            "session_id": "session-1",
+        }
+
+    def _post_merge(self):
+        source = {"unique_id": ACCOUNT_ID, "username": "Same", "account_ref": "acc-1"}
+        target = {"unique_id": "999", "username": "Other", "account_ref": "acc-2"}
+        with (
+            patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(
+                app_module, "ensure_account_refs", side_effect=lambda accounts: (accounts, False)
+            ),
+            patch.object(app_module, "get_userData", return_value=[source, target]),
+            patch.object(app_module, "account_by_unique_id", return_value=source),
+            patch.object(app_module, "account_by_ref", return_value=target),
+            patch.object(app_module, "can_access_account", return_value=True),
+        ):
+            return self.client.post(
+                f"/accounts/{ACCOUNT_ID}/merge-into",
+                data={"csrf_token": "t", "target_account_ref": "acc-2"},
+                follow_redirects=False,
+            )
+
+    def test_mismatched_nickname_redirects_back_to_the_panel(self):
+        # A form submit that returns JSON navigates the browser onto the JSON
+        # body, which is exactly the bug the operator hit. Any outcome here has
+        # to be a redirect with a flash message.
+        response = self._post_merge()
+        self.assertEqual(303, response.status_code)
+        self.assertNotIn("application/json", response.headers.get("content-type", ""))
+        self.assertIn("/", response.headers.get("location", ""))
+
+
 class WebUiQrProxyTests(unittest.TestCase):
     """The WebUI proxy must relay QR states instead of wrapping them as images."""
 
