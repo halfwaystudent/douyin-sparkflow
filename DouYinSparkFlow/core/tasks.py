@@ -1817,7 +1817,7 @@ def _target_sent_today(user, target_name, now):
     history = streak_state.history_entry(user, target_name, now.tzinfo)
     sent_at = _parse_sent_at(history.get("sentAt"), now.tzinfo)
     return bool(
-        str(history.get("confirmationLevel") or "") == "receipt_only"
+        str(history.get("status") or "") == "sent_receipt_only"
         and sent_at
         and streak_state.same_calendar_day(sent_at, now)
     )
@@ -1830,7 +1830,7 @@ def _target_unconfirmed_today(user, target_name, now):
     # page. Treating it as "unconfirmed, therefore resendable" would send the
     # operator a duplicate of a message that was already delivered, so it is
     # excluded from the automatic resend queue here.
-    if str(history.get("confirmationLevel") or "") == "receipt_only":
+    if str(history.get("status") or "") == "sent_receipt_only":
         return False
     if (
         sent_at

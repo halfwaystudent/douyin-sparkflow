@@ -2508,6 +2508,32 @@ class ReceiptOnlyConfirmationTests(unittest.TestCase):
         # ...but it is still not a strong confirmation, and not resendable.
         self.assertFalse(tasks._target_unconfirmed_today(user, "Alice", now))
 
+    def test_forced_reset_of_a_receipt_only_record_becomes_resendable(self):
+        from webui import app as web_app
+
+        now = datetime(2026, 9, 18, 11, 0, tzinfo=timezone.utc)
+        account = {
+            "unique_id": "1",
+            "username": "demo",
+            "message_history": {
+                "Alice": {
+                    "status": "sent_receipt_only",
+                    "confirmationLevel": "receipt_only",
+                    "sentAt": "2026-09-18T10:00:00+00:00",
+                }
+            },
+        }
+        # While the record stands, nothing resends it...
+        self.assertTrue(tasks._target_sent_today(account, "Alice", now))
+        # ...but the operator's manual reset must really make it resendable,
+        # otherwise the console promises a resend that never happens.
+        changed = web_app.mark_target_unconfirmed(account, "Alice", force=True, now=now)
+        self.assertTrue(changed)
+        entry = dict((account.get("message_history") or {}).get("Alice") or {})
+        self.assertEqual("unconfirmed", entry.get("status"))
+        self.assertFalse(tasks._target_sent_today(account, "Alice", now))
+        self.assertTrue(tasks._target_unconfirmed_today(account, "Alice", now))
+
 class StreakTaskIntegrationTests(unittest.TestCase):
     @staticmethod
     def _update_side_effect(accounts):
