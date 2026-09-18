@@ -1321,6 +1321,32 @@ def create_app():
             + ("，并已重建发送索引" if index_updated else ""),
         )
 
+    def _start_friend_refresh_if_free(normalized_id, account, username):
+        """Start the background friend refresh when nothing blocks it.
+
+        Returns what the caller should report: started, running (already
+        refreshing), busy (a send run holds the lock, because the send flow
+        drives its own browser per account) or skipped.
+        """
+        if not normalized_id:
+            return "skipped"
+        if task_run_lock_status().get("running"):
+            return "busy"
+        if normalized_id in _friend_refresh_active or friend_refresh_conflict(normalized_id):
+            return "running"
+        _friend_refresh_active.add(normalized_id)
+        friend_refresh_jobs[normalized_id] = {
+            "state": "running",
+            "stage": "starting",
+            "collected": 0,
+            "startedAt": datetime.now().isoformat(timespec="seconds"),
+            "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+        }
+        asyncio.create_task(
+            _run_friend_refresh_job(normalized_id, dict(account), str(username or ""))
+        )
+        return "started"
+
     @app.post("/accounts/{unique_id}/friends/refresh/async")
     async def refresh_account_friend_list_async(request: Request, unique_id: str):
         maybe_redirect = require_user(request)
@@ -2848,35 +2874,14 @@ def create_app():
                 is_healthy=verified,
                 verification_reason=verification_reason,
             )
-            # A fresh login state is exactly when the friend list is most likely
-            # stale, so refresh it in the background instead of waiting for the
-            # operator to press refresh. Skipped while a send run holds the lock,
-            # because the send flow drives its own browser per account.
             normalized_saved = normalize_unique_id(account.get("unique_id"))
-            friend_refresh_state = "skipped"
-            if (
-                verified
-                and normalized_saved
-                and not task_run_lock_status().get("running")
-                and normalized_saved not in _friend_refresh_active
-                and not friend_refresh_conflict(normalized_saved)
-            ):
-                _friend_refresh_active.add(normalized_saved)
-                friend_refresh_jobs[normalized_saved] = {
-                    "state": "running",
-                    "stage": "starting",
-                    "collected": 0,
-                    "startedAt": datetime.now().isoformat(timespec="seconds"),
-                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
-                }
-                asyncio.create_task(
-                    _run_friend_refresh_job(
-                        normalized_saved,
-                        dict(account),
-                        str(current.get("username") or ""),
-                    )
+            friend_refresh_state = (
+                _start_friend_refresh_if_free(
+                    normalized_saved, account, current.get("username", "")
                 )
-                friend_refresh_state = "started"
+                if verified
+                else "skipped"
+            )
             logger.info(
                 "Login save friend refresh: uid=%s state=%s",
                 normalized_saved,
