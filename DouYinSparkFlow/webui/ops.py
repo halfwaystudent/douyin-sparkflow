@@ -503,6 +503,30 @@ def _format_window_schedule(window_config):
     )
 
 
+def schedule_window_state(now=None):
+    """Report whether right now sits inside today's configured send window.
+
+    The window may only be edited from outside it, so the save route and the
+    panel both need this answer from one place instead of two.
+    """
+    current = now or datetime.now(_schedule_timezone())
+    try:
+        parsed = parse_schedule_string(current_daily_schedule())
+    except ValueError:
+        parsed = None
+    if not parsed or parsed.get("mode") != "window":
+        return {"enabled": False, "inside": False, "label": ""}
+    start = int(parsed["startHour"])
+    end = int(parsed["endHour"])
+    return {
+        "enabled": True,
+        "inside": start <= current.hour < end,
+        "startHour": start,
+        "endHour": end,
+        "label": _format_window_schedule(parsed),
+    }
+
+
 def parse_schedule_string(time_string):
     raw = str(time_string or "").strip()
     match = WINDOWED_SCHEDULE_RE.fullmatch(raw)
@@ -518,6 +542,9 @@ def parse_schedule_string(time_string):
             raise ValueError("Window schedule is out of range")
         if interval not in range(1, 60):
             raise ValueError("Window schedule interval must be between 1 and 59 minutes")
+        # Fixed at 20 minutes: whatever interval the operator types in the string
+        # is ignored, so a stale value can never change the real cadence.
+        interval = WINDOW_INTERVAL_MINUTES
         return {
             "mode": "window",
             "startHour": start_hour,
@@ -835,6 +862,10 @@ def _next_window_trigger(now, window):
 
 
 FRIENDS_CACHE_TTL_HOURS = 168
+
+# The send window interval is fixed: the console no longer offers an interval
+# input, so the value inside the schedule string is ignored.
+WINDOW_INTERVAL_MINUTES = 20
 
 
 def duplicate_display_names(accounts):

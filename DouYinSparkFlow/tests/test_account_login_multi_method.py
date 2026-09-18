@@ -1203,6 +1203,44 @@ class MergeDuplicateAccountTests(unittest.TestCase):
         self.assertEqual(1, len(stored))
 
 
+class ReloginOverwriteTests(unittest.TestCase):
+    """Re-logging into a chosen account must overwrite it, not be refused."""
+
+    def test_differing_uid_is_accepted_so_the_account_is_overwritten(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        login_result = {
+            "unique_id": "999",
+            "username": "Tester",
+            "cookies": [
+                {"name": "sessionid", "value": "x"},
+                {"name": "sid_guard", "value": "y"},
+            ],
+        }
+        with patch.object(
+            app_module,
+            "verify_account_session",
+            new=AsyncMock(
+                return_value={"identity": {"unique_id": "999", "username": "Tester"}}
+            ),
+        ):
+            verified, reason, identity, category = asyncio.run(
+                app_module.verify_login_result(
+                    login_result,
+                    relogin_account_ref="acc-1",
+                    relogin_unique_id="123",
+                )
+            )
+
+        # Refusing here is what used to leave a duplicate row behind, so a
+        # differing id must come back as a successful verification.
+        self.assertTrue(verified)
+        self.assertEqual("", reason)
+        self.assertEqual("", category)
+        self.assertEqual("999", identity["unique_id"])
+
+
 class MergeRedirectContractTests(unittest.TestCase):
     """The merge button is a plain form, so the route must redirect, not return JSON."""
 

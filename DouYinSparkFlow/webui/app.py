@@ -107,6 +107,7 @@ from webui.ops import (
     run_unsent_retry_now,
     task_run_lock_status,
     preview_daily_schedule,
+    schedule_window_state,
     sync_daily_schedule_from_config,
     update_daily_schedule,
 )
@@ -121,6 +122,7 @@ DEBUG_ARTIFACTS_DIR = BASE_DIR.parent / "logs" / "debug_artifacts"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["cache_age_label"] = cache_age_label
 templates.env.globals["duplicate_display_names"] = duplicate_display_names
+templates.env.globals["schedule_window_state"] = schedule_window_state
 
 
 def _dedupe_targets(values):
@@ -646,12 +648,16 @@ async def verify_login_result(login_result, *, relogin_account_ref="", relogin_u
             CATEGORY_LOGIN_REQUIRED,
         )
     if relogin_unique_id and identity["unique_id"]:
-        if normalize_unique_id(relogin_unique_id) != identity["unique_id"]:
-            return (
-                False,
-                "扫码得到的账号与要重新登录的账号不一致，请确认后重试",
-                identity,
-                CATEGORY_LOGIN_REQUIRED,
+        requested = normalize_unique_id(relogin_unique_id)
+        if requested != identity["unique_id"]:
+            # Re-logging into a chosen account must overwrite it, not refuse.
+            # The same person's Douyin id can come back in a different form, and
+            # refusing here is what used to leave a duplicate row behind. The
+            # save records an identity_mismatch entry so the change is visible.
+            logger.info(
+                "Relogin identity differs from the stored id; overwriting the account: requested=%s scanned=%s",
+                requested,
+                identity["unique_id"],
             )
     return True, "", identity, ""
 
@@ -1958,6 +1964,16 @@ def create_app():
             return Response("Invalid CSRF token", status_code=403)
 
         time_string = str(form.get("daily_schedule", "")).strip()
+        window_state = schedule_window_state()
+        if window_state.get("inside"):
+            # Freeze the window while today's window is running: changing it
+            # mid-window would silently retime the rest of the day.
+            flash(
+                request,
+                f"现在是发送窗口 {window_state.get('label')} 内，窗口配置在窗口结束（{int(window_state.get('endHour') or 0):02d}:00）之前不可修改。",
+                "error",
+            )
+            return redirect("/")
         result = update_daily_schedule(time_string)
         if getattr(result, "returncode", 1) == 0:
             flash(request, f"Updated the daily schedule to {time_string}.", "success")
@@ -2752,9 +2768,16 @@ def create_app():
                     "Login save creates a separate account past a same-name match: scanned_uid=%s",
                     normalize_unique_id(exported.get("unique_id")),
                 )
+            # A chosen re-login target means the operator already picked which
+            # account this login belongs to, so it is overwritten in place
+            # instead of being treated as a possible duplicate.
+            relogin_target_given = bool(
+                str(form.get("relogin_unique_id", "")).strip() or merge_with
+            )
             if (
                 not existing
                 and not allow_duplicate_requested
+                and not relogin_target_given
             ):
                 # No account matched this unique_id, so creating a row is the
                 # only remaining outcome. Ask first if the nickname already
@@ -2825,6 +2848,40 @@ def create_app():
                 is_healthy=verified,
                 verification_reason=verification_reason,
             )
+            # A fresh login state is exactly when the friend list is most likely
+            # stale, so refresh it in the background instead of waiting for the
+            # operator to press refresh. Skipped while a send run holds the lock,
+            # because the send flow drives its own browser per account.
+            normalized_saved = normalize_unique_id(account.get("unique_id"))
+            friend_refresh_state = "skipped"
+            if (
+                verified
+                and normalized_saved
+                and not task_run_lock_status().get("running")
+                and normalized_saved not in _friend_refresh_active
+                and not friend_refresh_conflict(normalized_saved)
+            ):
+                _friend_refresh_active.add(normalized_saved)
+                friend_refresh_jobs[normalized_saved] = {
+                    "state": "running",
+                    "stage": "starting",
+                    "collected": 0,
+                    "startedAt": datetime.now().isoformat(timespec="seconds"),
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                }
+                asyncio.create_task(
+                    _run_friend_refresh_job(
+                        normalized_saved,
+                        dict(account),
+                        str(current.get("username") or ""),
+                    )
+                )
+                friend_refresh_state = "started"
+            logger.info(
+                "Login save friend refresh: uid=%s state=%s",
+                normalized_saved,
+                friend_refresh_state,
+            )
             # Without this trail a wrong match is invisible: a duplicate account
             # only shows up later as two same-name rows in the list.
             logger.info(
@@ -2848,6 +2905,7 @@ def create_app():
                 "verified": verified,
                 "verification_error": verification_reason,
                 "verification_category": verification_category,
+                "friend_refresh": friend_refresh_state,
                 "account": {
                     "account_ref": account.get("account_ref"),
                     "unique_id": account.get("unique_id"),

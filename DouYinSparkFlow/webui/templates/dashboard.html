@@ -646,10 +646,17 @@
           <p class="muted compact">最近没有可读的定时触发记录（触发日志写入任务日志文件后此处会显示）。</p>
           {% endif %}
         </div>
+        {% set window_state = schedule_window_state() %}
+        {% if window_state.inside %}
+        <p class="muted compact schedule-preview-warning">
+          ⚠ 现在是发送窗口 {{ window_state.label }} 内（到 {{ "%02d"|format(window_state.endHour) }}:00 结束），
+          窗口配置在此期间不可修改；窗口结束后再改即可。
+        </p>
+        {% endif %}
         <form method="post" action="/ops/schedule" class="stack-form section-form" data-schedule-preview-url="/ops/schedule/preview">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <label>
-            <span>自动发送窗口，例如 10:00-18:00/20m</span>
+            <span>自动发送窗口（触发间隔固定 20 分钟），例如 10:00-18:00</span>
             <input type="text" name="daily_schedule" value="{{ ops.daily_schedule }}" placeholder="10:00-18:00/20m 或单个 10:00">
             <small>只填 <code>HH:MM</code> 表示每天一次的固定时间；窗口模式的起止必须是整点。</small>
           </label>

@@ -1049,6 +1049,25 @@
     // Exposed so the batch button can drive every account sequentially.
     picker.refreshFriends = doRefresh;
     refreshButton?.addEventListener("click", doRefresh);
+    // A successful login save starts a friend refresh in the background, so pick
+    // its progress up on load instead of leaving the operator with a stale list.
+    fetch(`${refreshUrl}/status`, { credentials: "same-origin", cache: "no-store" })
+      .then((response) => response.json())
+      .then((job) => {
+        if (!job || job.state !== "running") return;
+        if (status) status.textContent = stageLabel(job);
+        return pollJob().then((finished) => {
+          if (finished.state === "done") {
+            lastSuccessAt = finished.updatedAt || lastSuccessAt;
+            friends = finished.friends || friends;
+            if (status) status.textContent = finished.message || "好友列表已刷新";
+            render();
+          } else if (finished.state === "failed") {
+            showRefreshOutcome(`刷新失败：${finished.error || "未知原因"}`);
+          }
+        });
+      })
+      .catch(() => {});
     render();
   });
 

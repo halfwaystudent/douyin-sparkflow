@@ -85,6 +85,37 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertTrue(alignment["aligned"])
         self.assertEqual(["fixed"], alignment["kinds"])
 
+    def test_window_interval_is_pinned_to_twenty_minutes(self):
+        # The console no longer offers an interval input, so a stale or hand
+        # written value must not be able to change the real cadence.
+        for typed in ("10:00-18:00/5m", "10:00-18:00/20m", "10:00-18:00/45m"):
+            parsed = ops.parse_schedule_string(typed)
+            self.assertEqual(20, parsed["scheduleIntervalMinutes"])
+            self.assertEqual("10:00-18:00/20m", ops._format_window_schedule(parsed))
+
+    def test_window_state_reports_whether_now_is_inside(self):
+        import datetime as datetime_module
+
+        with patch.object(ops, "current_daily_schedule", return_value="10:00-18:00/20m"):
+            self.assertTrue(
+                ops.schedule_window_state(
+                    now=datetime_module.datetime(2026, 9, 18, 11, 0)
+                )["inside"]
+            )
+            self.assertFalse(
+                ops.schedule_window_state(
+                    now=datetime_module.datetime(2026, 9, 18, 20, 0)
+                )["inside"]
+            )
+            # The end hour is exclusive: 18:00 is already outside the window.
+            self.assertFalse(
+                ops.schedule_window_state(
+                    now=datetime_module.datetime(2026, 9, 18, 18, 0)
+                )["inside"]
+            )
+        with patch.object(ops, "current_daily_schedule", return_value="18:20"):
+            self.assertFalse(ops.schedule_window_state()["enabled"])
+
     def test_preview_daily_schedule_validates_and_estimates(self):
         with (
             patch.object(
