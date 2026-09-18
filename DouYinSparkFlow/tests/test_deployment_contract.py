@@ -176,7 +176,10 @@ class DeploymentContractTests(unittest.TestCase):
         compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         start_script = (SOURCE_ROOT / "scripts" / "start_login_desktop.sh").read_text(encoding="utf-8")
         server = (SOURCE_ROOT / "login_desktop_server.py").read_text(encoding="utf-8")
-        self.assertIn("cpus: ${LOGIN_DESKTOP_CPUS:-0.8}", compose)
+        # A login run drives Chromium, Xvfb, x11vnc and noVNC at once; 0.8 CPU
+        # starved the whole flow on a two-core host, so the default is 1.5 and
+        # stays overridable through LOGIN_DESKTOP_CPUS.
+        self.assertIn("cpus: ${LOGIN_DESKTOP_CPUS:-1.5}", compose)
         self.assertIn("mem_limit: ${LOGIN_DESKTOP_MEMORY_LIMIT:-1200m}", compose)
         self.assertIn("pids_limit: ${LOGIN_DESKTOP_PIDS_LIMIT:-256}", compose)
         self.assertIn("-nap -wait 50 -defer 50", start_script)
