@@ -442,12 +442,40 @@ class StoredSessionVerificationTests(unittest.TestCase):
         )
 
     def test_structure_failure_does_not_consume_the_second_route(self):
+        # The identity read raises a plain RuntimeError that carries its category
+        # as an attribute, so this must cover that shape and not only FriendRefreshError.
+        calls = []
+        failure = friends_module._with_category(
+            RuntimeError(login_module.CARD_NOT_READY_MESSAGE),
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+        )
+
+        async def structural(account, network_mode, **kwargs):
+            calls.append(network_mode)
+            raise failure
+
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct", "mihomo"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=structural),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module.verify_account_session({"cookies": [{"name": "sessionid", "value": "v"}]})
+            )
+
+        self.assertEqual(["direct"], calls)
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            caught.exception.category,
+        )
+
+    def test_chat_page_structure_failure_also_stops_at_the_first_route(self):
         calls = []
 
         async def structural(account, network_mode, **kwargs):
             calls.append(network_mode)
             raise friends_module.FriendRefreshError(
-                "creator identity card did not become ready within timeout",
+                "chat page did not load within timeout",
                 category=friends_module.CATEGORY_STRUCTURE_CHANGED,
             )
 
@@ -461,6 +489,30 @@ class StoredSessionVerificationTests(unittest.TestCase):
             )
 
         self.assertEqual(["direct"], calls)
+        self.assertEqual(
+            friends_module.CATEGORY_STRUCTURE_CHANGED,
+            caught.exception.category,
+        )
+
+    def test_unrecognised_error_still_tries_the_next_route(self):
+        # classify_refresh_error defaults unknown text to the structure category;
+        # an unknown failure must not lose the remaining egress routes because of it.
+        calls = []
+
+        async def unknown(account, network_mode, **kwargs):
+            calls.append(network_mode)
+            raise RuntimeError("unexpected verification failure")
+
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=["direct", "mihomo"]),
+            patch.object(friends_module, "_fetch_account_friends_once", side_effect=unknown),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(
+                friends_module.verify_account_session({"cookies": [{"name": "sessionid", "value": "v"}]})
+            )
+
+        self.assertEqual(["direct", "mihomo"], calls)
         self.assertEqual(
             friends_module.CATEGORY_STRUCTURE_CHANGED,
             caught.exception.category,

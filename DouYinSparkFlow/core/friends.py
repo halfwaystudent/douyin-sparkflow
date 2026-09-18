@@ -57,6 +57,9 @@ IDENTITY_RETRY_MIN_TIMEOUT_MS = 15000
 # render). Waiting out the whole budget and then retrying with a shorter one would
 # only double the operator's wait without a chance of succeeding.
 IDENTITY_RETRY_FAST_FAIL_MS = 15000
+# The reload that precedes the retry only has to bring the shell back so the card
+# can render; waiting a full navigation timeout there would stall the save.
+IDENTITY_RELOAD_TIMEOUT_SECONDS = 30
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
@@ -399,11 +402,15 @@ async def _fetch_account_friends_once(
             last_identity_error = None
             for attempt in range(IDENTITY_READ_ATTEMPTS):
                 # The first attempt gets the full render budget; the retry only has
-                # to catch a transient blank render, so it stays short.
+                # to catch a transient blank render, so it stays short - and never
+                # longer than the fast-failure window that qualifies it.
                 budget_ms = (
                     identity_timeout_ms
                     if attempt == 0
-                    else max(IDENTITY_RETRY_MIN_TIMEOUT_MS, identity_timeout_ms // 3)
+                    else min(
+                        max(IDENTITY_RETRY_MIN_TIMEOUT_MS, identity_timeout_ms // 3),
+                        IDENTITY_RETRY_FAST_FAIL_MS,
+                    )
                 )
                 started_at = asyncio.get_running_loop().time()
                 try:
@@ -442,7 +449,10 @@ async def _fetch_account_friends_once(
                         try:
                             await page.reload(
                                 wait_until="commit",
-                                timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000,
+                                timeout=min(
+                                    FRIEND_LIST_READY_TIMEOUT_SECONDS,
+                                    IDENTITY_RELOAD_TIMEOUT_SECONDS,
+                                ) * 1000,
                             )
                         except Exception:
                             logger.debug("Creator page reload failed", exc_info=True)
@@ -540,11 +550,23 @@ async def verify_account_session(account, *, auth_only=False, network_mode=None)
             logger.warning("Session verification route=%s failed: %s", mode, exc)
             continue
         except RuntimeError as exc:
-            last_category = classify_refresh_error(exc)
+            # Raw failures carry their category as an attribute when the detector
+            # already knows it; re-deriving it from the text alone would ignore
+            # that and, for example, burn the other egress route on a page problem.
+            attached = getattr(exc, "category", None)
+            last_category = attached or classify_refresh_error(exc)
             if last_category == CATEGORY_LOGIN_REQUIRED:
                 raise FriendRefreshError(
                     str(exc),
                     category=CATEGORY_LOGIN_REQUIRED,
+                ) from exc
+            if attached == CATEGORY_STRUCTURE_CHANGED or _looks_like_structure_failure(exc):
+                # The page loaded on the creator host but its DOM never rendered
+                # the account card; another egress route cannot change that, so
+                # stop here instead of doubling the wait for the same answer.
+                raise FriendRefreshError(
+                    f"无法读取好友私信页，无法验证登录态：{exc}",
+                    category=CATEGORY_STRUCTURE_CHANGED,
                 ) from exc
             last_error = exc
             logger.warning("Session verification route=%s failed: %s", mode, exc)
@@ -623,6 +645,17 @@ def _left_creator_host(page):
     if not current_url:
         return False
     return "creator.douyin.com" not in current_url
+
+
+def _looks_like_structure_failure(exc):
+    """True when the message itself names a page or DOM problem.
+
+    ``classify_refresh_error`` falls back to the structure category for text it
+    does not recognise, so an explicit marker check keeps an unknown error from
+    skipping the remaining egress routes.
+    """
+    text = str(exc or "").lower()
+    return any(marker in text for marker in STRUCTURE_ERROR_MARKERS)
 
 
 def classify_refresh_error(exc):
