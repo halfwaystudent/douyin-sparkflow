@@ -80,7 +80,7 @@ services:
     ports:
       - "${LOGIN_DESKTOP_BIND_ADDRESS:-127.0.0.1}:${LOGIN_DESKTOP_WEB_PORT:-8788}:6080"
     command: bash /app/scripts/start_login_desktop.sh
-    cpus: ${LOGIN_DESKTOP_CPUS:-0.8}
+    cpus: ${LOGIN_DESKTOP_CPUS:-1.5}
     mem_limit: ${LOGIN_DESKTOP_MEMORY_LIMIT:-1200m}
     pids_limit: ${LOGIN_DESKTOP_PIDS_LIMIT:-256}
     volumes:
