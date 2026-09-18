@@ -2677,6 +2677,18 @@ def create_app():
                 is_healthy=verified,
                 verification_reason=verification_reason,
             )
+            # Without this trail a wrong match is invisible: a duplicate account
+            # only shows up later as two same-name rows in the list.
+            logger.info(
+                "Login save: scanned_uid=%s name_len=%s requested_uid=%s operation=%s action=%s verified=%s matched_before=%s",
+                normalize_unique_id(exported.get("unique_id")),
+                len(str(exported.get("username") or "")),
+                normalize_unique_id(relogin_unique_id) or "",
+                operation,
+                action,
+                verified,
+                bool(existing),
+            )
             if operation == "add" and current.get("role") == "user":
                 refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
                 update_web_user(current["username"], account_refs=refs)
