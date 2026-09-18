@@ -442,10 +442,14 @@
     if (workspace.state === "active" && workspace.active) {
       const remaining = Math.max(0, Number(workspace.remaining_seconds || 0));
       const tone = remaining > 0 && remaining <= 60 ? "warning" : "success";
-      const promoted = previousState !== "active" || previousTicket !== workspace.ticket;
+      const promoted =
+        (previousState !== "active" || previousTicket !== workspace.ticket) &&
+        lastPromotedTicket !== workspace.ticket;
       if (promoted) {
-        // The queue just promoted this session: load the workspace and the QR
-        // code right away instead of making the operator click again.
+        // Only take over once per ticket: re-loading the heavy noVNC frame and
+        // re-fetching the QR code on every poll burns the single login-desktop
+        // page lock and makes the whole login flow feel sluggish.
+        lastPromotedTicket = workspace.ticket;
         if (section && !section.open) section.open = true;
         loadFrame(true);
         qrPollStartedAt = Date.now();
@@ -478,6 +482,7 @@
   };
 
   let qrPollStartedAt = 0;
+  let lastPromotedTicket = "";
   const setQrButtons = (label, { busy = false, stopped = false } = {}) => {
     document.querySelectorAll("[data-refresh-login-qr]").forEach((button) => {
       const text = button.querySelector("span");
@@ -496,7 +501,7 @@
     window.clearTimeout(qrRefreshTimer);
     qrRefreshTimer = window.setTimeout(async () => {
       if (qrStatus) qrStatus.textContent = `正在读取登录二维码…${qrWaitLabel()}`;
-      const retryLater = (message, delayMs = 1500) => {
+      const retryLater = (message, delayMs = 3000) => {
         if (retries > 1 && workspace.state === "active") {
           if (qrStatus) qrStatus.textContent = `${message} 继续等待…${qrWaitLabel()}`;
           refreshLoginQr(delayMs, retries - 1);
@@ -796,8 +801,8 @@
 
   if (section) section.addEventListener("toggle", () => { if (section.open) pollStatus(); });
   pollStatus();
-  timer = window.setInterval(pollStatus, 5000);
-  heartbeatTimer = window.setInterval(heartbeat, 5000);
+  timer = window.setInterval(pollStatus, 10000);
+  heartbeatTimer = window.setInterval(heartbeat, 10000);
   countdownTimer = window.setInterval(() => {
     if (workspace.state !== "active" || !workspace.active) return;
     workspace.remaining_seconds = Math.max(0, Number(workspace.remaining_seconds || 0) - 1);
