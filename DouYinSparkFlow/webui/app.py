@@ -1153,6 +1153,225 @@ def create_app():
         )
         return redirect("/")
 
+    # Async friend refresh. The web app is a single uvicorn process, so a plain
+    # dict is enough: one entry per account, overwritten by the next refresh.
+    friend_refresh_jobs: dict[str, dict] = {}
+
+    def _write_friend_cache(normalized_id, friends, updated_at):
+        def mutate(accounts):
+            target = account_by_unique_id(accounts, normalized_id)
+            if not target:
+                return None, False
+            target["friends_cache"] = list(friends)
+            target["friends_cache_updated_at"] = updated_at
+            return None, True
+
+        return update_user_data(mutate, force_reload=True)
+
+    def _finish_friend_job(normalized_id, **fields):
+        job = friend_refresh_jobs.get(normalized_id)
+        if job is not None:
+            job.update(fields)
+            job["finishedAt"] = datetime.now().isoformat(timespec="seconds")
+        _friend_refresh_active.discard(normalized_id)
+
+    async def _run_friend_refresh_job(normalized_id, account, username):
+        def on_progress(collected):
+            job = friend_refresh_jobs.get(normalized_id)
+            if job is not None:
+                job["stage"] = "collecting"
+                job["collected"] = int(collected)
+
+        try:
+            friends = await asyncio.wait_for(
+                fetch_account_friends(account, on_progress=on_progress),
+                timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Async friend refresh timed out for %s after %ss",
+                account.get("username", normalized_id),
+                _FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+            _finish_friend_job(
+                normalized_id,
+                state="failed",
+                stage="timeout",
+                error=f"读取好友列表超时（超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒），已保留上一次的好友数据",
+                category=CATEGORY_NETWORK_UNAVAILABLE,
+                categoryLabel=CATEGORY_LABELS[CATEGORY_NETWORK_UNAVAILABLE],
+                retryable=True,
+            )
+            return
+        except FriendRefreshError as exc:
+            category = exc.category or CATEGORY_STRUCTURE_CHANGED
+            logger.warning(
+                "Async friend refresh failed for %s category=%s: %s",
+                account.get("username", normalized_id),
+                category,
+                exc,
+            )
+            _finish_friend_job(
+                normalized_id,
+                state="failed",
+                stage="failed",
+                error=str(exc),
+                category=category,
+                categoryLabel=CATEGORY_LABELS.get(
+                    category, CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED]
+                ),
+                retryable=category != CATEGORY_LOGIN_REQUIRED,
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "Async friend refresh errored for %s: %s",
+                account.get("username", normalized_id),
+                exc,
+                exc_info=True,
+            )
+            _finish_friend_job(
+                normalized_id,
+                state="failed",
+                stage="failed",
+                error=str(exc),
+                category=CATEGORY_STRUCTURE_CHANGED,
+                categoryLabel=CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED],
+                retryable=True,
+            )
+            return
+
+        previous_cache = list(account.get("friends_cache") or [])
+        scan_complete = bool(getattr(friends, "complete", False))
+        if not friends and previous_cache:
+            logger.warning(
+                "Async friend refresh returned no names for %s (complete=%s); keeping %s cached friends",
+                account.get("username", normalized_id),
+                scan_complete,
+                len(previous_cache),
+            )
+            _finish_friend_job(
+                normalized_id,
+                state="failed",
+                stage="empty",
+                error="本次没有读到任何好友，已保留上一次的好友数据；请稍后重试，或先确认该账号登录态。",
+                category=CATEGORY_EMPTY_RESULT,
+                categoryLabel=CATEGORY_LABELS[CATEGORY_EMPTY_RESULT],
+                retryable=True,
+            )
+            return
+
+        updated_at = datetime.now().isoformat(timespec="seconds")
+        _write_friend_cache(normalized_id, friends, updated_at)
+
+        index_updated = False
+        if scan_complete and friends:
+            try:
+                record_friend_scan(
+                    account,
+                    friends,
+                    scan_complete=True,
+                    targets=account.get("targets") or [],
+                )
+                index_updated = True
+            except Exception:
+                logger.warning(
+                    "Friend index update after async refresh failed for %s",
+                    account.get("username", normalized_id),
+                    exc_info=True,
+                )
+
+        _finish_friend_job(
+            normalized_id,
+            state="done",
+            stage="done",
+            friends=list(friends),
+            updatedAt=updated_at,
+            scanComplete=scan_complete,
+            indexUpdated=index_updated,
+            message=f"已刷新 {len(friends)} 个好友"
+            + ("，并已重建发送索引" if index_updated else ""),
+        )
+
+    @app.post("/accounts/{unique_id}/friends/refresh/async")
+    async def refresh_account_friend_list_async(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
+
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+
+        normalized_id = normalize_unique_id(unique_id)
+        if task_run_lock_status().get("running"):
+            # A send run drives its own browser per account; starting a refresh
+            # at the same time would fight over the same profile.
+            return JSONResponse(
+                {
+                    "error": "发送任务正在运行，为避免与发送流程同时驱动同一账号的浏览器，请稍后再刷新。",
+                    "category": "busy",
+                    "retryable": True,
+                },
+                status_code=409,
+                headers={"Retry-After": "30"},
+            )
+        conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            return JSONResponse(
+                {"error": conflict, "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+        _friend_refresh_active.add(normalized_id)
+        friend_refresh_jobs[normalized_id] = {
+            "state": "running",
+            "stage": "starting",
+            "collected": 0,
+            "startedAt": datetime.now().isoformat(timespec="seconds"),
+            "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+        }
+        asyncio.create_task(
+            _run_friend_refresh_job(normalized_id, dict(account), principal(request).get("username", ""))
+        )
+        return JSONResponse(
+            {"ok": True, "state": "running", "job": dict(friend_refresh_jobs[normalized_id])},
+            status_code=202,
+        )
+
+    @app.get("/accounts/{unique_id}/friends/refresh/status")
+    async def refresh_account_friend_list_status(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+
+        normalized_id = normalize_unique_id(unique_id)
+        job = friend_refresh_jobs.get(normalized_id)
+        if job is None:
+            return JSONResponse(
+                {
+                    "state": "idle",
+                    "stage": "idle",
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                }
+            )
+        return JSONResponse(dict(job))
+
     @app.post("/accounts/{unique_id}/friends/refresh")
     async def refresh_account_friend_list(request: Request, unique_id: str):
         maybe_redirect = require_user(request)
@@ -1168,6 +1387,16 @@ def create_app():
             return JSONResponse({"error": "Forbidden" if access_error.status_code == 403 else "Account not found."}, status_code=access_error.status_code)
 
         normalized_id = normalize_unique_id(unique_id)
+        if task_run_lock_status().get("running"):
+            return JSONResponse(
+                {
+                    "error": "发送任务正在运行，为避免与发送流程同时驱动同一账号的浏览器，请稍后再刷新。",
+                    "category": "busy",
+                    "retryable": True,
+                },
+                status_code=409,
+                headers={"Retry-After": "30"},
+            )
         conflict = friend_refresh_conflict(normalized_id)
         if conflict:
             # 429 keeps the caller's account data untouched and tells the caller

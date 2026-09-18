@@ -389,8 +389,14 @@
         <h2 class="section-title">账号管理</h2>
         <p class="muted compact">管理开关、目标好友、好友缓存和登录态。</p>
       </div>
-      <span class="pill">{{ accounts|length }} 个账号</span>
+      <div class="button-row">
+        <button class="button button-quiet" type="button" data-refresh-all-friends>
+          <i data-lucide="refresh-cw"></i><span>刷新全部好友</span>
+        </button>
+        <span class="pill">{{ accounts|length }} 个账号</span>
+      </div>
     </div>
+    <p class="muted compact" data-refresh-all-friends-summary></p>
     <div class="account-management-list">
       {% for account in accounts %}
       <details class="collapsible-section">

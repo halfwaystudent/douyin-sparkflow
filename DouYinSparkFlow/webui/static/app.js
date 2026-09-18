@@ -914,37 +914,101 @@
       status.append(" ", detail);
     };
 
-    refreshButton?.addEventListener("click", async () => {
+    const stageLabel = (job) => {
+      if (job.stage === "starting") return "正在启动浏览器…";
+      if (job.stage === "collecting") return `正在读取好友列表…已采集 ${job.collected || 0} 个`;
+      return "正在处理…";
+    };
+
+    const pollJob = async () => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const response = await fetch(`${refreshUrl}/status`, {
+          credentials: "same-origin",
+          cache: "no-store",
+        });
+        const job = await response.json().catch(() => ({}));
+        if (job.state === "running") {
+          if (status) status.textContent = stageLabel(job);
+          continue;
+        }
+        return job;
+      }
+      return { state: "failed", error: "刷新仍未完成，请稍后在运行日志中查看结果。" };
+    };
+
+    const doRefresh = async () => {
       refreshButton.disabled = true;
-      if (status) status.textContent = "正在读取好友列表...";
+      if (status) status.textContent = "正在启动刷新…";
       try {
         const formData = new FormData();
         formData.set("csrf_token", csrfToken);
-        const response = await fetch(refreshUrl, {
+        const response = await fetch(`${refreshUrl}/async`, {
           method: "POST",
           body: formData,
           credentials: "same-origin",
         });
-        const data = await response.json();
-        if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok === false) {
           // Keep an in-session timestamp when this failure body omits it (busy,
           // forbidden, or unexpected errors).
           lastSuccessAt = data.previousUpdatedAt || lastSuccessAt;
           const label = data.categoryLabel ? `（${data.categoryLabel}）` : "";
           throw new Error(`${data.error || "刷新失败"}${label}`);
         }
-        lastSuccessAt = data.updated_at || lastSuccessAt;
-        friends = data.friends || [];
-        if (status) status.textContent = data.message || "好友列表已刷新";
-        render();
+        const job = await pollJob();
+        if (job.state === "done") {
+          lastSuccessAt = job.updatedAt || lastSuccessAt;
+          friends = job.friends || [];
+          if (status) status.textContent = job.message || "好友列表已刷新";
+          render();
+          return { ok: true, message: job.message || "已刷新" };
+        }
+        lastSuccessAt = job.previousUpdatedAt || lastSuccessAt;
+        const label = job.categoryLabel ? `（${job.categoryLabel}）` : "";
+        throw new Error(`${job.error || "刷新失败"}${label}`);
       } catch (error) {
         // Keep the previous successful refresh time visible after a failure.
         showRefreshOutcome(`刷新失败：${error.message}`);
+        return { ok: false, message: error.message };
       } finally {
         refreshButton.disabled = false;
       }
-    });
+    };
+
+    // Exposed so the batch button can drive every account sequentially.
+    picker.refreshFriends = doRefresh;
+    refreshButton?.addEventListener("click", doRefresh);
     render();
+  });
+
+  // Batch refresh: run every account sequentially (the server also refuses to
+  // overlap with a send run) and summarise partial failures instead of hiding
+  // them behind per-account status text.
+  const batchButton = document.querySelector("[data-refresh-all-friends]");
+  const batchSummary = document.querySelector("[data-refresh-all-friends-summary]");
+  const renderBatchSummary = (results) => {
+    if (!batchSummary) return;
+    const ok = results.filter((item) => item.ok).length;
+    const failed = results.filter((item) => !item.ok);
+    batchSummary.textContent = failed.length
+      ? `成功 ${ok} 个，失败 ${failed.length} 个：${failed.map((item) => item.message).join("；")}`
+      : `全部成功（${ok} 个账号）`;
+  };
+  batchButton?.addEventListener("click", async () => {
+    const pickers = [...document.querySelectorAll(".friend-picker")];
+    const results = [];
+    batchButton.disabled = true;
+    if (batchSummary) batchSummary.textContent = `正在刷新 ${pickers.length} 个账号…`;
+    try {
+      for (const picker of pickers) {
+        if (typeof picker.refreshFriends !== "function") continue;
+        results.push(await picker.refreshFriends());
+      }
+    } finally {
+      batchButton.disabled = false;
+    }
+    renderBatchSummary(results);
   });
 })();
 

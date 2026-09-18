@@ -1064,7 +1064,15 @@ class DashboardRefreshStatusTests(unittest.TestCase):
         self.assertIn("data.categoryLabel", self.script)
 
     def test_success_path_records_the_new_refresh_time(self):
-        self.assertIn("lastSuccessAt = data.updated_at", self.script)
+        # The refresh is now an async job the panel polls, so the successful
+        # timestamp comes from the finished job rather than the POST response.
+        self.assertIn("/async", self.script)
+        self.assertIn("${refreshUrl}/status", self.script)
+        self.assertIn("lastSuccessAt = job.updatedAt", self.script)
+
+    def test_refresh_reports_collection_progress(self):
+        self.assertIn("正在读取好友列表…已采集", self.script)
+        self.assertIn("data-refresh-all-friends", self.script)
 
 
 class WebUiQrProxyTests(unittest.TestCase):

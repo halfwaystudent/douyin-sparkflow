@@ -262,7 +262,7 @@ async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOU
     )
 
 
-async def collect_friend_names(page):
+async def collect_friend_names(page, on_progress=None):
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
@@ -302,6 +302,9 @@ async def collect_friend_names(page):
             seen_names.add(name)
             found_names.append(name)
             new_names_count += 1
+
+        if on_progress is not None:
+            on_progress(len(found_names))
 
         no_more_selector, _ = await _first_visible_locator(page, NO_MORE_SELECTORS)
         if no_more_selector:
@@ -367,6 +370,7 @@ async def _fetch_account_friends_once(
     *,
     auth_only=False,
     identity_timeout_ms=LOGIN_IDENTITY_TIMEOUT_MS,
+    on_progress=None,
 ):
     cookies = list(account.get("cookies") or [])
     playwright = browser = context = page = None
@@ -417,7 +421,7 @@ async def _fetch_account_friends_once(
         await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
         await asyncio.sleep(1)
 
-        friends = await collect_friend_names(page)
+        friends = await collect_friend_names(page, on_progress=on_progress)
         if isinstance(friends, FriendScanResult):
             return friends
         return FriendScanResult(friends)
@@ -585,7 +589,7 @@ def classify_refresh_error(exc):
     return CATEGORY_STRUCTURE_CHANGED
 
 
-async def fetch_account_friends(account):
+async def fetch_account_friends(account, on_progress=None):
     cookies = list(account.get("cookies") or [])
     if not cookies:
         raise FriendRefreshError(
@@ -597,7 +601,9 @@ async def fetch_account_friends(account):
     last_error = None
     for index, network_mode in enumerate(modes):
         try:
-            payload = await _fetch_account_friends_once(account, network_mode)
+            payload = await _fetch_account_friends_once(
+                account, network_mode, on_progress=on_progress
+            )
             friends = list(payload or [])
             complete = bool(getattr(payload, "complete", False))
             logger.info(
