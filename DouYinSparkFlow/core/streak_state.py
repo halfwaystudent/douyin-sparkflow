@@ -1483,7 +1483,7 @@ def is_sent_unverified(account, target_name, now=None):
     return _is_schedule_today(event_time, now)
 
 
-def preflight_account(account, now=None, *, require_friend_index=False):
+def preflight_account(account, now=None):
     now = _now(now)
     failure = dict(account.get("account_failure") or {})
     last_attempt = _parse_time(failure.get("lastAttemptAt"), now.tzinfo)
@@ -1574,20 +1574,6 @@ def preflight_account(account, now=None, *, require_friend_index=False):
             "category": "expired_cookies",
             "reason": "all cookie expiries are in the past",
         }
-    if require_friend_index:
-        meta = dict(account.get("friend_index_meta") or {})
-        last_scan_at = _parse_time(meta.get("lastScanAt"), now.tzinfo)
-        if (
-            not account.get("friend_index")
-            or not meta.get("lastScanComplete")
-            or not last_scan_at
-            or not _is_schedule_today(last_scan_at, now)
-        ):
-            return {
-                "healthy": False,
-                "category": "friend_index_stale",
-                "reason": "friend index is missing or stale",
-            }
     return {"healthy": True, "category": "", "reason": ""}
 
 

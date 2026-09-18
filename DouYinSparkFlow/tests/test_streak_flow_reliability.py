@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -1705,6 +1706,75 @@ class StreakStateMachineTests(unittest.TestCase):
         )
 
 
+class FriendIndexPreflightDeadlockTests(unittest.TestCase):
+    """A stale friend index must never block a scheduled run from starting.
+
+    The only writer of ``friend_index`` / ``friend_index_meta`` lives inside the
+    browser send flow. Gating that flow on the freshness of its own output
+    deadlocks the run forever, because no other code path can refresh the index.
+    """
+
+    def _account(self, *, meta):
+        account = {
+            "username": "demo",
+            "unique_id": "1",
+            "enabled": True,
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        if meta is not None:
+            account["friend_index"] = {"alice": {"stableKeys": ["sec:sec-1"]}}
+            account["friend_index_meta"] = meta
+        return account
+
+    def _scheduled_run(self, account):
+        # A non-manual, non-fallback run is what the scheduler actually triggers.
+        config = {"useProtocolSender": False}
+        with patch.dict(
+            os.environ,
+            {"SPARKFLOW_MANUAL_RUN": "", "SPARKFLOW_FALLBACK_PHASE": ""},
+            clear=False,
+        ), patch.object(tasks, "_persist_account_preflight"):
+            return tasks._prepare_active_users_for_run(config, [account])
+
+    def test_scheduled_run_survives_yesterday_friend_index(self):
+        yesterday = datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)
+        account = self._account(
+            meta={
+                "lastScanAt": yesterday.isoformat(timespec="seconds"),
+                "lastScanComplete": True,
+            }
+        )
+
+        runnable = self._scheduled_run(account)
+
+        self.assertEqual(1, len(runnable))
+        self.assertEqual(["Alice"], runnable[0]["targets"])
+
+    def test_scheduled_run_survives_missing_friend_index(self):
+        account = self._account(meta=None)
+
+        runnable = self._scheduled_run(account)
+
+        self.assertEqual(1, len(runnable))
+        self.assertEqual(["Alice"], runnable[0]["targets"])
+
+    def test_scheduled_run_survives_incomplete_friend_index(self):
+        account = self._account(
+            meta={
+                "lastScanAt": datetime.now(
+                    timezone(timedelta(hours=8))
+                ).isoformat(timespec="seconds"),
+                "lastScanComplete": False,
+            }
+        )
+
+        runnable = self._scheduled_run(account)
+
+        self.assertEqual(1, len(runnable))
+        self.assertEqual(["Alice"], runnable[0]["targets"])
+
+
 class StreakPreflightTests(unittest.TestCase):
     def test_preflight_rejects_missing_cookies_without_consuming_target_attempts(self):
         account = {
@@ -1732,13 +1802,10 @@ class StreakPreflightTests(unittest.TestCase):
             },
         }
 
-        result = streak_state.preflight_account(
-            account,
-            NOW,
-            require_friend_index=True,
-        )
+        result = streak_state.preflight_account(account, NOW)
 
         self.assertTrue(result["healthy"])
+        self.assertEqual("", result["category"])
         self.assertEqual("sec:sec-1", streak_state.resolve_target_ref(account, "Alice"))
 
     def test_friend_index_prefers_sec_uid_over_peer_user_id(self):
@@ -2961,7 +3028,7 @@ class StreakTaskIntegrationTests(unittest.TestCase):
         self.assertTrue(account["account_health"]["healthy"])
         self.assertEqual([], runnable)
 
-    def test_scheduled_preflight_requires_missing_friend_index(self):
+    def test_scheduled_run_does_not_require_missing_friend_index(self):
         account = {
             "username": "demo",
             "unique_id": "1001",
@@ -2991,13 +3058,16 @@ class StreakTaskIntegrationTests(unittest.TestCase):
         ):
             runnable = tasks._prepare_active_users_for_run(config, [account])
 
-        self.assertEqual([], runnable)
-        self.assertEqual(
+        # The browser send flow builds the friend index on demand, so a missing
+        # index must not reject the run nor mark the account unhealthy.
+        self.assertEqual(1, len(runnable))
+        self.assertEqual(["Alice"], runnable[0]["targets"])
+        self.assertNotEqual(
             "friend_index_stale",
-            account["account_health"]["category"],
+            (account.get("account_health") or {}).get("category"),
         )
 
-    def test_scheduled_preflight_requires_index_for_explicit_browser_account(self):
+    def test_scheduled_run_does_not_require_index_for_explicit_browser_account(self):
         account = {
             "username": "demo",
             "unique_id": "1001",
@@ -3029,10 +3099,13 @@ class StreakTaskIntegrationTests(unittest.TestCase):
         ):
             runnable = tasks._prepare_active_users_for_run(config, [account])
 
-        self.assertEqual([], runnable)
-        self.assertEqual(
+        # Being an explicit browser sender no longer implies the run is gated on
+        # an index that only the gated flow can produce.
+        self.assertEqual(1, len(runnable))
+        self.assertEqual(["Alice"], runnable[0]["targets"])
+        self.assertNotEqual(
             "friend_index_stale",
-            account["account_health"]["category"],
+            (account.get("account_health") or {}).get("category"),
         )
 
     def test_scheduled_preflight_allows_retry_after_protocol_failure_cooldown(self):

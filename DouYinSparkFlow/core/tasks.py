@@ -2174,28 +2174,8 @@ def _prepare_active_users_for_run(active_config, active_user_data):
     if not _is_manual_run() or _is_fallback_run():
         healthy_users = []
         checked_at = now.astimezone(timezone.utc).isoformat(timespec="seconds")
-        browser_sending_required = bool(
-            not active_config.get("useProtocolSender", True)
-            or active_config.get("browserFallbackEnabled", True)
-        )
-        browser_sender_accounts = {
-            str(item).strip().lower()
-            for item in (active_config.get("browserSenderAccounts") or [])
-            if str(item).strip()
-        }
         for user in active_user_data:
-            account_uses_browser = bool(
-                _account_match_tokens(user) & browser_sender_accounts
-            )
-            preflight = streak_state.preflight_account(
-                user,
-                now,
-                require_friend_index=bool(
-                    user.get("friend_index_meta")
-                    or browser_sending_required
-                    or account_uses_browser
-                ),
-            )
+            preflight = streak_state.preflight_account(user, now)
             if (
                 not preflight.get("healthy")
                 or user.get("account_health")
