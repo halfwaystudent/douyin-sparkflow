@@ -85,6 +85,71 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertTrue(alignment["aligned"])
         self.assertEqual(["fixed"], alignment["kinds"])
 
+    def test_preview_daily_schedule_validates_and_estimates(self):
+        with (
+            patch.object(
+                ops,
+                "get_config",
+                return_value={
+                    "sendStrategy": {
+                        "messageIntervalSecondsMin": 10,
+                        "messageIntervalSecondsMax": 10,
+                    }
+                },
+            ),
+            patch.object(
+                ops,
+                "get_send_console_snapshot",
+                return_value={"summary": {"total_targets": 17, "enabled_accounts": 1}},
+            ),
+        ):
+            preview = ops.preview_daily_schedule("10:00-18:00/20m")
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual("10:00-18:00/20m", preview["label"])
+        self.assertTrue(preview["nextTriggerAt"])
+        self.assertEqual(17, preview["targetCount"])
+        self.assertGreater(preview["estimatedRunSeconds"], 0)
+        self.assertEqual(24, preview["slotsPerDay"])
+
+        bad = ops.preview_daily_schedule("10:00-18:00/0m")
+        self.assertFalse(bad["ok"])
+        self.assertTrue(bad["error"])
+
+    def test_fixed_time_preview_explains_the_mode(self):
+        with (
+            patch.object(ops, "get_config", return_value={}),
+            patch.object(
+                ops,
+                "get_send_console_snapshot",
+                return_value={"summary": {"total_targets": 0, "enabled_accounts": 0}},
+            ),
+        ):
+            preview = ops.preview_daily_schedule("18:20")
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual("18:20", preview["label"])
+        self.assertEqual(1, preview["slotsPerDay"])
+        self.assertTrue(any("单次固定时间" in text for text in preview["warnings"]))
+
+    def test_log_summary_counts_levels_and_categories(self):
+        lines = [
+            "2026-09-18 10:00:00 - app - ERROR - tasks.py:1 - friend_index_stale blocked the run",
+            "2026-09-18 10:00:01 - app - WARNING - tasks.py:2 - protocol_sender_failed",
+            "2026-09-18 10:00:02 - app - INFO - tasks.py:3 - nothing notable",
+            "plain line without a level",
+        ]
+        with patch.object(ops, "read_log_tail", return_value=lines):
+            summary = ops.summarize_log_tail()
+
+        self.assertEqual(4, summary["lines"])
+        self.assertEqual(1, summary["levels"]["ERROR"])
+        self.assertEqual(1, summary["levels"]["WARNING"])
+        self.assertEqual(1, summary["levels"]["INFO"])
+        counts = {item["category"]: item["count"] for item in summary["categories"]}
+        self.assertEqual(1, counts["friend_index_stale"])
+        self.assertEqual(1, counts["protocol_sender_failed"])
+
     def test_missing_optional_runtime_tools_do_not_log_warnings(self):
         with (
             patch.object(ops.subprocess, "run", side_effect=FileNotFoundError("missing")),

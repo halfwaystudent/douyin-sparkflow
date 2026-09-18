@@ -871,3 +871,57 @@ window.addEventListener("DOMContentLoaded", () => {
     window.lucide.createIcons({ attrs: { "aria-hidden": "true" } });
   }
 });
+
+(() => {
+  const form = document.querySelector("[data-schedule-preview-url]");
+  if (!form) return;
+  const button = form.querySelector("[data-schedule-preview]");
+  const input = form.querySelector("input[name='daily_schedule']");
+  const result = form.querySelector("[data-schedule-preview-result]");
+  const csrf = form.querySelector("input[name='csrf_token']");
+  if (!button || !input || !result) return;
+
+  const appendLine = (text, className = "") => {
+    const line = document.createElement("div");
+    if (className) line.className = className;
+    line.textContent = text;
+    result.appendChild(line);
+  };
+
+  const render = (data) => {
+    result.hidden = false;
+    result.textContent = "";
+    if (!data || data.ok !== true) {
+      appendLine(`无法解析：${(data && data.error) || "格式不正确"}`, "schedule-preview-error");
+      return;
+    }
+    appendLine(`将生效为：${data.label}`);
+    appendLine(`下一次触发：${data.nextTriggerDisplay || "-"}`);
+    appendLine(`一轮预计耗时（估算）：${data.estimatedRunDisplay || "-"}`);
+    appendLine(`当前目标数：${data.targetCount || 0}`);
+    (data.warnings || []).forEach((text) => {
+      appendLine(`⚠ ${text}`, "schedule-preview-warning");
+    });
+  };
+
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    result.hidden = false;
+    result.textContent = "正在校验…";
+    try {
+      const body = new FormData();
+      body.set("csrf_token", csrf ? csrf.value : "");
+      body.set("daily_schedule", input.value);
+      const response = await fetch(form.dataset.schedulePreviewUrl, {
+        method: "POST",
+        body,
+        credentials: "same-origin",
+      });
+      render(await response.json().catch(() => ({})));
+    } catch (error) {
+      result.textContent = `预览失败：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();

@@ -607,13 +607,22 @@
           <p class="muted compact">最近没有可读的定时触发记录（触发日志写入任务日志文件后此处会显示）。</p>
           {% endif %}
         </div>
-        <form method="post" action="/ops/schedule" class="stack-form section-form">
+        <form method="post" action="/ops/schedule" class="stack-form section-form" data-schedule-preview-url="/ops/schedule/preview">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <label>
             <span>自动发送窗口，例如 10:00-18:00/20m</span>
-            <input type="text" name="daily_schedule" value="{{ ops.daily_schedule }}">
+            <input type="text" name="daily_schedule" value="{{ ops.daily_schedule }}" placeholder="10:00-18:00/20m 或单个 10:00">
+            <small>只填 <code>HH:MM</code> 表示每天一次的固定时间；窗口模式的起止必须是整点。</small>
           </label>
-          <button class="button button-quiet" type="submit"><i data-lucide="calendar-clock"></i><span>更新发送窗口</span></button>
+          <div class="button-row">
+            <button class="button button-quiet" type="button" data-schedule-preview>
+              <i data-lucide="eye"></i><span>预览效果</span>
+            </button>
+            <button class="button button-quiet" type="submit">
+              <i data-lucide="calendar-clock"></i><span>更新发送窗口</span>
+            </button>
+          </div>
+          <div class="schedule-preview muted compact" data-schedule-preview-result hidden></div>
         </form>
       </div>
     </details>

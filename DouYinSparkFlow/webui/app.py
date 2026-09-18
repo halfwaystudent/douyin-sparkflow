@@ -94,13 +94,16 @@ from webui.ops import (
     TASK_ALREADY_RUNNING,
     get_overview_snapshot,
     get_ops_snapshot,
+    log_file_path,
     read_log_tail,
+    summarize_log_tail,
     refresh_proxy,
     restart_proxy,
     run_failed_retry_now,
     run_task_now,
     run_unsent_retry_now,
     task_run_lock_status,
+    preview_daily_schedule,
     sync_daily_schedule_from_config,
     update_daily_schedule,
 )
@@ -1658,6 +1661,27 @@ def create_app():
             flash(request, f"Failed to update the daily schedule to {time_string}: {getattr(result, 'stderr', '')}", "error")
         return redirect("/")
 
+    @app.post("/ops/schedule/preview")
+    async def preview_schedule(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+
+        time_string = str(form.get("daily_schedule", "")).strip()
+        try:
+            preview = preview_daily_schedule(time_string)
+        except Exception as exc:
+            logger.warning("Schedule preview failed", exc_info=True)
+            return JSONResponse(
+                {"ok": False, "error": f"预览失败：{exc}"},
+                status_code=500,
+            )
+        return JSONResponse(preview)
+
     @app.get("/ops/logs", response_class=HTMLResponse)
     async def logs_page(request: Request):
         maybe_redirect = require_admin(request)
@@ -1669,7 +1693,26 @@ def create_app():
             {
                 "flash": pop_flash(request),
                 "log_tail": read_log_tail(400),
+                "log_summary": summarize_log_tail(400),
             },
+        )
+
+    @app.get("/ops/logs/download")
+    async def logs_download(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+        path = log_file_path()
+        if not path.is_file():
+            return PlainTextResponse(
+                "日志文件不存在或尚未产生（定时触发写入任务日志后会生成）。",
+                status_code=404,
+            )
+        return FileResponse(
+            str(path),
+            media_type="text/plain; charset=utf-8",
+            filename=path.name,
+            headers={"Cache-Control": "no-store"},
         )
 
     login_transition_lock = asyncio.Lock()

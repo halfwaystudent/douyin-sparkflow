@@ -130,6 +130,12 @@
     <div class="logs-toolbar__left">
       <span class="logs-meta"><span class="dot" id="logs-live-dot"></span><span id="logs-status-text">最近更新：刚刚</span></span>
       <span class="logs-meta"><span class="dot"></span><span id="logs-line-count">{{ (log_tail|trim).splitlines()|length }} 行</span></span>
+      {% for level, count in (log_summary.levels or {}).items() %}
+      <span class="status-chip {% if level in ['ERROR', 'CRITICAL'] %}danger{% elif level == 'WARNING' %}warning{% else %}info{% endif %}">{{ level }} {{ count }}</span>
+      {% endfor %}
+      {% for item in (log_summary.categories or [])[:5] %}
+      <span class="status-chip warning">{{ item.label }} {{ item.count }}</span>
+      {% endfor %}
     </div>
     <div class="logs-toolbar__left">
       <label class="toggle-switch" title="每 5 秒自动刷新日志">
@@ -137,8 +143,9 @@
         <span class="toggle-track"></span>
         <span>自动刷新</span>
       </label>
+      <input type="search" id="logs-filter" placeholder="只看包含…的行（分类 / 账号 / 关键字）">
       <button type="button" class="ghost-button" id="logs-refresh-btn">↻ 刷新</button>
-      <a class="ghost-button" id="logs-download-btn" href="data:text/plain;charset=utf-8,{{ log_tail|urlencode }}">⬇ 下载日志</a>
+      <a class="ghost-button" id="logs-download-btn" href="/ops/logs/download">⬇ 下载日志</a>
     </div>
   </div>
 
@@ -166,15 +173,30 @@
       return `最近更新：${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     };
 
+    const filterEl = document.getElementById("logs-filter");
+    let rawText = "";
+
+    const applyFilter = () => {
+      const query = String((filterEl && filterEl.value) || "").trim().toLowerCase();
+      const lines = rawText ? rawText.split(/\r?\n/) : [];
+      const shown = query
+        ? lines.filter((line) => line.toLowerCase().includes(query))
+        : lines;
+      if (codeEl) codeEl.textContent = shown.join("\n");
+      if (lineEl) {
+        lineEl.textContent = query
+          ? `显示 ${shown.length} / 共 ${lines.length} 行`
+          : `${lines.length} 行`;
+      }
+    };
+
     const renderBody = (text) => {
-      const has = !!(text && text.trim());
+      rawText = text || "";
+      const has = !!(rawText && rawText.trim());
       if (has) {
         if (emptyEl) emptyEl.style.display = "none";
-        if (codeEl) {
-          codeEl.style.display = "";
-          codeEl.textContent = text;
-        }
-        if (lineEl) lineEl.textContent = `${text.trim().split(/\r?\n/).length} 行`;
+        if (codeEl) codeEl.style.display = "";
+        applyFilter();
       } else {
         if (codeEl) codeEl.style.display = "none";
         if (emptyEl) emptyEl.style.display = "";
@@ -212,6 +234,7 @@
 
     if (toggle) toggle.addEventListener("change", () => setLive(toggle.checked));
     if (refreshBtn) refreshBtn.addEventListener("click", refresh);
+    if (filterEl) filterEl.addEventListener("input", applyFilter);
     if (statusEl) statusEl.textContent = fmtTime();
   })();
 </script>

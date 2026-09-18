@@ -405,7 +405,7 @@ def run_task_now(*, unsent_only=False, failed_only=False, force_all=False, accou
             )
             return TASK_ALREADY_RUNNING
 
-        log_file = Path(get_app_settings().get("ops_log_file") or "/var/log/douyin-sparkflow.log")
+        log_file = log_file_path()
         command, cwd = build_task_run_spec()
         run_env = {
             "SPARKFLOW_MANUAL_RUN": "1",
@@ -469,7 +469,7 @@ def restart_proxy():
 
 
 def read_log_tail(lines=200):
-    log_path = Path(get_app_settings().get("ops_log_file") or "/var/log/douyin-sparkflow.log")
+    log_path = log_file_path()
     if not log_path.exists():
         return ""
     content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -822,6 +822,93 @@ def _next_window_trigger(now, window):
         second=0,
         microsecond=0,
     )
+
+
+def preview_daily_schedule(time_string):
+    """Validate a schedule string and describe what it would actually do.
+
+    Returns the normalised label, the next trigger, a rough estimate of how long
+    one run needs, and warnings when the interval or the window is too short for
+    the configured targets. The estimate is deliberately coarse and labelled as
+    such in the UI: the real pacing comes from the send loop, not from here.
+    """
+    raw = str(time_string or "").strip()
+    empty = {
+        "ok": False,
+        "error": "",
+        "label": "",
+        "nextTriggerAt": "",
+        "nextTriggerDisplay": "",
+        "estimatedRunSeconds": 0,
+        "estimatedRunDisplay": "",
+        "slotsPerDay": 0,
+        "targetCount": 0,
+        "warnings": [],
+    }
+    try:
+        parsed = parse_schedule_string(raw)
+    except ValueError as exc:
+        return {**empty, "error": str(exc)}
+
+    now = datetime.now(_schedule_timezone())
+    config = get_config(force_reload=True)
+    strategy = dict(config.get("sendStrategy") or {})
+    try:
+        min_interval = max(0, int(strategy.get("messageIntervalSecondsMin") or 0))
+        max_interval = max(min_interval, int(strategy.get("messageIntervalSecondsMax") or 0))
+    except (TypeError, ValueError):
+        min_interval, max_interval = 0, 0
+    average_interval = (min_interval + max_interval) / 2
+    summary = get_send_console_snapshot().get("summary") or {}
+    target_count = int(summary.get("total_targets") or 0)
+    account_count = max(1, int(summary.get("enabled_accounts") or 0))
+    estimated_run_seconds = int(target_count * average_interval) + account_count * 45
+
+    warnings = []
+    if parsed["mode"] == "fixed":
+        label = f"{parsed['hour']:02d}:{parsed['minute']:02d}"
+        next_trigger = now.replace(
+            hour=parsed["hour"], minute=parsed["minute"], second=0, microsecond=0
+        )
+        if next_trigger <= now:
+            next_trigger += timedelta(days=1)
+        slots_per_day = 1
+        warnings.append(
+            "单次固定时间：每天只触发一次。这个模式会把发送窗口标记为未启用，"
+            "时间保存在任务行本身，因此面板的窗口输入会显示该时间。"
+        )
+    else:
+        label = _format_window_schedule(parsed)
+        window = {
+            "startHour": parsed["startHour"],
+            "endHour": parsed["endHour"],
+            "scheduleIntervalMinutes": parsed["scheduleIntervalMinutes"],
+        }
+        next_trigger = _next_window_trigger(now, window)
+        span_seconds = max(0, (parsed["endHour"] - parsed["startHour"]) * 3600)
+        slots_per_day = max(1, span_seconds // (parsed["scheduleIntervalMinutes"] * 60))
+        interval_seconds = parsed["scheduleIntervalMinutes"] * 60
+        if estimated_run_seconds > interval_seconds:
+            warnings.append(
+                f"一轮预计约 {_format_duration_seconds(estimated_run_seconds)}，"
+                f"超过触发间隔 {parsed['scheduleIntervalMinutes']} 分钟：任务会重叠，"
+                "后来的一次会被运行锁跳过。"
+            )
+        if span_seconds and estimated_run_seconds > span_seconds:
+            warnings.append("窗口总时长小于一轮预计耗时，今天很可能发不完。")
+
+    return {
+        **empty,
+        "ok": True,
+        "label": label,
+        "nextTriggerAt": next_trigger.isoformat(timespec="seconds"),
+        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M"),
+        "estimatedRunSeconds": estimated_run_seconds,
+        "estimatedRunDisplay": _format_duration_seconds(estimated_run_seconds) or "不到 1 分钟",
+        "slotsPerDay": slots_per_day,
+        "targetCount": target_count,
+        "warnings": warnings,
+    }
 
 
 def get_schedule_snapshot(now=None):
@@ -1591,6 +1678,66 @@ def _check_image_present():
         return result.returncode == 0
     except Exception:
         return False
+
+
+def log_file_path():
+    """Path of the task log the panel reads and offers for download."""
+    configured = str(get_app_settings().get("ops_log_file") or "").strip()
+    if configured:
+        return Path(configured)
+    return Path(CRON_LOG_PATH)
+
+
+LOG_LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b")
+
+# Categories that actually show up in the task log; FAILURE_CATEGORY_LABELS only
+# covers the subset the console renders, so the log summary needs its own set.
+LOG_CATEGORY_KEYS = tuple(
+    sorted(
+        set(FAILURE_CATEGORY_LABELS)
+        | {
+            "friend_index_stale",
+            "protocol_sender_failed",
+            "missing_cookies",
+            "browser_timeout",
+            "navigation_timeout",
+            "in_flight_lease_expired",
+            "unknown",
+        }
+    )
+)
+
+
+def summarize_log_tail(limit=400):
+    """Count log levels and known failure categories in the current tail."""
+    try:
+        lines = read_log_tail(limit) or []
+    except Exception:
+        logger.warning("summarize_log_tail could not read the log tail", exc_info=True)
+        return {"lines": 0, "levels": {}, "categories": []}
+    levels = {}
+    categories = {}
+    for line in lines:
+        match = LOG_LEVEL_RE.search(line)
+        if match:
+            level = match.group(1)
+            levels[level] = levels.get(level, 0) + 1
+        for category in LOG_CATEGORY_KEYS:
+            if category in line:
+                categories[category] = categories.get(category, 0) + 1
+    ordered = sorted(categories.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "lines": len(lines),
+        "levels": levels,
+        "categories": [
+            {
+                "category": name,
+                "label": FAILURE_CATEGORY_LABELS.get(name, name),
+                "count": count,
+            }
+            for name, count in ordered
+        ],
+    }
 
 
 def recent_trigger_lines(limit=5):
