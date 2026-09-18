@@ -26,3 +26,7 @@ DouYinSparkFlow/*.lock
 !/.comet/config.yaml
 # <<< Comet managed project state <<<
 .data-backups/
+
+# Server-local runtime backups and pre-theme backups (never committed)
+/backups/
+DouYinSparkFlow/.theme-backup-*/

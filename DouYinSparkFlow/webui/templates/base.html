@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark light">
     <title>{% block title %}续火花{% endblock %}</title>
-    <link rel="stylesheet" href="/static/app.css?v=20260824">
+    <link rel="stylesheet" href="/static/app.css?v=20260918">
   </head>
   <body data-page="{% block page_key %}dashboard{% endblock %}">
     <header class="mobile-topbar">
@@ -66,17 +66,17 @@
               <a class="nav-item" href="/#interactive-login-section">
                 <i data-lucide="scan-line"></i><span>登录抖音账号</span>
               </a>
-{% if is_admin %}
+              {% if is_admin %}
               <a class="nav-item" href="/#config-panel">
                 <i data-lucide="sliders-horizontal"></i><span>运行配置</span>
               </a>
               {% endif %}
-{% if is_admin %}
+              {% if is_admin %}
               <a class="nav-item" href="/#ops-panel">
                 <i data-lucide="wrench"></i><span>运维操作</span>
               </a>
               {% endif %}
-{% if is_admin %}
+              {% if is_admin %}
               <a class="nav-item" href="/#settings-panel">
                 <i data-lucide="settings"></i><span>系统设置</span>
               </a>
@@ -139,7 +139,7 @@
     </dialog>
 
     <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20260824"></script>
+    <script defer src="/static/app.js?v=20260918"></script>
     {% block scripts %}{% endblock %}
   </body>
 </html>
