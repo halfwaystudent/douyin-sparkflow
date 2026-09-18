@@ -1816,7 +1816,7 @@ def _target_unconfirmed_today(user, target_name, now):
     sent_at = _parse_sent_at(history.get("sentAt"), now.tzinfo)
     if (
         sent_at
-        and sent_at.date() == now.date()
+        and streak_state.same_calendar_day(sent_at, now)
         and not _target_sent_today(user, target_name, now)
     ):
         return True

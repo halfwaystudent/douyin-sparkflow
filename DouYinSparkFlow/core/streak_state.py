@@ -640,6 +640,16 @@ def _same_calendar_day(left, right):
     )
 
 
+def same_calendar_day(left, right):
+    """Compare two instants by the schedule calendar day.
+
+    Anything that decides "is this record from today" must go through here;
+    comparing ``.date()`` on UTC instants disagrees with the Asia/Shanghai
+    schedule around midnight.
+    """
+    return _same_calendar_day(left, right)
+
+
 def _is_schedule_today(value, now):
     return bool(value and _same_calendar_day(value, now))
 

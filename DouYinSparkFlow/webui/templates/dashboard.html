@@ -440,7 +440,7 @@
                 <div>
                   <strong>好友选择器</strong>
                   <p class="muted compact friend-picker-status">
-                    {% if account.friends_cache_updated_at %}上次刷新：{{ account.friends_cache_updated_at }}{% else %}尚未读取好友列表{% endif %}
+                    {% if account.friends_cache_updated_at %}上次刷新：{{ account.friends_cache_updated_at }}{% if cache_age_label(account.friends_cache_updated_at) %}（{{ cache_age_label(account.friends_cache_updated_at) }}）{% endif %}{% else %}尚未读取好友列表{% endif %}
                   </p>
                 </div>
                 <button class="button button-quiet friend-refresh-button" type="button">

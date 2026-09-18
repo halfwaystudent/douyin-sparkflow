@@ -824,6 +824,27 @@ def _next_window_trigger(now, window):
     )
 
 
+FRIENDS_CACHE_TTL_HOURS = 168
+
+
+def cache_age_label(value, ttl_hours=FRIENDS_CACHE_TTL_HOURS):
+    """Human label for a cached-friends timestamp, flagging a stale cache."""
+    parsed = _parse_sent_at(value, _schedule_timezone())
+    if not parsed:
+        return ""
+    now = datetime.now(_schedule_timezone())
+    seconds = max(0, int((now - parsed).total_seconds()))
+    if seconds < 3600:
+        label = f"{max(1, seconds // 60)} 分钟前"
+    elif seconds < 86400:
+        label = f"{seconds // 3600} 小时前"
+    else:
+        label = f"{seconds // 86400} 天前"
+    if seconds > max(1, int(ttl_hours)) * 3600:
+        return f"{label} · 已过期，建议刷新好友"
+    return label
+
+
 def preview_daily_schedule(time_string):
     """Validate a schedule string and describe what it would actually do.
 

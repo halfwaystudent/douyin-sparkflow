@@ -94,6 +94,7 @@ from webui.ops import (
     TASK_ALREADY_RUNNING,
     get_overview_snapshot,
     get_ops_snapshot,
+    cache_age_label,
     log_file_path,
     read_log_tail,
     summarize_log_tail,
@@ -116,6 +117,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 DEBUG_ARTIFACTS_DIR = BASE_DIR.parent / "logs" / "debug_artifacts"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates.env.globals["cache_age_label"] = cache_age_label
 
 
 def _dedupe_targets(values):

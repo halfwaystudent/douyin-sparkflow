@@ -34,7 +34,11 @@ def _receipt_is_strong(receipt):
 def history_entry_is_strong_confirmed_today(entry, now):
     entry = dict(entry or {})
     sent_at = parse_sent_at(entry.get("sentAt"), now.tzinfo)
-    if not sent_at or sent_at.date() != now.date() or bool(entry.get("needsVerification")):
+    if (
+        not sent_at
+        or not streak_state.same_calendar_day(sent_at, now)
+        or bool(entry.get("needsVerification"))
+    ):
         return False
     if entry.get("status") == "confirmed" and entry.get("confirmationLevel") == "strong":
         return True
@@ -50,4 +54,4 @@ def target_is_strong_confirmed_today(account, target_name, now):
 
 def history_entry_is_today(entry, now):
     sent_at = parse_sent_at(dict(entry or {}).get("sentAt"), now.tzinfo)
-    return bool(sent_at and sent_at.date() == now.date())
+    return bool(sent_at and streak_state.same_calendar_day(sent_at, now))

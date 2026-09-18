@@ -390,7 +390,13 @@
     Object.entries(payload).forEach(([key, value]) => formData.set(key, String(value ?? "")));
     const response = await fetch(url, { method: "POST", body: formData, credentials: "same-origin" });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败：${response.status}`);
+    if (!response.ok || data.ok === false) {
+      const error = new Error(data.error || `请求失败：${response.status}`);
+      // Keep the server's grading (category / categoryLabel / retryable) so
+      // callers can render an actionable message instead of a bare string.
+      error.payload = data;
+      throw error;
+    }
     return data;
   };
 
@@ -528,7 +534,19 @@
         }
         if (response.status === 502) {
           const data = await response.json().catch(() => ({}));
-          if (qrStatus) qrStatus.textContent = data.message || data.error || "登录桌面服务暂时不可用，请稍后点击刷新二维码。";
+          // Distinguish "cannot reach Douyin" from "the login service is down";
+          // the old copy blamed the login desktop for every upstream failure.
+          const upstream = /douyin|network|proxy|timeout|超时|网络/i.test(
+            String(data.message || data.error || ""),
+          );
+          if (qrStatus) {
+            qrStatus.textContent =
+              data.message ||
+              data.error ||
+              (upstream
+                ? "无法访问抖音（网络或代理异常），请检查代理后重试。"
+                : "登录桌面服务暂时不可用，请稍后点击刷新二维码。");
+          }
           return;
         }
         if (!response.ok) throw new Error(String(response.status));
@@ -696,8 +714,18 @@
         if (input) input.value = "";
         window.setTimeout(() => window.location.reload(), 900);
       } catch (error) {
-        if (status) status.textContent = `Cookie 登录失败：${error.message}`;
-        else if (previousLabel) status.textContent = previousLabel;
+        // The server already grades the failure (category / retryable), so the
+        // operator can tell "pasted the wrong thing" from "the session is gone"
+        // from "the service hiccuped" instead of guessing.
+        if (status) {
+          const payload = error.payload || {};
+          const label = payload.categoryLabel ? `（${payload.categoryLabel}）` : "";
+          const retryHint =
+            payload.retryable === false
+              ? "这类失败重试通常无效，请重新获取 Cookie。"
+              : "可稍后重试。";
+          status.textContent = `Cookie 登录失败${label}：${error.message}${retryHint}`;
+        }
       } finally {
         submit.disabled = false;
       }
