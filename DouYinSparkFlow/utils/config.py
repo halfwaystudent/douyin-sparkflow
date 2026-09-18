@@ -74,6 +74,8 @@ DEFAULT_CONFIG = {
     }
 }
 
+LEGACY_OPS_LOG_FILE = "/var/log/douyin-sparkflow.log"
+
 DEFAULT_APP_SETTINGS = {
     "admin_username": "admin",
     "admin_password_hash": "",
@@ -355,10 +357,23 @@ def delete_user_account(unique_id):
     return update_user_data(mutate, force_reload=True)
 
 
+def _migrate_legacy_app_settings(settings):
+    """Point a stored legacy trigger-log path at the mounted log file.
+
+    The scheduler streams trigger output into /app/logs/douyin-sparkflow.log,
+    while /var/log is not a mounted volume: an install that stored the old
+    default would keep the panel reading a file nothing writes to.
+    """
+    if str(settings.get("ops_log_file") or "").strip() == LEGACY_OPS_LOG_FILE:
+        settings["ops_log_file"] = DEFAULT_APP_SETTINGS["ops_log_file"]
+    return settings
+
+
 def get_app_settings(force_reload=False):
     global appSettings
     if appSettings is None or force_reload:
         appSettings = _load_json_file(app_settings_path(), DEFAULT_APP_SETTINGS)
+        _migrate_legacy_app_settings(appSettings)
         if not appSettings.get("session_secret"):
             appSettings["session_secret"] = secrets.token_urlsafe(32)
         if not appSettings.get("compose_root"):

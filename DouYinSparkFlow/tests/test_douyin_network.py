@@ -33,6 +33,29 @@ class DouyinNetworkRouteTests(unittest.TestCase):
         self.assertEqual("direct", config_module.DEFAULT_APP_SETTINGS["douyin_network_mode"])
         self.assertEqual("http://proxy:7890", config_module.DEFAULT_APP_SETTINGS["douyin_proxy_url"])
 
+    def test_default_ops_log_file_is_the_mounted_path(self):
+        self.assertEqual(
+            "/app/logs/douyin-sparkflow.log",
+            config_module.DEFAULT_APP_SETTINGS["ops_log_file"],
+        )
+
+    def test_legacy_ops_log_file_is_migrated_to_the_mounted_path(self):
+        settings = {"ops_log_file": config_module.LEGACY_OPS_LOG_FILE}
+
+        config_module._migrate_legacy_app_settings(settings)
+
+        self.assertEqual(
+            config_module.DEFAULT_APP_SETTINGS["ops_log_file"],
+            settings["ops_log_file"],
+        )
+
+    def test_custom_ops_log_file_is_preserved(self):
+        settings = {"ops_log_file": "/data/custom-ops.log"}
+
+        config_module._migrate_legacy_app_settings(settings)
+
+        self.assertEqual("/data/custom-ops.log", settings["ops_log_file"])
+
 
 if __name__ == "__main__":
     unittest.main()
