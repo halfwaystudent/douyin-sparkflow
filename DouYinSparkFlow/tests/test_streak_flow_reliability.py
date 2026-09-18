@@ -2534,6 +2534,40 @@ class ReceiptOnlyConfirmationTests(unittest.TestCase):
         self.assertFalse(tasks._target_sent_today(account, "Alice", now))
         self.assertTrue(tasks._target_unconfirmed_today(account, "Alice", now))
 
+    def test_missing_dom_evidence_keeps_the_previous_behaviour(self):
+        # dom_bubble_seen=None means "not reported" (protocol path or an older
+        # caller). That must keep the old behaviour and must never turn a strong
+        # receipt into the new receipt-only state.
+        user = {
+            "username": "demo",
+            "unique_id": "2",
+            "targets": ["Bob"],
+            "message_history": {},
+        }
+        accounts = [user]
+
+        def fake_update(mutator, **kwargs):
+            result = mutator(accounts)
+            changed = True
+            if isinstance(result, tuple) and len(result) == 2:
+                result, changed = result
+            if kwargs.get("return_changed"):
+                return result, changed
+            return result
+
+        with patch.object(tasks, "update_user_data", side_effect=fake_update):
+            tasks._persist_browser_send_success(
+                user,
+                "Bob",
+                "hi",
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                server_receipt=dict(self.STRONG_RECEIPT),
+            )
+
+        entry = dict((user.get("message_history") or {}).get("Bob") or {})
+        self.assertEqual("strong", entry.get("confirmationLevel"))
+        self.assertEqual("confirmed", entry.get("status"))
+
 class StreakTaskIntegrationTests(unittest.TestCase):
     @staticmethod
     def _update_side_effect(accounts):

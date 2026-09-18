@@ -7,6 +7,13 @@ SOURCE_ROOT = REPO_ROOT / "DouYinSparkFlow"
 
 
 class DeploymentContractTests(unittest.TestCase):
+    def test_installer_writes_the_scheduled_log_to_the_mounted_path(self):
+        installer = (REPO_ROOT / "deploy" / "install-server.sh").read_text(encoding="utf-8")
+        # The web container reads /app/logs/..., so the scheduler must write that
+        # same file through the shared mount instead of a container-local /var/log.
+        self.assertIn("/app/logs/douyin-sparkflow.log", installer)
+        self.assertNotIn("/var/log/douyin-sparkflow.log", installer)
+
     def test_github_workflow_is_at_repository_root(self):
         workflow = REPO_ROOT / ".github" / "workflows" / "schedule.yml"
         self.assertTrue(workflow.is_file())
