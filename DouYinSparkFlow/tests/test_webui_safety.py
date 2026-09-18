@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import errno
 import os
 import tempfile
@@ -35,6 +35,16 @@ class WebUiSafetyTests(unittest.TestCase):
             self.assertFalse(ops._pid_is_alive(999999))
         with patch.object(tasks.os, "kill", side_effect=error):
             self.assertFalse(tasks._pid_is_alive(999999))
+
+    def test_windows_bad_format_pid_probe_is_treated_as_dead(self):
+        # Windows raises ERROR_BAD_FORMAT (11) instead of ERROR_INVALID_PARAMETER
+        # (87) for some out-of-range pids; both mean "no live process".
+        error = OSError(errno.EINVAL, "bad format pid")
+        error.winerror = 11
+        with patch.object(ops.os, "kill", side_effect=error):
+            self.assertFalse(ops._pid_is_alive(99999999))
+        with patch.object(tasks.os, "kill", side_effect=error):
+            self.assertFalse(tasks._pid_is_alive(99999999))
 
     def test_missing_optional_runtime_tools_do_not_log_warnings(self):
         with (

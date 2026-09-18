@@ -110,10 +110,15 @@ def _pid_is_alive(pid):
     except PermissionError:
         return True
     except OSError as exc:
-        if getattr(exc, "winerror", None) == 87 or exc.errno == errno.ESRCH:
-            return False
         if exc.errno in (errno.EPERM, errno.EACCES):
             return True
+        if getattr(exc, "winerror", None) is not None:
+            # Windows reports an invalid or already-exited pid with a variety of
+            # winerror values (87 ERROR_INVALID_PARAMETER, 11 ERROR_BAD_FORMAT,
+            # 1168 ERROR_NOT_FOUND, ...). None of them mean the process is alive.
+            return False
+        if exc.errno == errno.ESRCH:
+            return False
         raise
     return True
 
