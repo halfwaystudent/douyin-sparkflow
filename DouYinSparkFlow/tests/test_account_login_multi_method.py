@@ -1075,6 +1075,36 @@ class DashboardRefreshStatusTests(unittest.TestCase):
         self.assertIn("data-refresh-all-friends", self.script)
 
 
+class DuplicateAccountGuardTests(unittest.TestCase):
+    """A login save must not silently add a second row for the same person."""
+
+    def test_same_name_candidates_are_matched_by_trimmed_nickname(self):
+        accounts = [
+            {"account_ref": "acc-1", "username": "Tester", "unique_id": "1"},
+            {"account_ref": "acc-2", "username": "Other", "unique_id": "2"},
+            {"account_ref": "acc-3", "username": "  Tester ", "unique_id": "3"},
+            {"account_ref": "acc-4", "username": "", "unique_id": "4"},
+        ]
+        matches = app_module.find_same_name_account(accounts, "Tester")
+        self.assertEqual(["acc-1", "acc-3"], [item["account_ref"] for item in matches])
+        self.assertEqual([], app_module.find_same_name_account(accounts, "   "))
+        self.assertEqual([], app_module.find_same_name_account(accounts, "Nobody"))
+        self.assertEqual([], app_module.find_same_name_account(None, "Tester"))
+
+    def test_console_flags_shared_nicknames(self):
+        from webui import ops
+
+        accounts = [
+            {"username": "Tester"},
+            {"username": "Tester"},
+            {"username": "Other"},
+            {"username": ""},
+        ]
+        self.assertEqual({"Tester": 2}, ops.duplicate_display_names(accounts))
+        self.assertEqual({}, ops.duplicate_display_names([{"username": "Solo"}]))
+        self.assertEqual({}, ops.duplicate_display_names(None))
+
+
 class WebUiQrProxyTests(unittest.TestCase):
     """The WebUI proxy must relay QR states instead of wrapping them as images."""
 

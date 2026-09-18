@@ -483,6 +483,23 @@ HEALTH_CLEARING_KEYS = (
 )
 
 
+def find_same_name_account(accounts, username):
+    """Accounts sharing a nickname, used to ask before adding a duplicate.
+
+    Douyin nicknames are not unique, so this only narrows the candidates down;
+    the operator still decides whether to update the existing row or create a
+    separate account.
+    """
+    wanted = str(username or "").strip()
+    if not wanted:
+        return []
+    return [
+        item
+        for item in accounts or []
+        if str((item or {}).get("username") or "").strip() == wanted
+    ]
+
+
 def save_exported_login_result(
     login_result: dict,
     *,
@@ -2681,10 +2698,10 @@ def create_app():
                 exported_name = str(exported.get("username") or "").strip()
                 same_name = [
                     item
-                    for item in get_userData(force_reload=True)
-                    if exported_name
-                    and str(item.get("username") or "").strip() == exported_name
-                    and can_access_account(current, item)
+                    for item in find_same_name_account(
+                        get_userData(force_reload=True), exported_name
+                    )
+                    if can_access_account(current, item)
                 ]
                 if same_name:
                     duplicate = same_name[0]
