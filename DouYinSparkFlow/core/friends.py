@@ -52,14 +52,15 @@ CREATOR_HOME_URL = "https://creator.douyin.com/"
 # turning it into a login failure.
 LOGIN_IDENTITY_TIMEOUT_MS = 60000
 IDENTITY_READ_ATTEMPTS = 2
-IDENTITY_RETRY_MIN_TIMEOUT_MS = 15000
-# A retry only makes sense for a failure that came back quickly (a transient blank
-# render). Waiting out the whole budget and then retrying with a shorter one would
-# only double the operator's wait without a chance of succeeding.
+# A retry is only worth it when the first attempt failed inside this window (a
+# transient blank render); a failure that needed the whole budget is not that case.
 IDENTITY_RETRY_FAST_FAIL_MS = 15000
-# The reload that precedes the retry only has to bring the shell back so the card
-# can render; waiting a full navigation timeout there would stall the save.
-IDENTITY_RELOAD_TIMEOUT_SECONDS = 30
+# The retry starts from a freshly reloaded page, which needs the same cold render
+# time as the first attempt, so it gets a little more than the fast-failure window.
+IDENTITY_RETRY_BUDGET_MS = 20000
+# The reload before the retry only has to bring the shell back so the card can
+# render; waiting a full navigation timeout there would stall the save.
+IDENTITY_RELOAD_TIMEOUT_SECONDS = 20
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
@@ -401,16 +402,12 @@ async def _fetch_account_friends_once(
             identity = None
             last_identity_error = None
             for attempt in range(IDENTITY_READ_ATTEMPTS):
-                # The first attempt gets the full render budget; the retry only has
-                # to catch a transient blank render, so it stays short - and never
-                # longer than the fast-failure window that qualifies it.
+                # The first attempt gets the full render budget; the retry starts
+                # from a reloaded page, so it gets the cold-render retry budget.
                 budget_ms = (
                     identity_timeout_ms
                     if attempt == 0
-                    else min(
-                        max(IDENTITY_RETRY_MIN_TIMEOUT_MS, identity_timeout_ms // 3),
-                        IDENTITY_RETRY_FAST_FAIL_MS,
-                    )
+                    else min(identity_timeout_ms, IDENTITY_RETRY_BUDGET_MS)
                 )
                 started_at = asyncio.get_running_loop().time()
                 try:

@@ -157,10 +157,14 @@ class _FakePage:
         self.sub_app_count = sub_app_count
         self.redirect_to = redirect_to
         self.visited = []
+        self.reload_timeouts = []
 
     async def goto(self, url, **kwargs):
         self.visited.append(url)
         self.url = self.redirect_to or url
+
+    async def reload(self, **kwargs):
+        self.reload_timeouts.append(kwargs.get("timeout"))
 
     def locator(self, selector):
         if selector == "#sub-app":
@@ -1696,21 +1700,33 @@ class IdentityReadBudgetTests(unittest.TestCase):
                     auth_only=True,
                 )
             )
-        return result, seen
+        return result, seen, context._page
 
     def test_first_attempt_uses_the_full_render_budget(self):
-        result, seen = self._run(failures=0)
+        result, seen, _page = self._run(failures=0)
 
         self.assertEqual("8940433898798", result["unique_id"])
         self.assertEqual([friends_module.LOGIN_IDENTITY_TIMEOUT_MS], seen)
 
     def test_slow_identity_read_is_retried_once_with_a_shorter_budget(self):
-        result, seen = self._run(failures=1)
+        result, seen, page = self._run(failures=1)
 
         self.assertEqual("8940433898798", result["unique_id"])
         self.assertEqual(2, len(seen))
         self.assertEqual(friends_module.LOGIN_IDENTITY_TIMEOUT_MS, seen[0])
+        self.assertEqual(
+            min(
+                friends_module.LOGIN_IDENTITY_TIMEOUT_MS,
+                friends_module.IDENTITY_RETRY_BUDGET_MS,
+            ),
+            seen[1],
+        )
         self.assertLess(seen[1], seen[0])
+        # The reload before the retry is capped, not a full navigation timeout.
+        self.assertEqual(
+            [friends_module.IDENTITY_RELOAD_TIMEOUT_SECONDS * 1000],
+            page.reload_timeouts,
+        )
 
     def test_visible_login_form_fails_fast_as_login_required(self):
         seen = []
