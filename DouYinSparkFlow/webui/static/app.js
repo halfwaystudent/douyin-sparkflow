@@ -294,6 +294,13 @@
       "[data-overview-value='scheduleLabel']",
       data.schedule?.label || "-",
     );
+    const remainingForNext = data.schedule?.remainingTargets || 0;
+    setText(
+      "[data-overview-value='nextTriggerHint']",
+      data.schedule?.hasWorkNextTrigger
+        ? `仍有 ${remainingForNext} 个待发送目标`
+        : "当前没有待发送目标，下一次触发不会实际发送",
+    );
     updateAccounts(data.accounts || []);
     updateActions(summary, Boolean(task.running));
 

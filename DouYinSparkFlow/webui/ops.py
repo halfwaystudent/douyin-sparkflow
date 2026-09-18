@@ -908,6 +908,37 @@ def _account_failure_pause_active(account_failure, now, pause_after):
     return elapsed_seconds < _temporary_account_failure_cooldown_minutes() * 60
 
 
+def _account_failure_cooldown_remaining_seconds(account_failure, now):
+    """Seconds left in the temporary-failure cooldown (0 when not cooling down)."""
+    category = str((account_failure or {}).get("category") or "")
+    if category not in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES:
+        return 0
+    last_attempt_at = _parse_sent_at(
+        (account_failure or {}).get("lastAttemptAt"),
+        now.tzinfo,
+    )
+    if not last_attempt_at:
+        return 0
+    remaining = (
+        last_attempt_at
+        + timedelta(minutes=_temporary_account_failure_cooldown_minutes())
+        - now
+    ).total_seconds()
+    return max(0, int(remaining))
+
+
+def _format_duration_seconds(seconds):
+    seconds = max(0, int(seconds))
+    if seconds <= 0:
+        return ""
+    minutes = seconds // 60
+    if minutes <= 0:
+        return f"{seconds} 秒"
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    return f"{minutes // 60} 小时 {minutes % 60} 分钟"
+
+
 def _account_failure_entry_today(account, now):
     entry = dict(account.get("account_failure") or {})
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
@@ -962,21 +993,31 @@ def _friend_index_status(account, target_name):
     }
 
 
-def _account_blocked_target_status(account, item, account_failure):
+def _account_blocked_target_status(account, item, account_failure, now):
     blocked_item = dict(item)
     target_name = str(blocked_item.get("target") or "")
     account_failure_affected = any(
         streak_state.target_keys_match(account, target_name, affected_target)
         for affected_target in (account_failure.get("affectedTargets") or [])
     )
+    category = str(account_failure.get("category") or "")
+    category_label = FAILURE_CATEGORY_LABELS.get(category, category or "账号异常")
+    remaining = _account_failure_cooldown_remaining_seconds(account_failure, now)
+    remaining_label = _format_duration_seconds(remaining)
     blocked_item.update(
         {
             "status": "account_blocked",
-            "category": str(account_failure.get("category") or ""),
+            "category": category,
             "reason": str(account_failure.get("reason") or ""),
             "attemptCount": _coerce_attempt_count(account_failure),
             "lastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
             "accountFailureAffected": account_failure_affected,
+            "cooldownRemainingSeconds": remaining,
+            "skipReason": (
+                f"账号冷却中（{category_label}），剩余 {remaining_label} 后才会再尝试"
+                if remaining_label
+                else f"账号异常（{category_label}），今天不再发送，明天恢复"
+            ),
         }
     )
     return blocked_item
@@ -1184,6 +1225,11 @@ def _build_target_status(account, target_name, now, send_window):
                 "confirmationDetail": confirmation_detail,
                 "needsVerification": True,
                 "legacyUnverified": legacy_unverified,
+                "skipReason": (
+                    "今日已发出（仅页面回显），明日可重试；不确定可点“不确定，重发”"
+                    if page_echo_evidence
+                    else "发送记录缺少任何证据，可重试或点“待核验”重发"
+                ),
             }
         )
         return _finalize_target_status(item, now)
@@ -1334,7 +1380,7 @@ def get_send_console_snapshot(account_refs=None):
         if account_paused:
             account_blocked_targets = [
                 _finalize_target_status(
-                    _account_blocked_target_status(account, item, pause_entry),
+                    _account_blocked_target_status(account, item, pause_entry, now),
                     now,
                 )
                 for item in statuses
@@ -1502,7 +1548,16 @@ def get_overview_snapshot(account_refs=None):
         )
     return {
         "now": send_console["now"],
-        "schedule": get_schedule_snapshot(),
+        "schedule": {
+            **get_schedule_snapshot(),
+            # The next cron trigger is only meaningful while something is still
+            # waiting to be sent; otherwise the window just spins empty.
+            "remainingTargets": int(summary["today_pending_targets"])
+            + int(summary["today_unprocessed_targets"]),
+            "hasWorkNextTrigger": bool(
+                int(summary["today_pending_targets"]) + int(summary["today_unprocessed_targets"])
+            ),
+        },
         "task": task_run_lock_status(),
         "summary": {
             "enabledAccounts": summary["enabled_accounts"],

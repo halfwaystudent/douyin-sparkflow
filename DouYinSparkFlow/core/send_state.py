@@ -21,17 +21,14 @@ def parse_sent_at(raw_value, local_tz):
 
 
 def _receipt_is_strong(receipt):
-    receipt = dict(receipt or {})
-    try:
-        http_status = int(receipt.get("httpStatus") or 0)
-    except (TypeError, ValueError):
-        http_status = 0
-    return (
-        bool(receipt.get("ok"))
-        and 200 <= http_status < 300
-        and str(receipt.get("call") or "message_send") in ("", "message_send")
-        and receipt.get("jsonOk") is True
-    )
+    """Delegate to the state machine so one receipt cannot get two verdicts.
+
+    This module used to accept a missing ``call`` field while the state machine
+    required ``call == "message_send"``; a receipt whose intercepted call could
+    not be identified is not proof that a message was sent, so the stricter
+    definition wins.
+    """
+    return streak_state.receipt_is_strong(receipt)
 
 
 def history_entry_is_strong_confirmed_today(entry, now):

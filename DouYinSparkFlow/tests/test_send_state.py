@@ -5,11 +5,30 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from core import msg_builder, tasks
+from core import send_state, streak_state
 from core.send_state import history_entry_is_strong_confirmed_today
 from webui import ops
 
 
 class SendStateTests(unittest.TestCase):
+    def test_receipt_strength_matches_the_state_machine(self):
+        # A receipt whose intercepted call could not be identified is not proof
+        # that a message was sent, and both modules must agree on that.
+        unidentified = {"ok": True, "httpStatus": 200, "jsonOk": True}
+        message_send = {
+            "ok": True,
+            "httpStatus": 200,
+            "jsonOk": True,
+            "call": "message_send",
+        }
+
+        self.assertEqual(
+            streak_state.receipt_is_strong(unidentified),
+            send_state._receipt_is_strong(unidentified),
+        )
+        self.assertFalse(send_state._receipt_is_strong(unidentified))
+        self.assertTrue(send_state._receipt_is_strong(message_send))
+
     def setUp(self):
         self.now = datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc)
         self.window = {

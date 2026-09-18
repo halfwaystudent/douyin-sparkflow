@@ -215,6 +215,7 @@
                   <small>{{ item.categoryLabel }} · 已尝试 {{ item.attemptCount or 0 }} 次</small>
                 </div>
                 <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or "未记录失败原因" }}</div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
                 <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
                 <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -231,6 +232,7 @@
                   <small>受账号异常影响</small>
                 </div>
                 <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or item.categoryLabel }}</div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
                 <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
                 <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -285,6 +287,7 @@
                 <div class="target-reason" title="{{ item.reason or item.confirmationDetail or '' }}">
                   {{ item.reason or item.confirmationDetail or "已发出，但只取得页面回显这一弱证据" }}
                 </div>
+                {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
                 <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
                 <form
                   method="post"
