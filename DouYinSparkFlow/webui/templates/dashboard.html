@@ -638,36 +638,6 @@
           </form>
           <a class="button button-quiet" href="/ops/logs"><i data-lucide="scroll-text"></i><span>查看详细日志</span></a>
         </div>
-        {% set alignment = ops.schedule_alignment %}
-        <div class="schedule-alignment">
-          <div class="alignment-row">
-            <span class="alignment-label">调度核对</span>
-            <span class="alignment-value">
-              {% if alignment.windowEnabled %}配置窗口 {{ alignment.configLabel }}{% else %}未启用发送窗口{% if alignment.fixedLabel %}（固定 {{ alignment.fixedLabel }}）{% endif %}{% endif %}
-            </span>
-            {% if not alignment.aligned %}<span class="status-chip warning">需要核对</span>{% endif %}
-          </div>
-          <p class="muted compact">{{ alignment.detail }}</p>
-          {% if alignment.missingTriggers %}
-          <p class="notice-inline warning">
-            <i data-lucide="triangle-alert"></i>
-            <span>已配置发送窗口且已过窗口开始时间，但任务日志里没有任何触发记录：请确认定时任务是否真的在执行。</span>
-          </p>
-          {% endif %}
-          {% if alignment.lines %}
-          <ul class="schedule-lines muted compact">
-            {% for line in alignment.lines %}<li><code>{{ line }}</code></li>{% endfor %}
-          </ul>
-          {% endif %}
-          {% if ops.recent_triggers %}
-          <p class="muted compact"><strong>最近触发记录：</strong></p>
-          <ul class="schedule-lines muted compact">
-            {% for line in ops.recent_triggers %}<li><code>{{ line }}</code></li>{% endfor %}
-          </ul>
-          {% else %}
-          <p class="muted compact">最近没有可读的定时触发记录（触发日志写入任务日志文件后此处会显示）。</p>
-          {% endif %}
-        </div>
         {% set window_state = schedule_window_state() %}
         {% if window_state.inside %}
         <p class="notice-inline warning">

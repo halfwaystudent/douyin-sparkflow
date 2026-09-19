@@ -264,7 +264,10 @@ class DashboardProgressRenderingTests(unittest.TestCase):
                     self.assertLessEqual(strong_pct + weak_pct, 100)
                     self.assertEqual(strong_pct + weak_pct, badge_pct)
 
-    def test_ops_panel_drops_the_dash_and_warning_glyph(self):
+    def test_ops_panel_no_longer_renders_the_schedule_diagnostics(self):
+        # The whole 调度核对 block was removed: the alignment checker flagged the
+        # intentional 18:00 fallback line and the trigger reader always reported
+        # zero, so every line in it was noise.
         summary = _summary(total_targets=1, today_confirmed_targets=1)
         account = _account_row(
             total_targets=1,
@@ -278,21 +281,36 @@ class DashboardProgressRenderingTests(unittest.TestCase):
                 "windowEnabled": True,
                 "configLabel": "10:00-18:00",
                 "fixedLabel": "",
-                "detail": "cron 与配置一致",
+                "detail": "配置已启用发送窗口，但 spool 中的任务行形态不一致",
                 "aligned": False,
                 "missingTriggers": True,
-                "lines": ["*/20 10-17 * * *"],
+                "lines": ["*/20 10-17 * * *", "0 18 * * *"],
             },
+            recent_triggers=["[AUTO_TRIGGER] 2026-09-19T18:00:11+08:00 unsent fallback start"],
         )
+
+        for gone in (
+            "调度核对",
+            "需要核对",
+            "形态不一致",
+            "没有任何触发记录",
+            "最近没有可读的定时触发记录",
+            "最近触发记录",
+            "alignment-row",
+            "*/20 10-17",
+            "0 18 * * *",
+        ):
+            with self.subTest(removed=gone):
+                self.assertNotIn(gone, html)
 
         self.assertNotIn("⚠", html)
         self.assertNotIn("——", html)
-        self.assertIn("alignment-row", html)
-        self.assertIn("调度核对", html)
-        self.assertIn("notice-inline warning", html)
-        self.assertIn("triangle-alert", html)
-        self.assertIn("需要核对", html)
-        self.assertIn("请确认定时任务是否真的在执行", html)
+        # The controls that stay behind must still be there.
+        self.assertIn("补发异常", html)
+        self.assertIn("全部重发", html)
+        self.assertIn("自动发送窗口", html)
+        self.assertIn("预览效果", html)
+        self.assertIn("更新发送窗口", html)
 
     def test_window_notice_uses_the_icon_notice(self):
         app_module.templates.env.globals["schedule_window_state"] = lambda: {

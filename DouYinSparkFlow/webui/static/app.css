@@ -1186,30 +1186,6 @@ tbody tr:hover td {
   white-space: nowrap;
 }
 
-.schedule-alignment {
-  display: grid;
-  gap: 8px;
-  margin-top: 14px;
-}
-
-.alignment-row {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.alignment-label {
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-
-.alignment-value {
-  font-weight: 650;
-}
-
 .notice-inline {
   display: flex;
   align-items: flex-start;

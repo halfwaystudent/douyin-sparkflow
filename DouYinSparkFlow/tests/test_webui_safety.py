@@ -164,13 +164,18 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertTrue(any("单次固定时间" in text for text in preview["warnings"]))
 
     def test_log_summary_counts_levels_and_categories(self):
-        lines = [
-            "2026-09-18 10:00:00 - app - ERROR - tasks.py:1 - friend_index_stale blocked the run",
-            "2026-09-18 10:00:01 - app - WARNING - tasks.py:2 - protocol_sender_failed",
-            "2026-09-18 10:00:02 - app - INFO - tasks.py:3 - nothing notable",
-            "plain line without a level",
-        ]
-        with patch.object(ops, "read_log_tail", return_value=lines):
+        # read_log_tail returns the tail as one newline-joined string, which is
+        # what the summary has to split; stubbing it with a list used to hide the
+        # fact that the caller iterated characters instead of lines.
+        tail = "\n".join(
+            [
+                "2026-09-18 10:00:00 - app - ERROR - tasks.py:1 - friend_index_stale blocked the run",
+                "2026-09-18 10:00:01 - app - WARNING - tasks.py:2 - protocol_sender_failed",
+                "2026-09-18 10:00:02 - app - INFO - tasks.py:3 - nothing notable",
+                "plain line without a level",
+            ]
+        )
+        with patch.object(ops, "read_log_tail", return_value=tail):
             summary = ops.summarize_log_tail()
 
         self.assertEqual(4, summary["lines"])

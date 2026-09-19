@@ -1812,7 +1812,10 @@ LOG_CATEGORY_KEYS = tuple(
 def summarize_log_tail(limit=400):
     """Count log levels and known failure categories in the current tail."""
     try:
-        lines = read_log_tail(limit) or []
+        # read_log_tail returns the tail as one string, so split it into lines
+        # before matching; iterating the string matched single characters and
+        # reported character counts instead of real levels and lines.
+        lines = (read_log_tail(limit) or "").splitlines()
     except Exception:
         logger.warning("summarize_log_tail could not read the log tail", exc_info=True)
         return {"lines": 0, "levels": {}, "categories": []}
@@ -1849,7 +1852,9 @@ def recent_trigger_lines(limit=5):
     operator onto the host shell.
     """
     try:
-        tail = read_log_tail(400) or []
+        # read_log_tail returns the tail as one string; iterate its lines, not
+        # its characters, or every marker lookup silently finds nothing.
+        tail = (read_log_tail(400) or "").splitlines()
     except Exception:
         logger.warning("recent_trigger_lines could not read the log tail", exc_info=True)
         return []
