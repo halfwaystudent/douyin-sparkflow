@@ -83,13 +83,15 @@ def _build_protocol_target_identities(user, messages_by_target):
             match = matches[0]
         sec_uid = str(match.get("secUid") or "").strip()
         peer_user_id = str(match.get("peerUserId") or "").strip()
-        if not sec_uid and not peer_user_id:
+        conversation_id = str(match.get("conversationId") or "").strip()
+        if not sec_uid and not peer_user_id and not conversation_id:
             continue
         identities[target] = {
             key: value
             for key, value in (
                 ("secUid", sec_uid),
                 ("peerUserId", peer_user_id),
+                ("conversationId", conversation_id),
             )
             if value
         }

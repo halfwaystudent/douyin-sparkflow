@@ -50,7 +50,11 @@ ensure_line() {
   local key="$1"
   local value="$2"
   if grep -q "^${key}:" "$CONFIG_FILE"; then
-    sed -i "s#^${key}:.*#${key}: ${value}#" "$CONFIG_FILE"
+    if sed --version >/dev/null 2>&1; then
+      sed -i "s#^${key}:.*#${key}: ${value}#" "$CONFIG_FILE"
+    else
+      sed -i '' "s#^${key}:.*#${key}: ${value}#" "$CONFIG_FILE"
+    fi
   else
     printf '%s: %s\n' "$key" "$value" >> "$CONFIG_FILE"
   fi

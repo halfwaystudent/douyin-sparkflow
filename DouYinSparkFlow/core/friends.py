@@ -275,11 +275,70 @@ async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOU
     )
 
 
+SYSTEM_CHAT_NAMES = {
+    "系统通知",
+    "创作者小助手",
+    "活动小助手",
+    "抖音小助手",
+    "直播小助手",
+    "服务通知",
+    "抖音安全中心",
+    "dou+小助手",
+    "电商小助手",
+    "消息助手",
+    "互动助手",
+    "官方通知",
+    "私信助手",
+    "抖音创作者服务平台",
+}
+
+
+async def _try_collect_groups(page, found_names, seen_names, on_progress=None):
+    try:
+        sub_app = page.locator('xpath=//*[@id="sub-app"]')
+        group_tab_candidates = [
+            page.get_by_role("tab", name="群聊", exact=True),
+            page.get_by_role("tab", name="群聊私信", exact=True),
+            sub_app.get_by_text("群聊", exact=True),
+            page.get_by_text("群聊", exact=True),
+        ]
+        for candidate in group_tab_candidates:
+            if await candidate.count() > 0 and await candidate.first.is_visible():
+                await candidate.first.click(timeout=3000)
+                await asyncio.sleep(1)
+                _, group_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
+                if group_locator:
+                    group_elements = await group_locator.all()
+                    for element in group_elements:
+                        name = ""
+                        for selector in FRIEND_NAME_SELECTORS:
+                            try:
+                                name = (await element.locator(selector).first.inner_text(timeout=1000)).strip()
+                            except Exception:
+                                continue
+                            if name:
+                                break
+                        if not name:
+                            try:
+                                name = (await element.inner_text(timeout=1000)).splitlines()[0].strip()
+                            except Exception:
+                                continue
+                        if name and name not in seen_names and name not in SYSTEM_CHAT_NAMES:
+                            seen_names.add(name)
+                            found_names.append(name)
+                            if on_progress is not None:
+                                on_progress(len(found_names))
+                break
+    except Exception as exc:
+        logger.debug("Failed scanning group tab in friend refresh: %s", exc)
+
+
 async def collect_friend_names(page, on_progress=None):
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
     if not target_locator:
+        await _try_collect_groups(page, [], set(), on_progress=on_progress)
         return FriendScanResult()
 
     found_names = []
@@ -290,6 +349,7 @@ async def collect_friend_names(page, on_progress=None):
     while True:
         _, target_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
         if not target_locator:
+            await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
             if found_names:
                 return FriendScanResult(found_names)
             raise RuntimeError("好友列表已加载但未找到可读取的好友行")
@@ -321,6 +381,7 @@ async def collect_friend_names(page, on_progress=None):
 
         no_more_selector, _ = await _first_visible_locator(page, NO_MORE_SELECTORS)
         if no_more_selector:
+            await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
             return FriendScanResult(found_names, complete=True)
 
         loading_selector, _ = await _first_visible_locator(page, LOADING_SELECTORS)
@@ -350,6 +411,7 @@ async def collect_friend_names(page, on_progress=None):
                 continue
 
         if not scrollable_element:
+            await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
             if found_names:
                 return FriendScanResult(found_names)
             raise RuntimeError("未找到好友列表滚动容器")
@@ -374,6 +436,7 @@ async def collect_friend_names(page, on_progress=None):
             stuck_rounds=stuck_rounds,
         )
         if should_stop:
+            await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
             return FriendScanResult(found_names, complete=True)
 
 

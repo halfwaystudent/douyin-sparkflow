@@ -428,3 +428,123 @@ test("a conversation lookup exception preserves earlier sends", async () => {
   assert.equal(result.sent[1].success, false);
   assert.equal(result.sent[1].statusName, "exception");
 });
+
+test("group chat entries survive deduplication and merge by conversationId", () => {
+  const merged = mergeConversationCache(
+    [
+      {
+        nickname: "测试群聊",
+        conversationId: "group-1001",
+        conversationShortId: "1001",
+        isGroup: true,
+        conversationType: 2,
+      },
+    ],
+    [
+      {
+        nickname: "测试群聊(新名)",
+        conversationId: "group-1001",
+        conversationShortId: "1001",
+        isGroup: true,
+        conversationType: 2,
+      },
+      {
+        nickname: "二群",
+        conversationId: "group-1002",
+        conversationShortId: "1002",
+        isGroup: true,
+        conversationType: 2,
+      },
+    ],
+  );
+
+  assert.equal(merged.length, 2);
+  const group1 = merged.find((entry) => entry.conversationId === "group-1001");
+  assert.ok(group1);
+  assert.equal(group1.nickname, "测试群聊(新名)");
+  assert.equal(group1.isGroup, true);
+  assert.equal(group1.conversationType, 2);
+
+  const group2 = merged.find((entry) => entry.conversationId === "group-1002");
+  assert.ok(group2);
+  assert.equal(group2.nickname, "二群");
+});
+
+test("group chat resolves by nickname and stable conversationId", () => {
+  const lookup = buildTargetLookup([
+    {
+      nickname: "家庭群",
+      conversationId: "conv-family",
+      isGroup: true,
+    },
+    {
+      nickname: "朋友群",
+      conversationId: "conv-friends",
+      isGroup: true,
+    },
+  ]);
+
+  // Resolve by nickname
+  const resolvedByNick = resolveTargetMapping(lookup, "家庭群", {});
+  assert.ok(resolvedByNick.mapping);
+  assert.equal(resolvedByNick.mapping.conversationId, "conv-family");
+  assert.equal(resolvedByNick.reason, "unique_nickname");
+
+  // Resolve by conversationId
+  const resolvedById = resolveTargetMapping(lookup, "改名后的群", {
+    conversationId: "conv-friends",
+  });
+  assert.ok(resolvedById.mapping);
+  assert.equal(resolvedById.mapping.conversationId, "conv-friends");
+  assert.equal(resolvedById.reason, "stable_conversation_id");
+});
+
+test("sendMessages successfully dispatches to group conversations", async () => {
+  const sentMessages = [];
+  const client = {
+    updateSendMessageHeaders() {},
+    getConversation({ conversationId }) {
+      return { conversationId, type: 2 };
+    },
+    async createMessage({ content, conversation }) {
+      return { text: JSON.parse(content).text, conversation };
+    },
+    async sendMessage({ message }) {
+      sentMessages.push(message);
+      return { success: true, statusCode: 0, statusMsg: "ok" };
+    },
+  };
+  const cacheEntries = [
+    {
+      nickname: "火花互续群",
+      conversationId: "conv-spark-group",
+      isGroup: true,
+    },
+  ];
+
+  const result = await sendMessages({
+    client,
+    cacheEntries,
+    messagesByTarget: { 火花互续群: "✨今日群聊火花+1" },
+    targetIdentities: { 火花互续群: { conversationId: "conv-spark-group" } },
+    dryRun: false,
+    cookieString: "",
+    cookieMap: {},
+    sendStrategy: {
+      messageIntervalSecondsMin: 0,
+      messageIntervalSecondsMax: 0,
+    },
+    identityOverride: {
+      identitySecurityHeader: "token",
+      realDeviceId: "device",
+    },
+  });
+
+  assert.equal(result.sent.length, 1);
+  assert.equal(result.sent[0].success, true);
+  assert.equal(result.sent[0].target, "火花互续群");
+  assert.equal(result.sent[0].conversationId, "conv-spark-group");
+  assert.equal(sentMessages.length, 1);
+  assert.equal(sentMessages[0].text, "✨今日群聊火花+1");
+});
+

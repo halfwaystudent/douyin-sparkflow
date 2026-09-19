@@ -533,7 +533,7 @@ async def start_im_send_observer(page, account_name, target_name):
 
     def _call_kind(url):
         value = str(url or "")
-        if "/v1/message/send" in value:
+        if "/message/send" in value:
             return "message_send"
         if "mark_read" in value:
             return "mark_read"
@@ -762,7 +762,7 @@ async def snapshot_last_own_message(page, chat_input=None):
                     const cls = String(allRows[i].className || "");
                     if (!cls.includes("is-me")) continue;
                     if (cls.includes("time-")) continue;
-                    const pre = allRows[i].querySelector("pre, [class*='text-']");
+                    const pre = allRows[i].querySelector("pre, [class*='text-'], [class*='content-'], [class*='bubble-'], [class*='message-text']");
                     const text = String(pre?.innerText || allRows[i].innerText || "").trim();
                     if (!text) continue;
                     const rect = allRows[i].getBoundingClientRect();
@@ -810,9 +810,9 @@ async def count_today_own_message_matches(page, target_text):
                     const cls = String(allRows[i].className || "");
                     if (!cls.includes("is-me")) continue;
                     if (cls.includes("time-")) continue;
-                    const pre = allRows[i].querySelector("pre, [class*='text-']");
+                    const pre = allRows[i].querySelector("pre, [class*='text-'], [class*='content-'], [class*='bubble-'], [class*='message-text']");
                     const text = String(pre?.innerText || allRows[i].innerText || "").trim();
-                    if (text === targetText) count++;
+                    if (text === targetText || (text && targetText && text.includes(targetText))) count++;
                 }
                 return count;
             }""",
@@ -901,10 +901,15 @@ async def confirm_message_sent(page, chat_input, message, before_snapshot=None):
                 round(float(last_snapshot.get("centerY") or 0), 1),
                 round(float(last_snapshot.get("right") or 0), 1),
             )
+        last_snapshot_text = _normalize_message_text(last_snapshot.get("text") or "") if last_snapshot else ""
+        matches_sent = (
+            last_snapshot_text == expected_message
+            or (expected_message and expected_message in last_snapshot_text)
+        )
         if (
             not last_input_text
             and last_snapshot
-            and _normalize_message_text(last_snapshot.get("text")) == expected_message
+            and matches_sent
             and last_signature != before_signature
         ):
             return (
@@ -937,6 +942,12 @@ async def confirm_message_sent(page, chat_input, message, before_snapshot=None):
             "count fallback at deadline: new own message with target text appeared today",
         )
     if last_snapshot:
+        last_snapshot_text = _normalize_message_text(last_snapshot.get("text") or "")
+        if expected_message and expected_message in last_snapshot_text:
+            return (
+                True,
+                "last own message contains sent text; confirmed",
+            )
         return False, (
             "last own message did not match sent text: "
             f"expected={expected_message!r} actual={last_snapshot.get('text')!r}"
@@ -1261,6 +1272,37 @@ async def _open_friends_tab(page, account_name, fallback_selector, target_select
     return "fallback_wait_clicked"
 
 
+async def _open_all_or_groups_tab(page, account_name, target_selectors=None):
+    await _dismiss_non_login_dialogs(page, account_name, "before_open_all_or_groups_tab")
+
+    sub_app = page.locator('xpath=//*[@id="sub-app"]')
+    all_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[1]'
+    candidates = [
+        ("page tab text 群聊", page.get_by_text("群聊", exact=True)),
+        ("page tab text 群聊私信", page.get_by_text("群聊私信", exact=True)),
+        ("tab text 群聊", sub_app.get_by_text("群聊", exact=True)),
+        ("page tab text 全部", page.get_by_text("全部", exact=True)),
+        ("page tab text 全部私信", page.get_by_text("全部私信", exact=True)),
+        ("page tab text 全部消息", page.get_by_text("全部消息", exact=True)),
+        ("tab text 全部", sub_app.get_by_text("全部", exact=True)),
+        ("tab text 全部私信", sub_app.get_by_text("全部私信", exact=True)),
+        ("fallback all tab xpath", page.locator(all_tab_selector)),
+    ]
+    if await _click_first_visible_locator(candidates, account_name, "open_all_or_groups_tab"):
+        await asyncio.sleep(2)
+        return True
+
+    try:
+        if await page.locator(all_tab_selector).count() > 0:
+            await page.locator(all_tab_selector).click(timeout=5000)
+            logger.info("Account %s clicked fallback all tab after explicit check", account_name)
+            await asyncio.sleep(1)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def _reopen_friend_chat_page(page, account_name):
     logger.warning(
         "Account %s friend list did not become visible within 60s; reopening chat page once",
@@ -1502,6 +1544,7 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
     friend_index = {}
     scan_started_at = asyncio.get_running_loop().time()
     last_new_friend_at = scan_started_at
+    switched_to_groups_tab = False
     logger.debug(
         "Account %s friend list scan config maxScanSeconds=%s idleScanSeconds=%s scrollStepPx=%s scrollDelaySeconds=%s readyTimeoutSeconds=%s emptyGraceSeconds=%s",
         account_name,
@@ -1554,10 +1597,10 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                 missing_index_target_names(),
                 len(found_usernames),
             )
-            raise FriendListIncompleteError(
-                f"friend_list_incomplete for {account_name}: scan timed out after {max_scan_seconds}s; "
-                f"missingTargets={missing_target_names()}; scannedFriends={len(found_usernames)}"
-            )
+            for item in list(remaining_targets):
+                missing_delivery_targets.add(item)
+            remaining_targets.clear()
+            return
 
         await _dismiss_non_login_dialogs(page, account_name, "friend_list_scan")
         selector, target_locator = await _first_non_empty_locator(page, (active_target_selector,) + tuple(target_selectors))
@@ -1651,6 +1694,28 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
 
         else:
             if await _selector_visible(page, no_more_selectors):
+                if not switched_to_groups_tab and remaining_targets:
+                    logger.info(
+                        "Account %s reached end of current tab with remaining targets %s; switching to all/groups tab",
+                        account_name,
+                        missing_target_names(),
+                    )
+                    switched = await _open_all_or_groups_tab(page, account_name, target_selectors)
+                    if switched:
+                        switched_to_groups_tab = True
+                        last_new_friend_at = asyncio.get_running_loop().time()
+                        _, scrollable_element = await _first_scrollable_friends_element(
+                            page,
+                            scrollable_friends_selectors,
+                        )
+                        if scrollable_element:
+                            await page.evaluate(
+                                "(element) => { element.scrollTop = 0; }",
+                                scrollable_element,
+                            )
+                            await asyncio.sleep(min(scroll_delay_seconds, 1))
+                        continue
+
                 if next_target_key:
                     missing_delivery_targets.add(next_target_key)
                     remaining_targets.discard(next_target_key)
@@ -1681,7 +1746,29 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                 return
 
             now_monotonic = asyncio.get_running_loop().time()
-            if found_usernames and now_monotonic - last_new_friend_at > idle_scan_seconds:
+            if (now_monotonic - last_new_friend_at > idle_scan_seconds):
+                if not switched_to_groups_tab and remaining_targets:
+                    logger.info(
+                        "Account %s idle on current tab with remaining targets %s; switching to all/groups tab",
+                        account_name,
+                        missing_target_names(),
+                    )
+                    switched = await _open_all_or_groups_tab(page, account_name, target_selectors)
+                    if switched:
+                        switched_to_groups_tab = True
+                        last_new_friend_at = now_monotonic
+                        _, scrollable_element = await _first_scrollable_friends_element(
+                            page,
+                            scrollable_friends_selectors,
+                        )
+                        if scrollable_element:
+                            await page.evaluate(
+                                "(element) => { element.scrollTop = 0; }",
+                                scrollable_element,
+                            )
+                            await asyncio.sleep(min(scroll_delay_seconds, 1))
+                        continue
+
                 if next_target_key:
                     missing_delivery_targets.add(next_target_key)
                     remaining_targets.discard(next_target_key)
@@ -1703,6 +1790,17 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                             )
                             await asyncio.sleep(min(scroll_delay_seconds, 1))
                         continue
+                    else:
+                        persist_index(False)
+                        logger.warning(
+                            "Account %s friend list scan finished after idle timeout. Missing delivery targets: %s; missing indexed targets=%s; scannedFriends=%s",
+                            account_name,
+                            missing_target_names(),
+                            missing_index_target_names(),
+                            len(found_usernames),
+                        )
+                        return
+
                 persist_index(False)
                 logger.warning(
                     "Account %s friend list scan made no progress for %ss. Missing delivery targets: %s; missing indexed targets=%s; scannedFriends=%s",
@@ -1712,10 +1810,10 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                     missing_index_target_names(),
                     len(found_usernames),
                 )
-                raise FriendListIncompleteError(
-                    f"friend_list_incomplete for {account_name}: no new friends for {idle_scan_seconds}s; "
-                    f"missingTargets={missing_target_names()}; scannedFriends={len(found_usernames)}"
-                )
+                for item in list(remaining_targets):
+                    missing_delivery_targets.add(item)
+                remaining_targets.clear()
+                return
 
             if await _selector_visible(page, loading_selectors):
                 logger.debug("Account %s is waiting for more friends to load", account_name)

@@ -163,9 +163,14 @@ def _refs_from_record(record):
     ).strip()
     if peer_user_id:
         add(f"peer:{peer_user_id}")
+    conversation_id = str(
+        record.get("conversationId") or record.get("conversation_id") or ""
+    ).strip()
+    if conversation_id:
+        add(f"conversation:{conversation_id}")
     for item in record.get("stableKeys") or []:
         raw = str(item or "").strip()
-        if raw.startswith(("sec:", "peer:")):
+        if raw.startswith(("sec:", "peer:", "conversation:")):
             add(raw)
         if raw.startswith("data-sec-uid:"):
             value = raw.split(":", 1)[1].strip()

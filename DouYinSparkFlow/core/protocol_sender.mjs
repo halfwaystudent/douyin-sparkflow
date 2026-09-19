@@ -608,7 +608,41 @@ async function buildConversationCache({
   const cacheEntries = [];
 
   for (const conversation of conversations) {
-    if (conversation?.type !== 1) {
+    const isGroup = conversation?.type === 2 || Boolean(conversation?.isGroup);
+    if (conversation?.type !== 1 && !isGroup) {
+      continue;
+    }
+
+    if (isGroup) {
+      const groupName = (
+        conversation?.name ||
+        conversation?.coreInfo?.name ||
+        conversation?.core_info?.name ||
+        conversation?.conversationName ||
+        conversation?.ticket ||
+        ""
+      ).trim();
+      const nickname = normalizeNickname(groupName);
+      const conversationId = String(conversation?.id || "").trim();
+      if (!conversationId) {
+        continue;
+      }
+      cacheEntries.push({
+        nickname: groupName,
+        peerUserId: "",
+        secUid: "",
+        conversationId,
+        conversationShortId: conversation?.shortId !== undefined ? String(conversation?.shortId) : "",
+        isGroup: true,
+        conversationType: 2,
+        updatedAt: stableNow(),
+      });
+      if (nickname && wantedTargets.has(nickname)) {
+        matchedTargets.add(nickname);
+        if (matchedTargets.size === wantedTargets.size) {
+          break;
+        }
+      }
       continue;
     }
 
@@ -658,28 +692,36 @@ export function mergeConversationCache(existingCache, cacheEntries) {
   const deduped = new Map();
   const bySecUid = new Map();
   const byPeerUserId = new Map();
+  const byConversationId = new Map();
 
   function removeEntry(entry) {
     const secUid = String(entry?.secUid || "").trim();
     const peerUserId = String(entry?.peerUserId || "").trim();
+    const conversationId = String(entry?.conversationId || "").trim();
     if (secUid) {
       bySecUid.delete(secUid);
     }
     if (peerUserId) {
       byPeerUserId.delete(peerUserId);
     }
+    if (conversationId) {
+      byConversationId.delete(conversationId);
+    }
   }
 
   function addEntry(entry) {
     const secUid = String(entry?.secUid || "").trim();
     const peerUserId = String(entry?.peerUserId || "").trim();
-    if (!entry?.nickname || (!secUid && !peerUserId)) {
+    const conversationId = String(entry?.conversationId || "").trim();
+    const isGroup = Boolean(entry?.isGroup || (!secUid && !peerUserId && conversationId));
+    if (!entry?.nickname || (!secUid && !peerUserId && !conversationId)) {
       return;
     }
     const matches = [];
     for (const candidate of [
       secUid && bySecUid.get(secUid),
       peerUserId && byPeerUserId.get(peerUserId),
+      conversationId && byConversationId.get(conversationId),
     ]) {
       if (candidate && !matches.includes(candidate)) {
         matches.push(candidate);
@@ -693,11 +735,13 @@ export function mergeConversationCache(existingCache, cacheEntries) {
         "peerUserId",
         "conversationId",
         "conversationShortId",
+        "isGroup",
+        "conversationType",
         "updatedAt",
       ]) {
-        const value = String(existing[field] || "").trim();
-        if (value) {
-          merged[field] = existing[field];
+        const value = existing[field];
+        if (value !== undefined && value !== null && String(value).trim() !== "") {
+          merged[field] = value;
         }
       }
     }
@@ -711,15 +755,21 @@ export function mergeConversationCache(existingCache, cacheEntries) {
     }
     const mergedSecUid = String(merged.secUid || "").trim();
     const mergedPeerUserId = String(merged.peerUserId || "").trim();
-    const key = mergedSecUid
-      ? `sec:${mergedSecUid}`
-      : `peer:${mergedPeerUserId}`;
+    const mergedConversationId = String(merged.conversationId || "").trim();
+    const key = isGroup && mergedConversationId
+      ? `conv:${mergedConversationId}`
+      : (mergedSecUid
+        ? `sec:${mergedSecUid}`
+        : (mergedPeerUserId ? `peer:${mergedPeerUserId}` : `conv:${mergedConversationId}`));
     deduped.set(key, merged);
     if (mergedSecUid) {
       bySecUid.set(mergedSecUid, merged);
     }
     if (mergedPeerUserId) {
       byPeerUserId.set(mergedPeerUserId, merged);
+    }
+    if (mergedConversationId) {
+      byConversationId.set(mergedConversationId, merged);
     }
   }
 
@@ -730,7 +780,7 @@ export function mergeConversationCache(existingCache, cacheEntries) {
     addEntry(entry);
   }
   return Array.from(deduped.values()).sort((left, right) =>
-    left.nickname.localeCompare(right.nickname, "zh-CN"),
+    (left.nickname || "").localeCompare(right.nickname || "", "zh-CN"),
   );
 }
 
@@ -751,19 +801,30 @@ export function buildTargetLookup(cacheEntries) {
   const byNickname = new Map();
   const bySecUid = new Map();
   const byPeerUserId = new Map();
+  const byConversationId = new Map();
   for (const entry of cacheEntries) {
     const key = normalizeNickname(entry.nickname);
     addUniqueLookupEntry(byNickname, key, entry);
     addUniqueLookupEntry(bySecUid, entry.secUid, entry);
     addUniqueLookupEntry(byPeerUserId, entry.peerUserId, entry);
+    if (entry.conversationId) {
+      addUniqueLookupEntry(byConversationId, entry.conversationId, entry);
+    }
   }
-  return { byNickname, bySecUid, byPeerUserId };
+  return { byNickname, bySecUid, byPeerUserId, byConversationId };
 }
 
 
 export function resolveTargetMapping(lookup, target, identity = {}) {
   if (identity.ambiguous) {
     return { mapping: null, reason: "ambiguous_target" };
+  }
+  const conversationId = String(identity.conversationId || "").trim();
+  if (conversationId && lookup.byConversationId) {
+    const mapping = lookup.byConversationId.get(conversationId);
+    if (mapping) {
+      return { mapping, reason: "stable_conversation_id" };
+    }
   }
   const secUid = String(identity.secUid || "").trim();
   if (secUid) {
@@ -848,6 +909,7 @@ export async function sendMessages({
         peerUserId: mapping.peerUserId,
         conversationId: mapping.conversationId,
         conversationShortId: mapping.conversationShortId,
+        isGroup: Boolean(mapping.isGroup),
       });
 
       let delayBeforeSendSeconds = 0;
