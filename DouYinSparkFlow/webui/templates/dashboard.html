@@ -52,8 +52,12 @@
 {% block content %}
 {% set summary = ops.send_console.summary %}
 {% set total = summary.total_targets or 0 %}
-{% set confirmed = summary.today_confirmed_targets or 0 %}
-{% set progress_pct = (confirmed / total * 100)|round(0)|int if total else 0 %}
+{% set strong = summary.today_confirmed_targets or 0 %}
+{% set weak = (summary.today_page_echo_targets or 0) + (summary.today_receipt_only_targets or 0) %}
+{% set sent = strong + weak %}
+{% set strong_pct = (strong / total * 100)|round(0)|int if total else 0 %}
+{% set weak_pct = (weak / total * 100)|round(0)|int if total else 0 %}
+{% set sent_pct = strong_pct + weak_pct %}
 
 <div class="dashboard-stack" data-overview-root>
   <div
@@ -84,15 +88,20 @@
 
   <section class="overview-strip" aria-label="今日发送概览">
     <div class="overview-primary">
-      <span class="progress-badge">
-        <strong data-overview-value="progressPercent">{{ progress_pct }}%</strong>
-        <small>强确认</small>
+      <span
+        class="progress-badge"
+        style="--strong-pct: {{ strong_pct }}%; --weak-pct: {{ weak_pct }}%"
+        data-overview-badge
+      >
+        <strong data-overview-value="progressPercent">{{ sent_pct }}%</strong>
+        <small>已发送</small>
       </span>
       <div>
-        <div class="overview-label">今日确认进度</div>
-        <div class="overview-value" data-overview-value="progress">{{ confirmed }}/{{ total }}</div>
+        <div class="overview-label">今日发送进度</div>
+        <div class="overview-value" data-overview-value="progress">{{ sent }}/{{ total }}</div>
         <div class="overview-help">
-          {{ summary.enabled_accounts }} 个启用账号，共 {{ total }} 个目标
+          强确认 <b data-overview-value="confirmed">{{ strong }}</b> · 仅回显 <b data-overview-value="weakSent">{{ weak }}</b>
+          · {{ summary.enabled_accounts }} 个启用账号，共 {{ total }} 个目标
         </div>
       </div>
     </div>
@@ -121,7 +130,7 @@
   <section class="metric-grid" aria-label="今日状态分布">
     <article class="metric-card success">
       <div class="metric-label">确认成功</div>
-      <div class="metric-value" data-overview-value="confirmed">{{ confirmed }}</div>
+      <div class="metric-value" data-overview-value="confirmed">{{ strong }}</div>
       <div class="metric-help">强证据确认 · 另有 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> 个仅页面回显</div>
     </article>
     <article class="metric-card warning">
@@ -156,8 +165,11 @@
     <div class="account-summary-list">
       {% for row in ops.send_console.accounts %}
       {% set row_total = row.total_targets or 0 %}
-      {% set row_confirmed = row.confirmed_targets|length %}
-      {% set row_pct = (row_confirmed / row_total * 100)|round(0)|int if row_total else 0 %}
+      {% set row_strong = row.confirmed_targets|length %}
+      {% set row_weak = row.page_echo_count + row.receipt_only_count %}
+      {% set row_sent = row_strong + row_weak %}
+      {% set row_strong_pct = (row_strong / row_total * 100)|round(0)|int if row_total else 0 %}
+      {% set row_weak_pct = (row_weak / row_total * 100)|round(0)|int if row_total else 0 %}
       <a
         class="account-row"
         href="/ops/send-console#account-{{ row.unique_id }}"
@@ -178,10 +190,13 @@
           </span>
         </div>
         <div class="progress-line">
-          <span class="progress-track"><i style="width:{{ row_pct }}%" data-account-progress></i></span>
-          <span class="progress-text" data-account-progress-text>{{ row_confirmed }}/{{ row_total }}</span>
+          <span class="progress-track">
+            <i class="progress-strong" style="width:{{ row_strong_pct }}%" data-account-progress></i>
+            <i class="progress-echo" style="width:{{ row_weak_pct }}%" data-account-progress-echo></i>
+          </span>
+          <span class="progress-text" data-account-progress-text>已发送 {{ row_sent }}/{{ row_total }} · 强确认 {{ row_strong }}</span>
         </div>
-        <span class="summary-value"><strong data-account-confirmed>{{ row_confirmed }}</strong><small>已确认</small></span>
+        <span class="summary-value"><strong data-account-confirmed>{{ row_strong }}</strong><small>强确认</small></span>
         <span class="summary-value"><strong data-account-attention>{{ row.attention_count }}</strong><small>需处理</small></span>
         <span class="summary-value"><strong data-account-pending>{{ row.pending_count }}</strong><small>待发送</small></span>
         <i data-lucide="chevron-right"></i>
@@ -621,15 +636,18 @@
         </div>
         {% set alignment = ops.schedule_alignment %}
         <div class="schedule-alignment">
-          <p class="muted compact">
-            <strong>调度核对：</strong>
-            {% if alignment.windowEnabled %}配置窗口 {{ alignment.configLabel }}{% else %}未启用发送窗口{% if alignment.fixedLabel %}（固定 {{ alignment.fixedLabel }}）{% endif %}{% endif %}
-            —— {{ alignment.detail }}
+          <div class="alignment-row">
+            <span class="alignment-label">调度核对</span>
+            <span class="alignment-value">
+              {% if alignment.windowEnabled %}配置窗口 {{ alignment.configLabel }}{% else %}未启用发送窗口{% if alignment.fixedLabel %}（固定 {{ alignment.fixedLabel }}）{% endif %}{% endif %}
+            </span>
             {% if not alignment.aligned %}<span class="status-chip warning">需要核对</span>{% endif %}
-          </p>
+          </div>
+          <p class="muted compact">{{ alignment.detail }}</p>
           {% if alignment.missingTriggers %}
-          <p class="muted compact schedule-preview-warning">
-            ⚠ 已配置发送窗口且已过窗口开始时间，但任务日志里没有任何触发记录：请确认定时任务是否真的在执行。
+          <p class="notice-inline warning">
+            <i data-lucide="triangle-alert"></i>
+            <span>已配置发送窗口且已过窗口开始时间，但任务日志里没有任何触发记录：请确认定时任务是否真的在执行。</span>
           </p>
           {% endif %}
           {% if alignment.lines %}
@@ -648,9 +666,9 @@
         </div>
         {% set window_state = schedule_window_state() %}
         {% if window_state.inside %}
-        <p class="muted compact schedule-preview-warning">
-          ⚠ 现在是发送窗口 {{ window_state.label }} 内（到 {{ "%02d"|format(window_state.endHour) }}:00 结束），
-          窗口配置在此期间不可修改；窗口结束后再改即可。
+        <p class="notice-inline warning">
+          <i data-lucide="triangle-alert"></i>
+          <span>现在是发送窗口 {{ window_state.label }} 内（到 {{ "%02d"|format(window_state.endHour) }}:00 结束），窗口配置在此期间不可修改；窗口结束后再改即可。</span>
         </p>
         {% endif %}
         <form method="post" action="/ops/schedule" class="stack-form section-form" data-schedule-preview-url="/ops/schedule/preview">

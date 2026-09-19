@@ -810,6 +810,8 @@ html[data-theme="light"] .theme-dark-icon {
 }
 
 .progress-badge {
+  --strong-pct: 0%;
+  --weak-pct: 0%;
   width: 68px;
   height: 68px;
   border-radius: 50%;
@@ -817,11 +819,33 @@ html[data-theme="light"] .theme-dark-icon {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  color: #fff;
-  background: var(--fire-grad);
-  box-shadow: 0 4px 16px rgba(242, 106, 61, 0.35);
+  color: var(--text);
+  /* Strong confirmations keep the orange accent; sends that only produced weak
+     evidence (page echo / receipt without a bubble) fill in yellow, so a day
+     that only produced weak evidence no longer reads as an empty ring. */
+  background: conic-gradient(
+    from -90deg,
+    var(--primary) 0 var(--strong-pct),
+    var(--warning) var(--strong-pct) calc(var(--strong-pct) + var(--weak-pct)),
+    var(--surface-soft) calc(var(--strong-pct) + var(--weak-pct)) 100%
+  );
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
   font-variant-numeric: tabular-nums;
   position: relative;
+}
+
+.progress-badge::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  background: var(--surface-solid);
+}
+
+.progress-badge strong,
+.progress-badge small {
+  position: relative;
+  z-index: 1;
 }
 
 .progress-badge strong {
@@ -1118,15 +1142,35 @@ tbody tr:hover td {
   border-radius: 999px;
   background: var(--surface-soft);
   overflow: hidden;
+  display: flex;
 }
 
 .progress-track > i {
   display: block;
   height: 100%;
+  transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.progress-track > i:first-child {
+  border-radius: 999px 0 0 999px;
+}
+
+.progress-track > i:last-child {
+  border-radius: 0 999px 999px 0;
+}
+
+.progress-track > i:only-child {
   border-radius: inherit;
+}
+
+.progress-strong {
   background: var(--fire-grad);
   box-shadow: 0 0 8px rgba(242, 106, 61, 0.5);
-  transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.progress-echo {
+  background: var(--warning);
+  box-shadow: 0 0 8px rgba(247, 144, 9, 0.45);
 }
 
 .progress-text {
@@ -1135,6 +1179,50 @@ tbody tr:hover td {
   font-weight: 650;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.schedule-alignment {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.alignment-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.alignment-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.alignment-value {
+  font-weight: 650;
+}
+
+.notice-inline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-md, 9px);
+  border-left: 3px solid var(--warning);
+  background: var(--warning-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.notice-inline > svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  color: var(--warning);
 }
 
 .summary-value {

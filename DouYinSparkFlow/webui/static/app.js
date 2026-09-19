@@ -223,14 +223,23 @@
         row.querySelectorAll("[data-account-pending]").forEach((node) => {
           node.textContent = account.pending;
         });
+        const strongCount = account.confirmed || 0;
+        const weakCount = (account.pageEcho || 0) + (account.receiptOnly || 0);
+        const accountTotal = account.total || 0;
+        const strongPct = accountTotal
+          ? Math.round((strongCount / accountTotal) * 100)
+          : 0;
+        const weakPct = accountTotal
+          ? Math.round((weakCount / accountTotal) * 100)
+          : 0;
         row.querySelectorAll("[data-account-progress]").forEach((node) => {
-          const pct = account.total
-            ? Math.round((account.confirmed / account.total) * 100)
-            : 0;
-          node.style.width = `${pct}%`;
+          node.style.width = `${strongPct}%`;
+        });
+        row.querySelectorAll("[data-account-progress-echo]").forEach((node) => {
+          node.style.width = `${weakPct}%`;
         });
         row.querySelectorAll("[data-account-progress-text]").forEach((node) => {
-          node.textContent = `${account.confirmed}/${account.total}`;
+          node.textContent = `已发送 ${strongCount + weakCount}/${accountTotal} · 强确认 ${strongCount}`;
         });
       });
     });
@@ -273,16 +282,28 @@
       (summary.pending || 0) + (summary.unprocessed || 0),
     );
     setText("[data-overview-value='remaining']", summary.remaining || 0);
+    const strongCount = summary.confirmed || 0;
+    const weakCount = (summary.pageEcho || 0) + (summary.receiptOnly || 0);
+    const totalCount = summary.total || 0;
+    const strongPct = totalCount
+      ? Math.round((strongCount / totalCount) * 100)
+      : 0;
+    const weakPct = totalCount
+      ? Math.round((weakCount / totalCount) * 100)
+      : 0;
     setText(
       "[data-overview-value='progress']",
-      `${summary.confirmed || 0}/${summary.total || 0}`,
+      `${strongCount + weakCount}/${totalCount}`,
     );
     setText(
       "[data-overview-value='progressPercent']",
-      summary.total
-        ? `${Math.round((summary.confirmed / summary.total) * 100)}%`
-        : "0%",
+      `${strongPct + weakPct}%`,
     );
+    setText("[data-overview-value='weakSent']", weakCount);
+    document.querySelectorAll("[data-overview-badge]").forEach((node) => {
+      node.style.setProperty("--strong-pct", `${strongPct}%`);
+      node.style.setProperty("--weak-pct", `${weakPct}%`);
+    });
     setText(
       "[data-overview-value='lastConfirmedAt']",
       formatTime(summary.lastConfirmedAt),
