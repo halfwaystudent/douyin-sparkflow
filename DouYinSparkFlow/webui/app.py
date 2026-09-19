@@ -37,6 +37,7 @@ from core.friends import (
     verify_account_session,
 )
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
+from core.protocol_dispatch import run_protocol_tasks
 from core.tasks import (
     _append_streak_run_report,
     record_friend_scan,
@@ -290,6 +291,27 @@ def mark_target_unconfirmed(
     account["message_history"] = history
     account["failure_queue"] = queue
     return True
+
+
+def manual_retry_config(config):
+    """Config for a single-target manual retry: one task, no anti-burst delay."""
+    retry_config = dict(config)
+    retry_config["taskCount"] = 1
+    strategy = dict(retry_config.get("sendStrategy") or {})
+    strategy["accountStartDelaySecondsMin"] = 0
+    strategy["accountStartDelaySecondsMax"] = 0
+    retry_config["sendStrategy"] = strategy
+    return retry_config
+
+
+def manual_retry_channel(config):
+    """Sender a manual retry must use, mirroring ``_split_sender_modes``.
+
+    A retry that always drove the browser would contradict a protocol-primary
+    deployment and record evidence the operator cannot trust, so the channel is
+    derived from the same switch the scheduled run uses.
+    """
+    return "protocol" if config.get("useProtocolSender", True) else "browser"
 
 
 def login_desktop_api_url():
@@ -1711,8 +1733,8 @@ def create_app():
 
         account_copy = dict(account)
         account_copy["targets"] = [target_name]
-        config = get_config(force_reload=True)
-        config["taskCount"] = 1
+        config = manual_retry_config(get_config(force_reload=True))
+        channel = manual_retry_channel(config)
         run_id = uuid.uuid4().hex
         started_at = datetime.now(timezone.utc)
         run_status = "completed"
@@ -1720,12 +1742,24 @@ def create_app():
         try:
             try:
                 with task_run_lock():
-                    await run_browser_tasks(
-                        config,
-                        [account_copy],
-                        run_id=run_id,
-                        allow_retry=True,
-                    )
+                    # The retry has to use the same channel as the scheduled run;
+                    # a browser-only retry would contradict a protocol-primary
+                    # deployment and record evidence the operator cannot trust.
+                    if channel == "protocol":
+                        await run_protocol_tasks(
+                            config,
+                            [account_copy],
+                            None,
+                            run_id=run_id,
+                            allow_retry=True,
+                        )
+                    else:
+                        await run_browser_tasks(
+                            config,
+                            [account_copy],
+                            run_id=run_id,
+                            allow_retry=True,
+                        )
             except Exception as exc:
                 run_status = "failed"
                 flash(request, f"Retry failed for {account.get('username', 'Account')} / {target_name}: {exc}", "error")

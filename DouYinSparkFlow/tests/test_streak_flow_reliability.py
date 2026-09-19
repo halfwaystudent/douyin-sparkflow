@@ -3564,13 +3564,18 @@ class StreakTaskIntegrationTests(unittest.TestCase):
             patch.object(
                 web_app,
                 "get_config",
-                return_value={"taskCount": 1},
+                return_value={"taskCount": 1, "useProtocolSender": False},
             ),
             patch.object(
                 web_app,
                 "run_browser_tasks",
                 new=AsyncMock(),
             ) as run_browser,
+            patch.object(
+                web_app,
+                "run_protocol_tasks",
+                new=AsyncMock(),
+            ) as run_protocol,
             patch.object(
                 web_app,
                 "get_userData",
@@ -3589,6 +3594,7 @@ class StreakTaskIntegrationTests(unittest.TestCase):
 
         self.assertEqual(303, response.status_code)
         run_browser.assert_awaited_once()
+        run_protocol.assert_not_called()
         append_report.assert_called_once()
         self.assertEqual(
             run_browser.await_args.kwargs["run_id"],
@@ -3598,6 +3604,54 @@ class StreakTaskIntegrationTests(unittest.TestCase):
             "completed",
             append_report.call_args.kwargs["run_status"],
         )
+
+    def test_manual_target_retry_uses_the_protocol_channel_when_enabled(self):
+        from webui import app as web_app
+
+        account = {
+            "account_ref": "acc-1",
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        client = TestClient(web_app.app)
+
+        with (
+            patch.object(
+                web_app,
+                "current_principal",
+                return_value={"role": "admin", "username": "admin"},
+            ),
+            patch.object(web_app, "validate_csrf", return_value=True),
+            patch.object(web_app, "ensure_account_refs", side_effect=lambda accounts: (accounts, False)),
+            patch.object(web_app, "account_by_unique_id", return_value=account),
+            patch.object(web_app, "can_access_account", return_value=True),
+            patch.object(web_app, "task_run_lock_status", return_value={"running": False}),
+            patch.object(web_app, "task_run_lock", return_value=nullcontext()),
+            patch.object(
+                web_app,
+                "get_config",
+                return_value={"taskCount": 1, "useProtocolSender": True},
+            ),
+            patch.object(web_app, "run_browser_tasks", new=AsyncMock()) as run_browser,
+            patch.object(web_app, "run_protocol_tasks", new=AsyncMock()) as run_protocol,
+            patch.object(web_app, "get_userData", return_value=[account]),
+            patch.object(web_app, "_append_streak_run_report"),
+        ):
+            response = client.post(
+                "/accounts/1001/retry-target",
+                data={"target": "Alice", "csrf_token": "test"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, response.status_code)
+        run_protocol.assert_awaited_once()
+        run_browser.assert_not_called()
+        kwargs = run_protocol.await_args.kwargs
+        self.assertTrue(kwargs["allow_retry"])
+        self.assertEqual([account["unique_id"]], [run_protocol.await_args.args[1][0]["unique_id"]])
+        self.assertEqual(["Alice"], run_protocol.await_args.args[1][0]["targets"])
 
     def test_browser_in_flight_claim_rejects_confirmed_target(self):
         account = {
@@ -4335,6 +4389,144 @@ class StreakTaskIntegrationTests(unittest.TestCase):
             "confirmed",
             account["message_history"]["Alice"]["status"],
         )
+
+
+class ManualRetryChannelTests(unittest.TestCase):
+    """A manual single-target retry must follow the configured send channel."""
+
+    def test_protocol_is_used_when_the_switch_is_on(self):
+        from webui import app as web_app
+
+        self.assertEqual(
+            "protocol",
+            web_app.manual_retry_channel({"useProtocolSender": True}),
+        )
+
+    def test_browser_is_used_when_the_switch_is_off(self):
+        from webui import app as web_app
+
+        self.assertEqual(
+            "browser",
+            web_app.manual_retry_channel({"useProtocolSender": False}),
+        )
+
+    def test_missing_switch_matches_the_scheduled_default(self):
+        from webui import app as web_app
+
+        # _split_sender_modes reads the same key with the same default.
+        self.assertEqual("protocol", web_app.manual_retry_channel({}))
+
+    def test_retry_config_drops_the_anti_burst_delay_and_keeps_the_rest(self):
+        from webui import app as web_app
+
+        config = {
+            "taskCount": 4,
+            "multiTask": True,
+            "useProtocolSender": True,
+            "sendStrategy": {
+                "shuffleTargets": False,
+                "accountStartDelaySecondsMin": 60,
+                "accountStartDelaySecondsMax": 180,
+                "messageIntervalSecondsMin": 45,
+            },
+        }
+
+        retry_config = web_app.manual_retry_config(config)
+
+        self.assertEqual(1, retry_config["taskCount"])
+        self.assertEqual(0, retry_config["sendStrategy"]["accountStartDelaySecondsMin"])
+        self.assertEqual(0, retry_config["sendStrategy"]["accountStartDelaySecondsMax"])
+        self.assertFalse(retry_config["sendStrategy"]["shuffleTargets"])
+        self.assertEqual(45, retry_config["sendStrategy"]["messageIntervalSecondsMin"])
+        self.assertTrue(retry_config["multiTask"])
+        # The caller's config is not mutated in place.
+        self.assertEqual(60, config["sendStrategy"]["accountStartDelaySecondsMin"])
+
+
+class ProtocolRetryClaimTests(unittest.TestCase):
+    """The protocol sender must be able to re-claim a target already sent today."""
+
+    def _account(self):
+        account = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["Alice"],
+            "cookies": [{"name": "sessionid", "value": "x"}],
+        }
+        # The claim helper uses the real clock, so "today" has to be the real day.
+        streak_state.mark_sent_unverified(
+            account,
+            "Alice",
+            strategy="browser",
+            now=datetime.now(timezone.utc),
+            detail="page echo only",
+        )
+        return account
+
+    def _claim(self, *, allow_retry):
+        accounts = [self._account()]
+        with patch.object(
+            protocol_dispatch,
+            "update_user_data",
+            side_effect=StreakTaskIntegrationTests._update_side_effect(accounts),
+        ):
+            claimed = protocol_dispatch._mark_protocol_targets_in_flight(
+                dict(accounts[0]),
+                "run-retry",
+                allow_retry=allow_retry,
+            )
+        return claimed, accounts[0]
+
+    def test_retry_claims_a_target_that_was_already_sent_today(self):
+        claimed, account = self._claim(allow_retry=True)
+
+        self.assertEqual(["Alice"], claimed)
+        state = streak_state.target_state(account, "Alice", datetime.now(timezone.utc))
+        self.assertEqual(streak_state.STATE_IN_FLIGHT, state["status"])
+        self.assertEqual("run-retry", state["runId"])
+
+    def test_scheduled_claim_still_refuses_an_already_sent_target(self):
+        claimed, account = self._claim(allow_retry=False)
+
+        self.assertEqual([], claimed)
+        state = streak_state.target_state(account, "Alice", datetime.now(timezone.utc))
+        self.assertEqual(streak_state.STATE_SENT_UNVERIFIED, state["status"])
+
+
+class ProtocolFailureLabelTests(unittest.TestCase):
+    """Protocol failure categories must read as their real meaning in the panel."""
+
+    def test_self_visible_is_labelled_as_not_delivered(self):
+        self.assertEqual(
+            "仅自己可见（对方未收到）",
+            web_ops.FAILURE_CATEGORY_LABELS["protocol_check_message_self_visible"],
+        )
+
+    def test_finalized_status_uses_that_label(self):
+        item = web_ops._finalize_target_status(
+            {
+                "status": "failed",
+                "category": "protocol_check_message_self_visible",
+                "reason": "statusCode=4",
+            },
+            NOW,
+        )
+
+        self.assertEqual("仅自己可见（对方未收到）", item["categoryLabel"])
+
+    def test_every_protocol_category_has_a_label(self):
+        for category in (
+            "protocol_check_message_not_pass",
+            "protocol_check_message_self_visible",
+            "protocol_check_conversation_not_pass",
+            "protocol_user_blocked",
+            "protocol_user_not_in_conversation",
+            "protocol_send_failed",
+            "protocol_unresolved",
+            "protocol_sender_failed",
+        ):
+            with self.subTest(category=category):
+                self.assertIn(category, web_ops.FAILURE_CATEGORY_LABELS)
 
 
 if __name__ == "__main__":

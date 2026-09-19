@@ -409,7 +409,7 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
     update_user_data(mutate, force_reload=True)
 
 
-def _mark_protocol_targets_in_flight(user, run_id):
+def _mark_protocol_targets_in_flight(user, run_id, *, allow_retry=False):
     now = datetime.now(timezone.utc)
 
     def mutate(accounts):
@@ -424,6 +424,7 @@ def _mark_protocol_targets_in_flight(user, run_id):
                 run_id=run_id,
                 strategy="protocol",
                 now=now,
+                allow_retry=allow_retry,
             )
             if (
                 claimed
@@ -607,7 +608,7 @@ def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
     return data
 
 
-async def run_protocol_tasks(config, accounts, message_builder, run_id=""):
+async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, allow_retry=False):
     del message_builder
 
     dry_run = bool(config.get("protocolDryRun", False))
@@ -632,7 +633,11 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id=""):
 
             logger.info("Starting protocol sender for %s", user.get("username", "unknown"))
             if run_id and not dry_run:
-                claimed_targets = _mark_protocol_targets_in_flight(user, run_id)
+                claimed_targets = _mark_protocol_targets_in_flight(
+                    user,
+                    run_id,
+                    allow_retry=allow_retry,
+                )
                 if claimed_targets is None:
                     raise RuntimeError(
                         f"unable to claim protocol targets for {user.get('username', 'unknown')}"

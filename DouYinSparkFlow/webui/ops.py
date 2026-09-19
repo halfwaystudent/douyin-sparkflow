@@ -72,6 +72,12 @@ FAILURE_CATEGORY_LABELS = {
     "browser_crash": "浏览器异常",
     "protocol_user_blocked": "对方限制私信",
     "protocol_user_not_in_conversation": "不在会话中",
+    "protocol_check_message_not_pass": "消息未通过校验",
+    "protocol_check_message_self_visible": "仅自己可见（对方未收到）",
+    "protocol_check_conversation_not_pass": "会话未通过校验",
+    "protocol_send_failed": "协议发送失败",
+    "protocol_unresolved": "协议找不到会话",
+    "protocol_sender_failed": "协议发送器异常",
 }
 
 
