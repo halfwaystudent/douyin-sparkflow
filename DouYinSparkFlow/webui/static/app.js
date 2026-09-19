@@ -1170,7 +1170,7 @@ window.addEventListener("DOMContentLoaded", () => {
     appendLine(`一轮预计耗时（估算）：${data.estimatedRunDisplay || "-"}`);
     appendLine(`当前目标数：${data.targetCount || 0}`);
     (data.warnings || []).forEach((text) => {
-      appendLine(`⚠ ${text}`, "schedule-preview-warning");
+      appendLine(text, "notice-inline warning");
     });
   };
 

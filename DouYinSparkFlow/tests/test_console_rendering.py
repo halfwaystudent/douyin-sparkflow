@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from webui import app as app_module
 
@@ -156,7 +157,7 @@ class DashboardProgressRenderingTests(unittest.TestCase):
         self.assertIn('data-overview-value="progress">11/11<', html)
         self.assertIn("已发送 8/8 · 强确认 0", html)
         self.assertIn("progress-echo", html)
-        self.assertIn("仅回显 <b data-overview-value=\"weakSent\">11</b>", html)
+        self.assertIn("弱证据 <b data-overview-value=\"weakSent\">11</b>", html)
 
     def test_mixed_evidence_splits_the_bar_and_the_percentage(self):
         summary = _summary(
@@ -196,6 +197,21 @@ class DashboardProgressRenderingTests(unittest.TestCase):
         self.assertIn("--strong-pct: 100%", html)
         self.assertIn("--weak-pct: 0%", html)
         self.assertIn("已发送 8/8 · 强确认 8", html)
+
+    def test_half_up_rounding_matches_the_live_refresh(self):
+        # 1/8 = 12.5% must render 13%, the same way app.js Math.round does,
+        # otherwise the server-rendered ring and the polled refresh disagree.
+        summary = _summary(total_targets=8, today_confirmed_targets=1)
+        account = _account_row(
+            total_targets=8,
+            confirmed_targets=[{"status": "sent"}],
+        )
+
+        html = self._render(summary, [account])
+
+        self.assertIn("--strong-pct: 13%", html)
+        self.assertIn("--weak-pct: 0%", html)
+        self.assertIn('data-overview-value="progress">1/8<', html)
 
     def test_ops_panel_drops_the_dash_and_warning_glyph(self):
         summary = _summary(total_targets=1, today_confirmed_targets=1)
@@ -244,6 +260,14 @@ class DashboardProgressRenderingTests(unittest.TestCase):
         self.assertNotIn("⚠", html)
         self.assertIn("现在是发送窗口", html)
         self.assertIn("窗口配置在此期间不可修改", html)
+
+
+    def test_static_assets_no_longer_ship_the_warning_glyph(self):
+        root = Path(app_module.TEMPLATES_DIR).parents[0]
+        for name in ("templates/dashboard.html", "static/app.js", "static/app.css"):
+            with self.subTest(asset=name):
+                text = (root / name).read_text(encoding="utf-8")
+                self.assertNotIn("⚠", text)
 
 
 if __name__ == "__main__":

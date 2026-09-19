@@ -1,6 +1,6 @@
 /* ==========================================================================
    DouYin SparkFlow - Modern Glassmorphism & Micro-Glow Theme
-   Version: 20260918
+   Version: 20260919
    ========================================================================== */
 
 :root {
@@ -830,6 +830,7 @@ html[data-theme="light"] .theme-dark-icon {
     var(--surface-soft) calc(var(--strong-pct) + var(--weak-pct)) 100%
   );
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border);
   font-variant-numeric: tabular-nums;
   position: relative;
 }
@@ -1170,7 +1171,8 @@ tbody tr:hover td {
 
 .progress-echo {
   background: var(--warning);
-  box-shadow: 0 0 8px rgba(247, 144, 9, 0.45);
+  /* A hairline keeps the orange and amber segments readable next to each other. */
+  box-shadow: inset 1px 0 0 var(--surface-solid), 0 0 8px rgba(247, 144, 9, 0.45);
 }
 
 .progress-text {

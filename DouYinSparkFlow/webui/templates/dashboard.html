@@ -55,8 +55,9 @@
 {% set strong = summary.today_confirmed_targets or 0 %}
 {% set weak = (summary.today_page_echo_targets or 0) + (summary.today_receipt_only_targets or 0) %}
 {% set sent = strong + weak %}
-{% set strong_pct = (strong / total * 100)|round(0)|int if total else 0 %}
-{% set weak_pct = (weak / total * 100)|round(0)|int if total else 0 %}
+{# Half-up rounding, so the server-rendered numbers match app.js Math.round(). #}
+{% set strong_pct = ((strong * 100 / total) + 0.5)|round(0, 'floor')|int if total else 0 %}
+{% set weak_pct = ((weak * 100 / total) + 0.5)|round(0, 'floor')|int if total else 0 %}
 {% set sent_pct = strong_pct + weak_pct %}
 
 <div class="dashboard-stack" data-overview-root>
@@ -100,7 +101,7 @@
         <div class="overview-label">今日发送进度</div>
         <div class="overview-value" data-overview-value="progress">{{ sent }}/{{ total }}</div>
         <div class="overview-help">
-          强确认 <b data-overview-value="confirmed">{{ strong }}</b> · 仅回显 <b data-overview-value="weakSent">{{ weak }}</b>
+          强确认 <b data-overview-value="confirmed">{{ strong }}</b> · 弱证据 <b data-overview-value="weakSent">{{ weak }}</b>
           · {{ summary.enabled_accounts }} 个启用账号，共 {{ total }} 个目标
         </div>
       </div>
@@ -166,10 +167,10 @@
       {% for row in ops.send_console.accounts %}
       {% set row_total = row.total_targets or 0 %}
       {% set row_strong = row.confirmed_targets|length %}
-      {% set row_weak = row.page_echo_count + row.receipt_only_count %}
+      {% set row_weak = (row.page_echo_count or 0) + (row.receipt_only_count or 0) %}
       {% set row_sent = row_strong + row_weak %}
-      {% set row_strong_pct = (row_strong / row_total * 100)|round(0)|int if row_total else 0 %}
-      {% set row_weak_pct = (row_weak / row_total * 100)|round(0)|int if row_total else 0 %}
+      {% set row_strong_pct = ((row_strong * 100 / row_total) + 0.5)|round(0, 'floor')|int if row_total else 0 %}
+      {% set row_weak_pct = ((row_weak * 100 / row_total) + 0.5)|round(0, 'floor')|int if row_total else 0 %}
       <a
         class="account-row"
         href="/ops/send-console#account-{{ row.unique_id }}"
