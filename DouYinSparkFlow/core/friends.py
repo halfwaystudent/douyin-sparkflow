@@ -67,6 +67,8 @@ FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # child indexes change frequently.  Keep semantic/current selectors first, with
 # the historical XPath selectors last for older page variants.
 FRIEND_ROW_SELECTORS = (
+    '#sub-app [role="gridcell"]:has([class*="item-header-name-"])',
+    '#sub-app [class*="list-item"]:has([class*="item-header-name-"])',
     '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
     '#sub-app li.semi-list-item:has([class*="item-header-name-"])',
     'xpath=//*[@id="sub-app"]//div[contains(@class, "semi-list-item-body") and .//*[contains(@class, "item-header-name-")]]',
@@ -293,10 +295,51 @@ SYSTEM_CHAT_NAMES = {
 }
 
 
+async def _extract_visible_names_fast(page):
+    try:
+        names = await page.evaluate("""() => {
+            const nodes = document.querySelectorAll('#sub-app [class*="item-header-name"]');
+            return Array.from(nodes).map(n => (n.innerText || '').trim()).filter(Boolean);
+        }""")
+        if isinstance(names, list) and names:
+            return names
+    except Exception:
+        pass
+    return []
+
+
+async def _scroll_list_fast(page, scrollable_element=None, step=800):
+    try:
+        res = await page.evaluate("""(s) => {
+            const grid = document.querySelector('#sub-app [role="grid"], #sub-app .ReactVirtualized__Grid, #sub-app ul > div');
+            if (!grid) return null;
+            const before = grid.scrollTop;
+            grid.scrollTop += s;
+            return { moved: grid.scrollTop > before, before, after: grid.scrollTop };
+        }""", step)
+        if isinstance(res, dict) and "moved" in res:
+            return res.get("moved", False), res.get("before", 0), res.get("after", 0)
+    except Exception:
+        pass
+    if scrollable_element:
+        try:
+            before = await page.evaluate("(el) => el.scrollTop", scrollable_element)
+            await page.evaluate(f"(el) => {{ el.scrollTop += {step}; }}", scrollable_element)
+            await asyncio.sleep(0.5)
+            after = await page.evaluate("(el) => el.scrollTop", scrollable_element)
+            return after > before, before, after
+        except Exception:
+            pass
+    return False, 0, 0
+
+
 async def _try_collect_groups(page, found_names, seen_names, on_progress=None):
     try:
         sub_app = page.locator('xpath=//*[@id="sub-app"]')
         group_tab_candidates = [
+            page.get_by_role("tab", name="群消息", exact=True),
+            page.get_by_text("群消息", exact=True),
+            sub_app.get_by_text("群消息", exact=True),
             page.get_by_role("tab", name="群聊", exact=True),
             page.get_by_role("tab", name="群聊私信", exact=True),
             sub_app.get_by_text("群聊", exact=True),
@@ -305,29 +348,53 @@ async def _try_collect_groups(page, found_names, seen_names, on_progress=None):
         for candidate in group_tab_candidates:
             if await candidate.count() > 0 and await candidate.first.is_visible():
                 await candidate.first.click(timeout=3000)
-                await asyncio.sleep(1)
-                _, group_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
-                if group_locator:
-                    group_elements = await group_locator.all()
-                    for element in group_elements:
-                        name = ""
-                        for selector in FRIEND_NAME_SELECTORS:
-                            try:
-                                name = (await element.locator(selector).first.inner_text(timeout=1000)).strip()
-                            except Exception:
-                                continue
-                            if name:
-                                break
-                        if not name:
-                            try:
-                                name = (await element.inner_text(timeout=1000)).splitlines()[0].strip()
-                            except Exception:
-                                continue
-                        if name and name not in seen_names and name not in SYSTEM_CHAT_NAMES:
-                            seen_names.add(name)
-                            found_names.append(name)
-                            if on_progress is not None:
-                                on_progress(len(found_names))
+                await asyncio.sleep(0.8)
+                idle_rounds = 0
+                for _ in range(12):
+                    fast_names = await _extract_visible_names_fast(page)
+                    added = 0
+                    if fast_names:
+                        for name in fast_names:
+                            if name and name not in seen_names and name not in SYSTEM_CHAT_NAMES:
+                                seen_names.add(name)
+                                found_names.append(name)
+                                added += 1
+                    else:
+                        _, group_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
+                        if group_locator:
+                            for element in await group_locator.all():
+                                name = ""
+                                for selector in FRIEND_NAME_SELECTORS:
+                                    try:
+                                        name = (await element.locator(selector).first.inner_text(timeout=500)).strip()
+                                    except Exception:
+                                        continue
+                                    if name:
+                                        break
+                                if not name:
+                                    try:
+                                        name = (await element.inner_text(timeout=500)).splitlines()[0].strip()
+                                    except Exception:
+                                        continue
+                                if name and name not in seen_names and name not in SYSTEM_CHAT_NAMES:
+                                    seen_names.add(name)
+                                    found_names.append(name)
+                                    added += 1
+
+                    if on_progress is not None and added > 0:
+                        on_progress(len(found_names))
+
+                    if added == 0:
+                        idle_rounds += 1
+                        if idle_rounds >= 2:
+                            break
+                    else:
+                        idle_rounds = 0
+
+                    moved, _, _ = await _scroll_list_fast(page, step=600)
+                    if not moved:
+                        break
+                    await asyncio.sleep(0.5)
                 break
     except Exception as exc:
         logger.debug("Failed scanning group tab in friend refresh: %s", exc)
@@ -337,44 +404,53 @@ async def collect_friend_names(page, on_progress=None):
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
-    if not target_locator:
-        await _try_collect_groups(page, [], set(), on_progress=on_progress)
-        return FriendScanResult()
-
     found_names = []
     seen_names = set()
+
+    if not target_locator:
+        await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
+        return FriendScanResult(found_names, complete=True)
+
     idle_rounds = 0
     stuck_rounds = 0
 
     while True:
-        _, target_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
-        if not target_locator:
-            await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
-            if found_names:
-                return FriendScanResult(found_names)
-            raise RuntimeError("好友列表已加载但未找到可读取的好友行")
-
-        target_elements = await target_locator.all()
         new_names_count = 0
-        for element in target_elements:
-            name = ""
-            for selector in FRIEND_NAME_SELECTORS:
-                try:
-                    name = (await element.locator(selector).first.inner_text(timeout=1000)).strip()
-                except Exception:
+        fast_names = await _extract_visible_names_fast(page)
+        if fast_names:
+            for name in fast_names:
+                if name and name not in seen_names and name not in SYSTEM_CHAT_NAMES:
+                    seen_names.add(name)
+                    found_names.append(name)
+                    new_names_count += 1
+        else:
+            _, target_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
+            if not target_locator:
+                await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
+                if found_names:
+                    return FriendScanResult(found_names)
+                raise RuntimeError("好友列表已加载但未找到可读取的好友行")
+
+            target_elements = await target_locator.all()
+            for element in target_elements:
+                name = ""
+                for selector in FRIEND_NAME_SELECTORS:
+                    try:
+                        name = (await element.locator(selector).first.inner_text(timeout=500)).strip()
+                    except Exception:
+                        continue
+                    if name:
+                        break
+                if not name:
+                    try:
+                        name = (await element.inner_text(timeout=500)).splitlines()[0].strip()
+                    except Exception:
+                        continue
+                if not name or name in seen_names or name in SYSTEM_CHAT_NAMES:
                     continue
-                if name:
-                    break
-            if not name:
-                try:
-                    name = (await element.inner_text(timeout=1000)).splitlines()[0].strip()
-                except Exception:
-                    continue
-            if not name or name in seen_names:
-                continue
-            seen_names.add(name)
-            found_names.append(name)
-            new_names_count += 1
+                seen_names.add(name)
+                found_names.append(name)
+                new_names_count += 1
 
         if on_progress is not None:
             on_progress(len(found_names))
@@ -386,52 +462,47 @@ async def collect_friend_names(page, on_progress=None):
 
         loading_selector, _ = await _first_visible_locator(page, LOADING_SELECTORS)
         if loading_selector:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
-        scrollable_element = None
-        scrollable_selector = ""
-        for selector in SCROLLABLE_FRIENDS_SELECTORS:
-            try:
-                candidate = page.locator(selector).first
-                handle = await candidate.element_handle()
-                if not handle:
+        # Try fast scroll first
+        moved, before_top, after_top = await _scroll_list_fast(page, step=800)
+        if not moved:
+            # Fallback to candidate handles if fast scroll did not find grid
+            scrollable_element = None
+            scrollable_selector = ""
+            for selector in SCROLLABLE_FRIENDS_SELECTORS:
+                try:
+                    candidate = page.locator(selector).first
+                    if await candidate.count() == 0:
+                        continue
+                    handle = await candidate.element_handle(timeout=1000)
+                    if not handle:
+                        continue
+                    metrics = await page.evaluate(
+                        """(element) => ({
+                            clientHeight: element.clientHeight,
+                            scrollHeight: element.scrollHeight,
+                        })""",
+                        handle,
+                    )
+                    if int(metrics.get("clientHeight") or 0) > 0:
+                        scrollable_element = handle
+                        scrollable_selector = selector
+                        break
+                except Exception:
                     continue
-                metrics = await page.evaluate(
-                    """(element) => ({
-                        clientHeight: element.clientHeight,
-                        scrollHeight: element.scrollHeight,
-                    })""",
-                    handle,
-                )
-                if int(metrics.get("clientHeight") or 0) > 0:
-                    scrollable_element = handle
-                    scrollable_selector = selector
-                    break
-            except Exception:
-                continue
 
-        if not scrollable_element:
-            await _try_collect_groups(page, found_names, seen_names, on_progress=on_progress)
-            if found_names:
-                return FriendScanResult(found_names)
-            raise RuntimeError("未找到好友列表滚动容器")
-
-        before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
-        await page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
-        await asyncio.sleep(1.5)
-        after_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
-        logger.debug(
-            "Friend list refresh scroll selector=%s before=%s after=%s names=%s",
-            scrollable_selector,
-            before_top,
-            after_top,
-            len(found_names),
-        )
+            if scrollable_element:
+                before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
+                await page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
+                await asyncio.sleep(1.0)
+                after_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
+                moved = after_top > before_top
 
         should_stop, idle_rounds, stuck_rounds = update_collection_progress(
             new_names_count=new_names_count,
             no_more_visible=False,
-            scroll_moved=after_top > before_top,
+            scroll_moved=moved,
             idle_rounds=idle_rounds,
             stuck_rounds=stuck_rounds,
         )

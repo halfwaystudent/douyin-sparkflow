@@ -1278,6 +1278,8 @@ async def _open_all_or_groups_tab(page, account_name, target_selectors=None):
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     all_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[1]'
     candidates = [
+        ("page tab text 群消息", page.get_by_text("群消息", exact=True)),
+        ("tab text 群消息", sub_app.get_by_text("群消息", exact=True)),
         ("page tab text 群聊", page.get_by_text("群聊", exact=True)),
         ("page tab text 群聊私信", page.get_by_text("群聊私信", exact=True)),
         ("tab text 群聊", sub_app.get_by_text("群聊", exact=True)),
