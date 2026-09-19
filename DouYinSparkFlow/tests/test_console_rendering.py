@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -157,7 +158,7 @@ class DashboardProgressRenderingTests(unittest.TestCase):
         self.assertIn('data-overview-value="progress">11/11<', html)
         self.assertIn("已发送 8/8 · 强确认 0", html)
         self.assertIn("progress-echo", html)
-        self.assertIn("弱证据 <b data-overview-value=\"weakSent\">11</b>", html)
+        self.assertIn("弱证据（仅回显/仅回执） <b data-overview-value=\"weakSent\">11</b>", html)
 
     def test_mixed_evidence_splits_the_bar_and_the_percentage(self):
         summary = _summary(
@@ -212,6 +213,56 @@ class DashboardProgressRenderingTests(unittest.TestCase):
         self.assertIn("--strong-pct: 13%", html)
         self.assertIn("--weak-pct: 0%", html)
         self.assertIn('data-overview-value="progress">1/8<', html)
+
+    def test_weak_segment_absorbs_the_rounding_remainder(self):
+        # 1/8 and 7/8 both land on .5; rounding each on its own used to print
+        # 13% + 88% = 101% in the badge.
+        summary = _summary(
+            total_targets=8,
+            today_confirmed_targets=1,
+            today_page_echo_targets=7,
+        )
+        account = _account_row(
+            total_targets=8,
+            confirmed_targets=[{"status": "sent"}],
+            page_echo_count=7,
+            page_echo_targets=[{"status": "sent_page_echo"}] * 7,
+        )
+
+        html = self._render(summary, [account])
+
+        self.assertIn("--strong-pct: 13%", html)
+        self.assertIn("--weak-pct: 87%", html)
+        self.assertIn('data-overview-value="progressPercent">100%<', html)
+        self.assertIn('data-overview-value="progress">8/8<', html)
+
+    def test_segment_widths_never_exceed_one_hundred_percent(self):
+        width_pattern = re.compile(r"--strong-pct: (\d+)%; --weak-pct: (\d+)%")
+        badge_pattern = re.compile(r'data-overview-value="progressPercent">(\d+)%<')
+
+        for total in range(1, 21):
+            for strong in range(total + 1):
+                weak = total - strong
+                summary = _summary(
+                    total_targets=total,
+                    today_confirmed_targets=strong,
+                    today_page_echo_targets=weak,
+                )
+                account = _account_row(
+                    total_targets=total,
+                    confirmed_targets=[{"status": "sent"}] * strong,
+                    page_echo_count=weak,
+                )
+
+                html = self._render(summary, [account])
+                strong_pct, weak_pct = (
+                    int(value) for value in width_pattern.search(html).groups()
+                )
+                badge_pct = int(badge_pattern.search(html).group(1))
+
+                with self.subTest(total=total, strong=strong):
+                    self.assertLessEqual(strong_pct + weak_pct, 100)
+                    self.assertEqual(strong_pct + weak_pct, badge_pct)
 
     def test_ops_panel_drops_the_dash_and_warning_glyph(self):
         summary = _summary(total_targets=1, today_confirmed_targets=1)

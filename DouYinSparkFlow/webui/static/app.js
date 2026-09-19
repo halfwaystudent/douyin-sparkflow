@@ -226,12 +226,16 @@
         const strongCount = account.confirmed || 0;
         const weakCount = (account.pageEcho || 0) + (account.receiptOnly || 0);
         const accountTotal = account.total || 0;
+        // Multiply before dividing so this matches the template's half-up maths,
+        // and derive the weak segment as the remainder so the two segments can
+        // never add up to more than 100%.
         const strongPct = accountTotal
-          ? Math.round((strongCount / accountTotal) * 100)
+          ? Math.round((strongCount * 100) / accountTotal)
           : 0;
-        const weakPct = accountTotal
-          ? Math.round((weakCount / accountTotal) * 100)
+        const sentPct = accountTotal
+          ? Math.round(((strongCount + weakCount) * 100) / accountTotal)
           : 0;
+        const weakPct = sentPct - strongPct;
         row.querySelectorAll("[data-account-progress]").forEach((node) => {
           node.style.width = `${strongPct}%`;
         });
@@ -285,24 +289,30 @@
     const strongCount = summary.confirmed || 0;
     const weakCount = (summary.pageEcho || 0) + (summary.receiptOnly || 0);
     const totalCount = summary.total || 0;
+    // Same half-up maths and remainder rule as the server-rendered template.
     const strongPct = totalCount
-      ? Math.round((strongCount / totalCount) * 100)
+      ? Math.round((strongCount * 100) / totalCount)
       : 0;
-    const weakPct = totalCount
-      ? Math.round((weakCount / totalCount) * 100)
+    const sentPct = totalCount
+      ? Math.round(((strongCount + weakCount) * 100) / totalCount)
       : 0;
+    const weakPct = sentPct - strongPct;
     setText(
       "[data-overview-value='progress']",
       `${strongCount + weakCount}/${totalCount}`,
     );
     setText(
       "[data-overview-value='progressPercent']",
-      `${strongPct + weakPct}%`,
+      `${sentPct}%`,
     );
     setText("[data-overview-value='weakSent']", weakCount);
     document.querySelectorAll("[data-overview-badge]").forEach((node) => {
       node.style.setProperty("--strong-pct", `${strongPct}%`);
       node.style.setProperty("--weak-pct", `${weakPct}%`);
+      node.style.setProperty(
+        "--ring-gap",
+        strongPct && weakPct ? "0.6%" : "0%",
+      );
     });
     setText(
       "[data-overview-value='lastConfirmedAt']",
@@ -1151,10 +1161,18 @@ window.addEventListener("DOMContentLoaded", () => {
   const csrf = form.querySelector("input[name='csrf_token']");
   if (!button || !input || !result) return;
 
-  const appendLine = (text, className = "") => {
+  const appendLine = (text, className = "", icon = "") => {
     const line = document.createElement("div");
     if (className) line.className = className;
-    line.textContent = text;
+    if (icon) {
+      const glyph = document.createElement("i");
+      glyph.dataset.lucide = icon;
+      const copy = document.createElement("span");
+      copy.textContent = text;
+      line.append(glyph, copy);
+    } else {
+      line.textContent = text;
+    }
     result.appendChild(line);
   };
 
@@ -1169,9 +1187,13 @@ window.addEventListener("DOMContentLoaded", () => {
     appendLine(`下一次触发：${data.nextTriggerDisplay || "-"}`);
     appendLine(`一轮预计耗时（估算）：${data.estimatedRunDisplay || "-"}`);
     appendLine(`当前目标数：${data.targetCount || 0}`);
-    (data.warnings || []).forEach((text) => {
-      appendLine(text, "notice-inline warning");
+    const warnings = data.warnings || [];
+    warnings.forEach((text) => {
+      appendLine(text, "notice-inline warning", "triangle-alert");
     });
+    if (warnings.length && window.lucide) {
+      window.lucide.createIcons({ attrs: { "aria-hidden": "true" } });
+    }
   };
 
   button.addEventListener("click", async () => {

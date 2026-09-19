@@ -812,6 +812,7 @@ html[data-theme="light"] .theme-dark-icon {
 .progress-badge {
   --strong-pct: 0%;
   --weak-pct: 0%;
+  --ring-gap: 0%;
   width: 68px;
   height: 68px;
   border-radius: 50%;
@@ -826,11 +827,13 @@ html[data-theme="light"] .theme-dark-icon {
   background: conic-gradient(
     from -90deg,
     var(--primary) 0 var(--strong-pct),
-    var(--warning) var(--strong-pct) calc(var(--strong-pct) + var(--weak-pct)),
-    var(--surface-soft) calc(var(--strong-pct) + var(--weak-pct)) 100%
+    var(--surface-solid) var(--strong-pct) calc(var(--strong-pct) + var(--ring-gap)),
+    var(--warning) calc(var(--strong-pct) + var(--ring-gap))
+      calc(var(--strong-pct) + var(--ring-gap) + var(--weak-pct)),
+    var(--surface-hover) calc(var(--strong-pct) + var(--ring-gap) + var(--weak-pct)) 100%
   );
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   font-variant-numeric: tabular-nums;
   position: relative;
 }
@@ -1172,7 +1175,7 @@ tbody tr:hover td {
 .progress-echo {
   background: var(--warning);
   /* A hairline keeps the orange and amber segments readable next to each other. */
-  box-shadow: inset 1px 0 0 var(--surface-solid), 0 0 8px rgba(247, 144, 9, 0.45);
+  box-shadow: inset 1px 0 0 var(--surface-solid), 0 0 8px var(--warning-soft);
 }
 
 .progress-text {
