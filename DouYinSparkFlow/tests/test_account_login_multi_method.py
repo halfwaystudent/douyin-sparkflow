@@ -17,6 +17,34 @@ from webui import login_lock
 ACCOUNT_ID = "1234567890"
 
 
+def isolate_account_data(test_case, path):
+    """Point the account store at ``path`` whatever the ambient environment is.
+
+    ``get_userData()`` switches its data source when ``GITHUB_ACTIONS`` is set: it
+    reads the ``USER_DATA`` secret instead of the JSON file. A test that only
+    patches ``users_data_path`` therefore sees an empty account list on CI (and
+    the 404s that follow) while passing on a machine that happens to have local
+    account data. Pin the environment to LOCAL and drop the module-level cache so
+    these tests behave the same everywhere.
+    """
+    from utils import config as config_module
+
+    env_patch = patch.object(
+        config_module, "get_environment", return_value=config_module.Environment.LOCAL
+    )
+    env_patch.start()
+    test_case.addCleanup(env_patch.stop)
+
+    cached = config_module.userData
+    config_module.userData = None
+    test_case.addCleanup(lambda: setattr(config_module, "userData", cached))
+
+    path_patch = patch.object(config_module, "users_data_path", return_value=path)
+    path_patch.start()
+    test_case.addCleanup(path_patch.stop)
+
+
+
 def _json_export():
     return json.dumps(
         [
@@ -553,12 +581,7 @@ class SavedLoginHealthTests(unittest.TestCase):
 
         self.users_path = Path(self.temp_dir.name) / "usersData.json"
         self.users_path.write_text("[]", encoding="utf-8")
-        self.users_patch = patch(
-            "utils.config.users_data_path",
-            return_value=self.users_path,
-        )
-        self.users_patch.start()
-        self.addCleanup(self.users_patch.stop)
+        isolate_account_data(self, self.users_path)
 
     def test_unverified_login_keeps_failure_markers(self):
         account, action = app_module.save_exported_login_result(
@@ -808,12 +831,7 @@ class FriendRefreshEndpointTests(unittest.TestCase):
             json_module.dumps([self.account], ensure_ascii=False),
             encoding="utf-8",
         )
-        self.path_patch = patch(
-            "utils.config.users_data_path",
-            return_value=self.users_path,
-        )
-        self.path_patch.start()
-        self.addCleanup(self.path_patch.stop)
+        isolate_account_data(self, self.users_path)
         self.client = TestClient(app_module.app)
         self.addCleanup(lambda: app_module._friend_refresh_active.discard(ACCOUNT_ID))
 
@@ -1562,12 +1580,7 @@ class UnverifiedLoginAttributionTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.users_path = Path(self.temp_dir.name) / "usersData.json"
         self.users_path.write_text("[]", encoding="utf-8")
-        self.users_patch = patch(
-            "utils.config.users_data_path",
-            return_value=self.users_path,
-        )
-        self.users_patch.start()
-        self.addCleanup(self.users_patch.stop)
+        isolate_account_data(self, self.users_path)
 
     def _save(self, **kwargs):
         account, _action = app_module.save_exported_login_result(
