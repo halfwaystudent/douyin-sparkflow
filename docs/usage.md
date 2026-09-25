@@ -84,7 +84,7 @@ ssh -L 8788:127.0.0.1:8788 <user>@<server-ip>
 ```bash
 docker compose ps
 docker compose logs -f login-desktop
-docker compose exec login-desktop curl -fsS http://127.0.0.1:18090/preflight
+docker compose exec login-desktop curl -fsS http://127.0.0.1:18090/health
 ```
 
 如果直连遇到网络问题，再在「系统设置」中选择 Mihomo 并填写代理地址。未配置 Mihomo 不会影响默认直连模式。

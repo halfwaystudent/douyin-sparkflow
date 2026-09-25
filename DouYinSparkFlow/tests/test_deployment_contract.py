@@ -15,26 +15,44 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertNotIn("/var/log/douyin-sparkflow.log", installer)
 
     def test_github_workflow_is_at_repository_root(self):
-        workflow = REPO_ROOT / ".github" / "workflows" / "schedule.yml"
+        workflow = REPO_ROOT / ".github" / "workflows" / "tests.yml"
         self.assertTrue(workflow.is_file())
-        self.assertFalse((SOURCE_ROOT / ".github" / "workflows" / "schedule.yml").exists())
+        self.assertFalse((SOURCE_ROOT / ".github" / "workflows" / "tests.yml").exists())
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("working-directory: DouYinSparkFlow", text)
-        self.assertIn("SPARKFLOW_BROWSER_PROFILE_ROOT", text)
-        self.assertIn("SPARKFLOW_MANUAL_RUN", text)
         self.assertIn('USER_DATA: "[]"', text)
-        self.assertIn("run_task:", text)
-        self.assertGreaterEqual(text.count("github.event_name == 'schedule' || inputs.run_task"), 2)
-        self.assertIn("path: DouYinSparkFlow/logs/", text)
+        self.assertIn("python -m unittest discover -s tests", text)
+        self.assertIn("node --test DouYinSparkFlow/tests/test_protocol_sender_helpers.mjs", text)
 
     def test_github_actions_are_pinned_to_commit_shas(self):
         import re
 
-        workflow = (REPO_ROOT / ".github" / "workflows" / "schedule.yml").read_text(encoding="utf-8")
-        uses_values = re.findall(r"^\s*-?\s*uses:\s*([^#\s]+)", workflow, flags=re.MULTILINE)
-        self.assertTrue(uses_values)
-        for value in uses_values:
-            self.assertRegex(value, r"^[^@]+@[0-9a-f]{40}$")
+        workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for workflow in workflows:
+            uses_values = re.findall(
+                r"^\s*-?\s*uses:\s*([^#\s]+)",
+                workflow.read_text(encoding="utf-8"),
+                flags=re.MULTILINE,
+            )
+            self.assertTrue(uses_values, workflow.name)
+            for value in uses_values:
+                with self.subTest(workflow=workflow.name, uses=value):
+                    self.assertRegex(value, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_ci_never_sends_messages_or_reads_secrets(self):
+        # The repository is public: CI must stay a pure verification surface. A
+        # scheduled workflow used to run the real send task from GitHub runners
+        # with account cookies in a secret, which both duplicated the server's
+        # schedule and sent from a foreign IP.
+        for workflow in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+            text = workflow.read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow.name):
+                self.assertNotIn("secrets.", text)
+                self.assertNotIn("--doTask", text)
+                self.assertNotIn("SPARKFLOW_MANUAL_RUN", text)
+                self.assertNotRegex(text, r"(?m)^\s*schedule:\s*$")
+                self.assertNotIn("path: DouYinSparkFlow/logs/", text)
 
     def test_runtime_config_is_not_tracked_as_the_template(self):
         self.assertTrue((SOURCE_ROOT / "config.example.json").is_file())

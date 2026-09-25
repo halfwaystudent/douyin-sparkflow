@@ -16,14 +16,19 @@
 
 | 文件 | 说明 | 大小 |
 |------|------|------|
-| `browser.py` | 浏览器控制和页面操作 | 3.4 KB |
-| `friends.py` | 好友列表管理和刷新逻辑 | 8.8 KB |
-| `login.py` | 登录流程控制 | 2.8 KB |
+| `browser.py` | 浏览器控制和页面操作 | 6.9 KB |
+| `cookies.py` | Cookie 解析、校验与登录态判定 | 6.5 KB |
+| `friends.py` | 好友列表管理和刷新逻辑 | 29.0 KB |
+| `login.py` | 登录流程控制 | 7.3 KB |
 | `msg_builder.py` | 消息内容构建（一言、祝福等） | 4.5 KB |
-| `protocol_dispatch.py` | 协议分发和路由 | 14.5 KB |
-| `protocol_sender.mjs` | 消息发送协议（Node.js 脚本） | 22.8 KB |
-| `send_state.py` | 统一判定强确认、待核验和当日发送状态 | 1.6 KB |
-| `tasks.py` | **任务调度核心**（定时任务、状态管理） | 109.5 KB |
+| `protocol_dispatch.py` | 协议分发和路由 | 25.5 KB |
+| `protocol_sender.mjs` | 消息发送协议（Node.js 脚本） | 29.2 KB |
+| `send_state.py` | 统一判定强确认、待核验和当日发送状态 | 1.9 KB |
+| `streak_state.py` | 目标状态机、在途租约与失败分类 | 59.1 KB |
+| `tasks.py` | **任务调度核心**（定时任务、状态管理） | 144.3 KB |
+| `unicode_casefold.mjs` | 生成的大小写折叠表（供 `protocol_sender.mjs` 匹配昵称） | 约 0.96 MB |
+
+> 表中大小会随开发变化，仅作规模参考。
 
 ### `webui/` - Web 管理界面
 
@@ -110,7 +115,7 @@ python main.py --web
 **命令行模式**：
 ```bash
 python main.py
-# 直接运行任务调度
+# 打开交互式菜单（可执行任务、导出 USER_DATA 等）
 ```
 
 **登录桌面服务**：

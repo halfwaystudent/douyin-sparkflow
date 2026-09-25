@@ -1,0 +1,54 @@
+name: Tests
+
+# Verification only: runs the Python and Node test suites on every push and pull
+# request. It never sends anything, never reads a secret and never starts a
+# browser, so a fork or a contributor PR can run the exact same checks.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: DouYinSparkFlow
+    env:
+      # The suite must not depend on real account data; an empty array keeps it
+      # hermetic and doubles as a check that nothing requires accounts to boot.
+      USER_DATA: "[]"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Byte-compile the application
+        run: python -m compileall -q core webui utils scripts main.py login_desktop_server.py
+
+  node-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+      - name: Run protocol sender tests
+        run: node --test DouYinSparkFlow/tests/test_protocol_sender_helpers.mjs

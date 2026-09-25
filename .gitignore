@@ -1,4 +1,4 @@
-﻿.env
+.env
 state/
 logs/
 output/
@@ -30,3 +30,7 @@ DouYinSparkFlow/*.lock
 # Server-local runtime backups and pre-theme backups (never committed)
 /backups/
 DouYinSparkFlow/.theme-backup-*/
+
+# Vendored archives are not tracked; add them as build/CI downloads instead.
+*.whl
+DouYinSparkFlow/webui/static/*.zip
