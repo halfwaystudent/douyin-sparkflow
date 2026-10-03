@@ -935,9 +935,12 @@ def create_app():
         maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
-        root = DEBUG_ARTIFACTS_DIR.resolve()
-        candidate = (root / artifact_path).resolve()
-        if root not in candidate.parents or not candidate.is_file():
+        root = DEBUG_ARTIFACTS_DIR.resolve(strict=True)
+        try:
+            candidate = (root / artifact_path).resolve(strict=True)
+        except OSError:
+            return PlainTextResponse("Not found", status_code=404)
+        if os.path.commonpath([str(root), str(candidate)]) != str(root) or not candidate.is_file():
             return PlainTextResponse("Not found", status_code=404)
         return FileResponse(candidate, headers={"Cache-Control": "no-store"})
 
