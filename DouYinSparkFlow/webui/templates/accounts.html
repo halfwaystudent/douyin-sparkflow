@@ -121,7 +121,6 @@
           <button class="button button-ghost button-sm" type="submit"><i data-lucide="combine"></i><span>合并到该账号</span></button>
         </form>
         {% endif %}
-        {% if is_admin %}
         <form
           method="post"
           action="/accounts/{{ account.unique_id }}/delete"
@@ -133,7 +132,6 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="button button-danger button-sm" type="submit"><i data-lucide="trash-2"></i><span>删除账号</span></button>
         </form>
-        {% endif %}
       </div>
     </div>
   </details>

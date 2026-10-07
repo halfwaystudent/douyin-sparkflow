@@ -70,6 +70,7 @@ from webui.users import (
     UserStoreError,
     account_by_ref,
     account_by_unique_id,
+    account_owner_username,
     can_access_account,
     create_web_user,
     delete_web_user,
@@ -582,6 +583,45 @@ def find_same_name_account(accounts, username):
         for item in accounts or []
         if str((item or {}).get("username") or "").strip() == wanted
     ]
+
+
+def unique_id_owned_by_other(accounts, unique_id, current):
+    """True when another Web user owns any row for this Douyin account.
+
+    Duplicate rows for one ``unique_id`` are legacy data. The save path updates
+    one row and then dedupes the rest, so the permission check has to look at
+    the whole set: claiming an unassigned duplicate while another row for the
+    same Douyin account belongs to someone else would strip their ownership.
+    """
+    normalized = normalize_unique_id(unique_id)
+    for row in accounts or []:
+        if normalize_unique_id(row.get("unique_id")) != normalized:
+            continue
+        if can_access_account(current, row):
+            continue
+        if account_owner_username(row.get("account_ref", "")):
+            return True
+    return False
+
+
+def preferred_account_for_unique_id(accounts, unique_id, current):
+    """Pick the row a save should update for one Douyin account.
+
+    Duplicate rows for a single ``unique_id`` are legacy data. Prefer a row the
+    caller may access so a save updates the user's own row instead of an
+    unassigned duplicate that happens to sort first and would otherwise be
+    deduped into the user's row.
+    """
+    normalized = normalize_unique_id(unique_id)
+    fallback = None
+    for row in accounts or []:
+        if normalize_unique_id(row.get("unique_id")) != normalized:
+            continue
+        if can_access_account(current, row):
+            return row
+        if fallback is None:
+            fallback = row
+    return fallback
 
 
 def save_exported_login_result(
@@ -1903,7 +1943,9 @@ def create_app():
 
     @app.post("/accounts/{unique_id}/delete")
     async def delete_account(request: Request, unique_id: str):
-        maybe_redirect = require_admin(request)
+        # Any user may delete an account they own; mutate_account_for_request
+        # rejects the rest with 403. Admin still deletes anything.
+        maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
 
@@ -1911,14 +1953,31 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        current = principal(request)
+
         def mutate(account, accounts):
             del account
-            accounts[:] = [
-                item
-                for item in accounts
-                if normalize_unique_id(item.get("unique_id"))
-                != normalize_unique_id(unique_id)
-            ]
+            normalized = normalize_unique_id(unique_id)
+            removed_refs = set()
+            remaining = []
+            for item in accounts:
+                # Duplicate rows for one unique_id are legacy data; only remove
+                # the ones this user may actually access so a delete can never
+                # take another user's row with it.
+                if (
+                    normalize_unique_id(item.get("unique_id")) == normalized
+                    and can_access_account(current, item)
+                ):
+                    ref = str(item.get("account_ref", "")).strip()
+                    if ref:
+                        removed_refs.add(ref)
+                    continue
+                remaining.append(item)
+            accounts[:] = remaining
+            if removed_refs:
+                # Drop the dangling ownership so no user keeps a ref pointing at
+                # a row that no longer exists.
+                remove_account_refs_from_users(removed_refs)
             return None
 
         account, _, access_error = mutate_account_for_request(
@@ -2977,12 +3036,26 @@ def create_app():
             )
 
         if not relogin_account_ref and identity.get("unique_id"):
-            existing = account_by_unique_id(get_userData(force_reload=True), identity["unique_id"])
+            saved_accounts = get_userData(force_reload=True)
+            existing = preferred_account_for_unique_id(
+                saved_accounts, identity["unique_id"], current
+            )
             if existing:
-                if not can_access_account(current, existing):
+                if unique_id_owned_by_other(
+                    saved_accounts, identity["unique_id"], current
+                ):
                     return JSONResponse(
                         {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
                         status_code=403,
+                    )
+                if not can_access_account(current, existing):
+                    # No other row for this Douyin account is owned, so the user
+                    # who just proved control may claim this one in place.
+                    logger.info(
+                        "Cookie login adopts an unassigned account: scanned_uid=%s account_ref=%s user=%s",
+                        normalize_unique_id(identity["unique_id"]),
+                        existing.get("account_ref", ""),
+                        current.get("username", ""),
                     )
                 relogin_account_ref = str(existing.get("account_ref", ""))
 
@@ -3067,7 +3140,9 @@ def create_app():
             if not payload.get("ok"):
                 raise RuntimeError("login-desktop export did not return ok")
             exported = payload.get("result", {}) or {}
-            existing = account_by_unique_id(get_userData(force_reload=True), exported.get("unique_id"))
+            existing = preferred_account_for_unique_id(
+                get_userData(force_reload=True), exported.get("unique_id"), current
+            )
             merge_with = str(form.get("merge_with", "")).strip()
             if merge_with:
                 # The operator confirmed that a same-name account is the one they
@@ -3150,8 +3225,21 @@ def create_app():
                         },
                         status_code=409,
                     )
-            if existing and str(existing.get("account_ref", "")) != relogin_account_ref and not can_access_account(current, existing):
+            adopt_unassigned = False
+            if unique_id_owned_by_other(
+                get_userData(force_reload=True), exported.get("unique_id"), current
+            ):
                 raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
+            if existing and str(existing.get("account_ref", "")) != relogin_account_ref and not can_access_account(current, existing):
+                # No other row for this Douyin account is owned, so the operator
+                # who just proved control may claim this unassigned row in place.
+                adopt_unassigned = True
+                logger.info(
+                    "Login save adopts an unassigned account: scanned_uid=%s account_ref=%s user=%s",
+                    normalize_unique_id(existing.get("unique_id")),
+                    existing.get("account_ref", ""),
+                    current.get("username", ""),
+                )
             if operation == "add" and current.get("role") == "user" and existing:
                 relogin_account_ref = existing.get("account_ref", "")
                 relogin_unique_id = existing.get("unique_id", "")
@@ -3192,7 +3280,7 @@ def create_app():
                 verified,
                 bool(existing),
             )
-            if operation == "add" and current.get("role") == "user":
+            if (operation == "add" or adopt_unassigned) and current.get("role") == "user":
                 refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
                 update_web_user(current["username"], account_refs=refs)
             begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=active.get("ticket", ""), account_ref=active.get("account_ref", ""))

@@ -148,7 +148,10 @@ class RedesignedPagesTests(unittest.TestCase):
         accounts_page = self._get("/accounts").text
         self.assertIn("主号", accounts_page)
         self.assertNotIn("小号", accounts_page)
-        self.assertNotIn("/accounts/1001/delete", accounts_page)
+        # Owners may delete their own account; another user's account is not
+        # rendered at all, so its delete form cannot appear either.
+        self.assertIn("/accounts/1001/delete", accounts_page)
+        self.assertNotIn("/accounts/1002/delete", accounts_page)
 
     def test_anonymous_visitors_are_sent_to_login(self):
         for path in ("/", "/accounts", "/login-workspace", "/settings"):

@@ -274,6 +274,21 @@ def all_assigned_refs(exclude_username: str | None = None) -> set[str]:
     return refs
 
 
+def account_owner_username(account_ref: str) -> str:
+    """Return the Web user that currently owns ``account_ref``, or "".
+
+    ``can_access_account`` only answers "is this mine"; callers that must tell
+    "unassigned" apart from "owned by someone else" need the owner's name.
+    """
+    target = str(account_ref or "").strip()
+    if not target:
+        return ""
+    for user in get_web_users():
+        if target in set(user.get("account_refs", [])):
+            return user["username"]
+    return ""
+
+
 def _validate_refs(refs: list[str] | None, accounts: list[dict] | None = None) -> list[str]:
     if accounts is None:
         accounts = get_userData(force_reload=True)
