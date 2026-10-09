@@ -1012,6 +1012,13 @@ class RuntimeHardeningTests(unittest.TestCase):
             return FakePlaywright(), FakeBrowser()
 
         with (
+            # Production reuses the account's persistent profile; this test
+            # covers the throwaway-context cleanup path with a fake browser.
+            patch.object(
+                friends,
+                "normalize_persistent_profile_config",
+                return_value={"enabled": False, "root": ""},
+            ),
             patch.object(friends, "get_browser", side_effect=fake_get_browser),
             patch.object(friends, "collect_friend_names", new=AsyncMock(return_value=["Alice"])),
         ):

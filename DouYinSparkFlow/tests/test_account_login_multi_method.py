@@ -46,6 +46,22 @@ def isolate_account_data(test_case, path):
     test_case.addCleanup(path_patch.stop)
 
 
+def force_ephemeral_profiles(test_case):
+    """Keep a unit test on the throwaway-context path.
+
+    Production refreshes reuse the account's persistent browser profile; a unit
+    test must not launch a real browser, so pin the feature off and let the
+    existing ``get_browser`` fakes provide the context.
+    """
+    patcher = patch.object(
+        friends_module,
+        "normalize_persistent_profile_config",
+        return_value={"enabled": False, "root": ""},
+    )
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
+
+
 
 def _json_export():
     return json.dumps(
@@ -255,6 +271,9 @@ class _FakePlaywright:
 
 class AuthOnlyFetchTests(unittest.TestCase):
     """Exercise the real auth_only branch instead of stubbing it out."""
+
+    def setUp(self):
+        force_ephemeral_profiles(self)
 
     def _run(self, page, identity):
         context = _FakeContext(page)
@@ -912,7 +931,7 @@ class FriendRefreshEndpointTests(unittest.TestCase):
         self.assertTrue(body["retryable"])
         self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
 
-    def test_empty_result_keeps_previous_friends_cache(self):
+    def test_incomplete_result_keeps_previous_friends_cache(self):
         self.assertEqual(["Old Friend"], self.account["friends_cache"])
 
         def fake_fetch(account):
@@ -925,12 +944,80 @@ class FriendRefreshEndpointTests(unittest.TestCase):
 
         body = response.json()
         self.assertEqual(502, response.status_code)
-        self.assertEqual("empty_result", body["category"])
+        # A read that stopped early is not proof the list shrank, so it keeps the
+        # last good cache instead of wiping the friend picker.
+        self.assertEqual("incomplete_scan", body["category"])
         self.assertTrue(body["retryable"])
         self.assertEqual(self.account["friends_cache_updated_at"], body["previousUpdatedAt"])
         stored = self._stored_account()
         self.assertEqual(["Old Friend"], stored["friends_cache"])
         self.assertEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+
+    def test_incomplete_scan_reason_reaches_the_console(self):
+        def fake_fetch(account):
+            del account
+            return friends_module.FriendScanResult(
+                ["Alice"],
+                reason="列表滚动没有继续推进",
+            )
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(502, response.status_code)
+        self.assertEqual("incomplete_scan", body["category"])
+        self.assertFalse(body["scan_complete"])
+        self.assertIn("列表滚动没有继续推进", body["error"])
+        # The partial names never reach the picker.
+        stored = self._stored_account()
+        self.assertEqual(["Old Friend"], stored["friends_cache"])
+        self.assertEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+
+    def test_complete_empty_scan_keeps_previous_friends_cache(self):
+        def fake_fetch(account):
+            del account
+            return friends_module.FriendScanResult(complete=True)
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(502, response.status_code)
+        self.assertEqual("empty_result", body["category"])
+        stored = self._stored_account()
+        self.assertEqual(["Old Friend"], stored["friends_cache"])
+        self.assertEqual("2026-01-01T00:00:00", stored["friends_cache_updated_at"])
+
+    def test_empty_scan_without_previous_cache_writes_nothing(self):
+        # An empty read is never proof the list is empty, so it must not stamp a
+        # fresh refresh time on an account that had no cache to begin with.
+        import json as json_module
+
+        self.users_path.write_text(
+            json_module.dumps(
+                [{**self.account, "friends_cache": [], "friends_cache_updated_at": ""}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_fetch(account):
+            del account
+            return friends_module.FriendScanResult(complete=True)
+
+        response, _ = self._run_refresh(
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        )
+
+        body = response.json()
+        self.assertEqual(502, response.status_code)
+        self.assertEqual("empty_result", body["category"])
+        stored = self._stored_account()
+        self.assertEqual([], stored.get("friends_cache") or [])
+        self.assertEqual("", stored.get("friends_cache_updated_at") or "")
 
     def test_complete_scan_updates_cache_and_reports_index(self):
         def fake_fetch(account):
@@ -998,12 +1085,63 @@ class FriendRefreshEndpointTests(unittest.TestCase):
 
         body = response.json()
         self.assertEqual(504, response.status_code)
-        self.assertEqual("network_unavailable", body["category"])
+        # Exceeding the read budget is an incomplete read, not a transport error.
+        self.assertEqual("incomplete_scan", body["category"])
+        self.assertFalse(body["scan_complete"])
         self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
+
+    def test_async_timeout_reports_an_incomplete_scan(self):
+        async def fake_wait_for(awaitable, timeout):
+            del timeout
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError()
+
+        async def fake_fetch(account, on_progress=None):
+            del account, on_progress
+            return friends_module.FriendScanResult(["Alice"], complete=True)
+
+        job = {}
+        with (
+            patch.object(app_module, "current_user", return_value="admin"),
+            patch.object(app_module, "current_principal", return_value=self.principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(app_module.asyncio, "wait_for", side_effect=fake_wait_for),
+            patch.object(app_module, "fetch_account_friends", side_effect=fake_fetch),
+        ):
+            response = self.client.post(
+                f"/accounts/{ACCOUNT_ID}/friends/refresh/async",
+                data={"csrf_token": "t"},
+            )
+            self.assertEqual(202, response.status_code)
+            for _ in range(200):
+                job = self.client.get(
+                    f"/accounts/{ACCOUNT_ID}/friends/refresh/status"
+                ).json()
+                if job.get("state") != "running":
+                    break
+                time.sleep(0.02)
+
+        # The background job must classify a budget overrun as an incomplete
+        # read, exactly like the synchronous route.
+        self.assertEqual("failed", job.get("state"))
+        self.assertEqual("incomplete_scan", job.get("category"))
+        self.assertFalse(job.get("scanComplete", True))
+        self.assertIn("读取超时", job.get("error", ""))
+        self.assertEqual(["Old Friend"], self._stored_account()["friends_cache"])
+        self.assertEqual(
+            "2026-01-01T00:00:00", self._stored_account()["friends_cache_updated_at"]
+        )
 
     def test_successful_refresh_writes_cache(self):
         response, _ = self._run_refresh(
-            patch.object(app_module, "fetch_account_friends", return_value=["Alice", "Bob"]),
+            patch.object(
+                app_module,
+                "fetch_account_friends",
+                return_value=friends_module.FriendScanResult(
+                    ["Alice", "Bob"], complete=True
+                ),
+            ),
         )
 
         body = response.json()
@@ -1789,6 +1927,9 @@ class UnverifiedLoginAttributionTests(unittest.TestCase):
 
 class IdentityReadBudgetTests(unittest.TestCase):
     """The identity read must get the full render budget and one retry."""
+
+    def setUp(self):
+        force_ephemeral_profiles(self)
 
     def _run(self, failures):
         seen = []

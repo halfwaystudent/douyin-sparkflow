@@ -28,6 +28,7 @@ from core.cookies import (
 )
 from core.friends import (
     CATEGORY_EMPTY_RESULT,
+    CATEGORY_INCOMPLETE_SCAN,
     CATEGORY_LABELS,
     CATEGORY_LOGIN_REQUIRED,
     CATEGORY_NETWORK_UNAVAILABLE,
@@ -54,6 +55,7 @@ from utils.config import (
     merge_user_account_into,
     update_user_data,
 )
+from utils.logger import setup_logger
 from webui.auth import (
     bootstrap_admin_password,
     clear_session,
@@ -114,7 +116,9 @@ from webui.ops import (
     update_daily_schedule,
 )
 
-logger = logging.getLogger(__name__)
+# Route web-side warnings into the same logs/app.log the task runner writes, at
+# the level it already uses, so a failed refresh is no longer silent.
+logger = setup_logger(level=logging.DEBUG)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -487,6 +491,26 @@ def friend_refresh_conflict(unique_id):
     if active:
         return "登录工作区正在被使用，请等扫码登录结束后再刷新好友"
     return ""
+
+
+def _incomplete_scan_message(reason):
+    """Explain a read that stopped before the end of the friend list."""
+    detail = f"（{reason}）" if reason else ""
+    return f"本次读取不完整，已保留上一次的好友数据；请稍后重试。{detail}"
+
+
+def _incomplete_scan_fields(reason):
+    """Shared result fields for any read that stopped before the list ended.
+
+    Both the synchronous route and the background job must classify a stalled
+    scan and a read that ran past its budget the same way.
+    """
+    return {
+        "error": _incomplete_scan_message(reason),
+        "category": CATEGORY_INCOMPLETE_SCAN,
+        "categoryLabel": CATEGORY_LABELS[CATEGORY_INCOMPLETE_SCAN],
+        "retryable": True,
+    }
 
 
 def _dedupe_account_records(accounts: list[dict], *, unique_id: str, keep_ref: str) -> set[str]:
@@ -1411,14 +1435,16 @@ def create_app():
                 account.get("username", normalized_id),
                 _FRIEND_REFRESH_TIMEOUT_SECONDS,
             )
+            # Exceeding the read budget is an incomplete read, not a transport
+            # failure, so the console reports it the same way as a stalled scan.
             _finish_friend_job(
                 normalized_id,
                 state="failed",
-                stage="timeout",
-                error=f"读取好友列表超时（超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒），已保留上一次的好友数据",
-                category=CATEGORY_NETWORK_UNAVAILABLE,
-                categoryLabel=CATEGORY_LABELS[CATEGORY_NETWORK_UNAVAILABLE],
-                retryable=True,
+                stage="incomplete",
+                **_incomplete_scan_fields(
+                    f"读取超时，超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒"
+                ),
+                scanComplete=False,
             )
             return
         except FriendRefreshError as exc:
@@ -1461,7 +1487,25 @@ def create_app():
 
         previous_cache = list(account.get("friends_cache") or [])
         scan_complete = bool(getattr(friends, "complete", False))
-        if not friends and previous_cache:
+        scan_reason = str(getattr(friends, "reason", "") or "")
+        if not scan_complete:
+            # A read that stopped early is not proof the list shrank, so it must
+            # never replace the last good cache or rebuild the send index.
+            logger.warning(
+                "Async friend refresh incomplete for %s: count=%s reason=%s",
+                account.get("username", normalized_id),
+                len(friends),
+                scan_reason or "-",
+            )
+            _finish_friend_job(
+                normalized_id,
+                state="failed",
+                stage="incomplete",
+                **_incomplete_scan_fields(scan_reason),
+                scanComplete=False,
+            )
+            return
+        if not friends:
             logger.warning(
                 "Async friend refresh returned no names for %s (complete=%s); keeping %s cached friends",
                 account.get("username", normalized_id),
@@ -1775,10 +1819,12 @@ def create_app():
             )
             return JSONResponse(
                 {
-                    "error": f"读取好友列表超时（超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒），已保留上一次的好友数据",
-                    "category": CATEGORY_NETWORK_UNAVAILABLE,
-                    "categoryLabel": CATEGORY_LABELS[CATEGORY_NETWORK_UNAVAILABLE],
-                    "retryable": True,
+                    # Exceeding the read budget is an incomplete read, not a
+                    # transport failure, so the console reports it as such.
+                    **_incomplete_scan_fields(
+                        f"读取超时，超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒"
+                    ),
+                    "scan_complete": False,
                     "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
                 },
                 status_code=504,
@@ -1819,10 +1865,28 @@ def create_app():
         previous_updated_at = account.get("friends_cache_updated_at", "")
         previous_cache = list(account.get("friends_cache") or [])
         scan_complete = bool(getattr(friends, "complete", False))
-        if not friends and previous_cache:
-            # An empty scan is not proof that the friend list is empty, so keep
-            # the last good cache and let the operator retry instead of wiping
-            # the friend picker with a single flaky read.
+        scan_reason = str(getattr(friends, "reason", "") or "")
+        if not scan_complete:
+            # A read that stopped early is not proof the list shrank, so it must
+            # never replace the last good cache or rebuild the send index.
+            logger.warning(
+                "Friend refresh incomplete for %s: count=%s reason=%s",
+                account.get("username", normalized_id),
+                len(friends),
+                scan_reason or "-",
+            )
+            return JSONResponse(
+                {
+                    **_incomplete_scan_fields(scan_reason),
+                    "scan_complete": False,
+                    "previousUpdatedAt": previous_updated_at,
+                },
+                status_code=502,
+            )
+        if not friends:
+            # An empty read is not proof that the friend list is empty, so keep
+            # whatever we had and let the operator retry instead of wiping the
+            # friend picker with a single flaky read.
             logger.warning(
                 "Friend refresh returned no names for %s (complete=%s); keeping %s cached friends",
                 account.get("username", normalized_id),
@@ -1876,6 +1940,13 @@ def create_app():
                     exc_info=True,
                 )
 
+        logger.info(
+            "Friend refresh stored for %s: count=%s complete=%s index_updated=%s",
+            account.get("username", normalized_id),
+            len(friends),
+            scan_complete,
+            index_updated,
+        )
         return JSONResponse(
             {
                 "friends": friends,

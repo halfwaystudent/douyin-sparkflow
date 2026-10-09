@@ -16,9 +16,13 @@ from zoneinfo import ZoneInfo
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from core.browser import (
+    account_profile_name,
+    acquire_browser_account_lock,
+    first_scrollable_element,
     get_browser,
     get_persistent_browser_context,
-    sanitize_profile_name,
+    normalize_persistent_profile_config,
+    release_browser_account_lock,
     select_douyin_network_mode,
 )
 from core.msg_builder import build_message, build_message_candidates
@@ -137,29 +141,10 @@ def _ordered_targets_for_run(targets, send_strategy):
     return ordered
 
 
-def _normalize_persistent_profile_config(active_config):
-    raw = active_config.get("persistentBrowserProfiles", {}) or {}
-    return {
-        "enabled": bool(raw.get("enabled", False)),
-        "root": str(
-            os.getenv("SPARKFLOW_BROWSER_PROFILE_ROOT")
-            or raw.get("root")
-            or "/opt/douyin-sparkflow/state/browser-profiles"
-        ),
-        "seedCookiesWhenEmpty": bool(raw.get("seedCookiesWhenEmpty", True)),
-        "syncStoredCookiesBeforeRun": bool(raw.get("syncStoredCookiesBeforeRun", True)),
-        "refreshStoredCookiesAfterLogin": bool(raw.get("refreshStoredCookiesAfterLogin", True)),
-    }
-
-
-def _account_profile_name(user):
-    unique_id = normalize_unique_id(user.get("unique_id"))
-    username = str(user.get("username") or "").strip()
-    if unique_id:
-        return f"uid-{unique_id}"
-    if username:
-        return f"user-{sanitize_profile_name(username)}"
-    return "unknown"
+# The sender and the friend refresher must resolve the same profile directory for
+# an account, so both helpers live in core.browser and keep their old names here.
+_normalize_persistent_profile_config = normalize_persistent_profile_config
+_account_profile_name = account_profile_name
 
 
 def _random_delay_seconds(send_strategy, min_key, max_key):
@@ -1361,14 +1346,9 @@ async def _extract_friend_display_name(element):
         except Exception:
             continue
 
-    try:
-        text = (await element.inner_text(timeout=1000)).strip()
-    except Exception:
-        return ""
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            return line
+    # A chat row also renders the last message and its timestamp, so the row's
+    # first text line is not the nickname. Without a nickname node this row is
+    # not a friend entry, and guessing here wrote "16:23" into the send index.
     return ""
 
 
@@ -1420,14 +1400,9 @@ async def _extract_friend_record(element):
 
 
 async def _first_scrollable_friends_element(page, selectors):
-    for selector in selectors:
-        try:
-            handle = await page.locator(selector).first.element_handle()
-        except Exception:
-            handle = None
-        if handle:
-            return selector, handle
-    return "", None
+    # Douyin renders zero-height grids next to the real list, so taking the
+    # first match made every scroll a no-op; the shared probe skips those.
+    return await first_scrollable_element(page, selectors)
 
 
 async def scroll_and_select_user(page, user, account_name, targets, friend_scan_config=None, index_targets=None):
@@ -3057,70 +3032,10 @@ def _pid_is_alive(pid):
     return True
 
 
-async def _acquire_browser_account_lock(user, account_name):
-    lock_dir = Path("logs/browser-account-locks")
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    identity = _account_identity(user) or account_name
-    lock_path = lock_dir / f"{_safe_name(identity)}.lock"
-    guard = FileLock(f"{lock_path}.guard", timeout=0)
-    started_at = asyncio.get_running_loop().time()
-    last_logged_at = 0
-
-    while True:
-        try:
-            guard.acquire()
-            token = uuid.uuid4().hex
-            lock_path.write_text(
-                json.dumps(
-                    {
-                        "pid": os.getpid(),
-                        "token": token,
-                        "account": account_name,
-                        "createdAt": datetime.now(timezone.utc).isoformat(
-                            timespec="seconds"
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            logger.debug("Acquired browser account lock for %s at %s", account_name, lock_path)
-            return guard, lock_path, token
-        except FileLockTimeout:
-            now = asyncio.get_running_loop().time()
-            if now - started_at > 7200:
-                raise RuntimeError(f"timed out waiting for browser account lock for {account_name}")
-            if now - last_logged_at >= 30:
-                logger.info(
-                    "Waiting for existing browser account lock for %s at %s",
-                    account_name,
-                    lock_path,
-                )
-                last_logged_at = now
-            await asyncio.sleep(5)
-        except Exception:
-            guard.release()
-            raise
-
-
-def _release_browser_account_lock(handle, lock_path, token, account_name):
-    try:
-        try:
-            current = json.loads(lock_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            current = {}
-        if str(current.get("token") or "") == token:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
-    finally:
-        try:
-            handle.release()
-            logger.debug("Released browser account lock for %s at %s", account_name, lock_path)
-        except Exception:
-            pass
+# The per-account browser lock is shared with the friend refresher, which now
+# drives the same persistent profile; both helpers live in core.browser.
+_acquire_browser_account_lock = acquire_browser_account_lock
+_release_browser_account_lock = release_browser_account_lock
 
 
 def _browser_account_timeout_seconds(friend_scan_config, target_count):

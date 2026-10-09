@@ -1,24 +1,39 @@
 import asyncio
 import logging
 
-from core.browser import douyin_network_modes, get_browser
+from core.browser import (
+    account_profile_name,
+    acquire_browser_account_lock,
+    douyin_network_modes,
+    first_scrollable_element,
+    get_browser,
+    get_persistent_browser_context,
+    normalize_persistent_profile_config,
+    release_browser_account_lock,
+)
 from core.login import collect_login_result
-from utils.config import normalize_unique_id
+from core.streak_state import AUTH_COOKIE_NAMES
+from utils.config import get_config, normalize_unique_id
+from utils.logger import setup_logger
 
 
-logger = logging.getLogger(__name__)
+# The refresh runs inside the web process; without this the route/count/complete
+# lines never reach logs/app.log and a failed refresh is invisible.
+logger = setup_logger(level=logging.DEBUG)
 
 
 CATEGORY_LOGIN_REQUIRED = "login_required"
 CATEGORY_NETWORK_UNAVAILABLE = "network_unavailable"
 CATEGORY_STRUCTURE_CHANGED = "structure_changed"
 CATEGORY_EMPTY_RESULT = "empty_result"
+CATEGORY_INCOMPLETE_SCAN = "incomplete_scan"
 
 CATEGORY_LABELS = {
     CATEGORY_LOGIN_REQUIRED: "登录失效",
     CATEGORY_NETWORK_UNAVAILABLE: "网络不可用",
     CATEGORY_STRUCTURE_CHANGED: "页面结构变化",
     CATEGORY_EMPTY_RESULT: "未读到好友",
+    CATEGORY_INCOMPLETE_SCAN: "读取不完整",
 }
 
 
@@ -27,15 +42,18 @@ class FriendScanResult(list):
 
     Behaves exactly like a list so existing callers keep working, but carries
     ``complete`` so the caller can decide whether the result is strong enough to
-    refresh the send-time friend index. When completeness is unknown (for
+    refresh the send-time friend index. ``reason`` explains why an incomplete
+    scan stopped so the console can show it. When completeness is unknown (for
     example a test double returning a plain list) it stays ``False``.
     """
 
     complete = False
+    reason = ""
 
-    def __init__(self, names=(), *, complete=False):
+    def __init__(self, names=(), *, complete=False, reason=""):
         super().__init__(names)
         self.complete = bool(complete)
+        self.reason = str(reason or "")
 
 
 class FriendRefreshError(RuntimeError):
@@ -120,6 +138,12 @@ NON_LOGIN_DIALOG_CLOSE_SELECTORS = (
 FRIEND_LIST_EMPTY_ROUNDS = 6
 FRIEND_LIST_EMPTY_WAIT_SECONDS = 1.5
 FRIEND_LIST_READY_TIMEOUT_SECONDS = 60
+# A virtualized list can stop producing rows long before it is exhausted, so
+# these bounds only end the read; they never prove the list was fully read.
+FRIEND_LIST_IDLE_ROUNDS = 5
+FRIEND_LIST_STUCK_ROUNDS = 2
+SCROLL_STEP_PX = 800
+SCROLL_SETTLE_SECONDS = 1.5
 
 
 def update_collection_progress(new_names_count, no_more_visible, scroll_moved, idle_rounds, stuck_rounds, idle_limit=5, stuck_limit=2):
@@ -275,12 +299,33 @@ async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOU
     )
 
 
+async def _read_friend_name(element):
+    """Return the row's nickname, or "" when the row has no nickname node.
+
+    A chat row also renders the last message and its timestamp, so reading the
+    row's first text line turned "16:23" and unread counters into friends.
+    """
+    for selector in FRIEND_NAME_SELECTORS:
+        try:
+            locator = element.locator(selector).first
+            if await locator.count() == 0:
+                continue
+            name = (await locator.inner_text(timeout=1000)).strip()
+        except Exception:
+            continue
+        if name:
+            return name
+    return ""
+
+
 async def collect_friend_names(page, on_progress=None):
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
     if not target_locator:
-        return FriendScanResult()
+        # The page announced the end of the list before rendering any row: a
+        # genuinely empty friend list, which is a complete read.
+        return FriendScanResult(complete=True)
 
     found_names = []
     seen_names = set()
@@ -291,25 +336,13 @@ async def collect_friend_names(page, on_progress=None):
         _, target_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
         if not target_locator:
             if found_names:
-                return FriendScanResult(found_names)
+                return FriendScanResult(found_names, reason="读取过程中好友行消失")
             raise RuntimeError("好友列表已加载但未找到可读取的好友行")
 
         target_elements = await target_locator.all()
         new_names_count = 0
         for element in target_elements:
-            name = ""
-            for selector in FRIEND_NAME_SELECTORS:
-                try:
-                    name = (await element.locator(selector).first.inner_text(timeout=1000)).strip()
-                except Exception:
-                    continue
-                if name:
-                    break
-            if not name:
-                try:
-                    name = (await element.inner_text(timeout=1000)).splitlines()[0].strip()
-                except Exception:
-                    continue
+            name = await _read_friend_name(element)
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
@@ -325,38 +358,34 @@ async def collect_friend_names(page, on_progress=None):
 
         loading_selector, _ = await _first_visible_locator(page, LOADING_SELECTORS)
         if loading_selector:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(SCROLL_SETTLE_SECONDS)
 
-        scrollable_element = None
-        scrollable_selector = ""
-        for selector in SCROLLABLE_FRIENDS_SELECTORS:
-            try:
-                candidate = page.locator(selector).first
-                handle = await candidate.element_handle()
-                if not handle:
-                    continue
-                metrics = await page.evaluate(
-                    """(element) => ({
-                        clientHeight: element.clientHeight,
-                        scrollHeight: element.scrollHeight,
-                    })""",
-                    handle,
-                )
-                if int(metrics.get("clientHeight") or 0) > 0:
-                    scrollable_element = handle
-                    scrollable_selector = selector
-                    break
-            except Exception:
-                continue
-
+        scrollable_selector, scrollable_element = await first_scrollable_element(
+            page, SCROLLABLE_FRIENDS_SELECTORS
+        )
         if not scrollable_element:
             if found_names:
-                return FriendScanResult(found_names)
+                return FriendScanResult(found_names, reason="未找到好友列表滚动容器")
             raise RuntimeError("未找到好友列表滚动容器")
 
+        metrics = await page.evaluate(
+            """(element) => ({
+                clientHeight: element.clientHeight,
+                scrollHeight: element.scrollHeight,
+            })""",
+            scrollable_element,
+        )
+        if int(metrics.get("scrollHeight") or 0) <= int(metrics.get("clientHeight") or 0):
+            # The container has nothing below the viewport, so the virtual list
+            # has already rendered every row: the read provably reached the end.
+            return FriendScanResult(found_names, complete=True)
+
         before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
-        await page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
-        await asyncio.sleep(1.5)
+        await page.evaluate(
+            f"(element) => element.scrollTop += {SCROLL_STEP_PX}",
+            scrollable_element,
+        )
+        await asyncio.sleep(SCROLL_SETTLE_SECONDS)
         after_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
         logger.debug(
             "Friend list refresh scroll selector=%s before=%s after=%s names=%s",
@@ -372,9 +401,16 @@ async def collect_friend_names(page, on_progress=None):
             scroll_moved=after_top > before_top,
             idle_rounds=idle_rounds,
             stuck_rounds=stuck_rounds,
+            idle_limit=FRIEND_LIST_IDLE_ROUNDS,
+            stuck_limit=FRIEND_LIST_STUCK_ROUNDS,
         )
         if should_stop:
-            return FriendScanResult(found_names, complete=True)
+            reason = (
+                "列表滚动没有继续推进"
+                if stuck_rounds >= FRIEND_LIST_STUCK_ROUNDS
+                else "连续多轮没有读到新的好友"
+            )
+            return FriendScanResult(found_names, reason=reason)
 
 
 async def _fetch_account_friends_once(
@@ -386,14 +422,45 @@ async def _fetch_account_friends_once(
     on_progress=None,
 ):
     cookies = list(account.get("cookies") or [])
+    account_name = str(account.get("username") or account.get("unique_id") or "")
     playwright = browser = context = page = None
+    lock_handle = lock_path = lock_token = None
     try:
-        playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
-        context = await browser.new_context()
+        # Reuse the account's persistent profile so the read drives the same
+        # browser identity as the sender instead of a throwaway cookie context.
+        # The per-account lock is the same one the sender takes, so a send run
+        # that starts mid-refresh waits instead of fighting over the profile.
+        profile_config = normalize_persistent_profile_config(
+            get_config(force_reload=True) or {}
+        )
+        if profile_config["enabled"]:
+            lock_handle, lock_path, lock_token = await acquire_browser_account_lock(
+                account, account_name
+            )
+            playwright, context, _profile_dir = await get_persistent_browser_context(
+                account_profile_name(account),
+                root=profile_config["root"],
+                network_mode=network_mode,
+            )
+            # Mirror the sender's cookie policy instead of always overwriting
+            # whatever session the profile already holds.
+            if profile_config["syncStoredCookiesBeforeRun"]:
+                await context.add_cookies(cookies)
+            elif profile_config["seedCookiesWhenEmpty"]:
+                current = await context.cookies(
+                    ["https://creator.douyin.com/", "https://www.douyin.com/"]
+                )
+                if not any(
+                    cookie.get("name") in AUTH_COOKIE_NAMES for cookie in current
+                ):
+                    await context.add_cookies(cookies)
+        else:
+            playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
+            context = await browser.new_context()
+            await context.add_cookies(cookies)
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)
         page = await context.new_page()
-        await context.add_cookies(cookies)
 
         if auth_only:
             # Only the creator home page exposes the logged-in identity, and a
@@ -504,6 +571,13 @@ async def _fetch_account_friends_once(
                 await playwright.stop()
             except Exception:
                 logger.debug("Failed to stop friend refresh Playwright", exc_info=True)
+        if lock_handle is not None:
+            try:
+                release_browser_account_lock(
+                    lock_handle, lock_path, lock_token, account_name
+                )
+            except Exception:
+                logger.debug("Failed to release friend refresh account lock", exc_info=True)
 
 
 async def verify_account_session(account, *, auth_only=False, network_mode=None):
@@ -695,16 +769,20 @@ async def fetch_account_friends(account, on_progress=None):
             )
             friends = list(payload or [])
             complete = bool(getattr(payload, "complete", False))
+            reason = str(getattr(payload, "reason", "") or "")
             logger.info(
-                "Friend refresh route=%s count=%s complete=%s attempt=%s/%s",
+                "Friend refresh account=%s route=%s count=%s complete=%s "
+                "reason=%s attempt=%s/%s",
+                account.get("username") or account.get("unique_id") or "unknown",
                 network_mode,
                 len(friends),
                 complete,
+                reason or "-",
                 index + 1,
                 len(modes),
             )
             if friends or index == len(modes) - 1:
-                return FriendScanResult(friends, complete=complete)
+                return FriendScanResult(friends, complete=complete, reason=reason)
             logger.warning(
                 "Friend refresh route=%s returned zero friends; trying next route",
                 network_mode,

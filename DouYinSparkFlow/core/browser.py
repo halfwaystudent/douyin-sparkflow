@@ -1,19 +1,36 @@
+import asyncio
+import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import traceback
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+from filelock import FileLock, Timeout as FileLockTimeout
 from playwright.async_api import async_playwright
 from rich.console import Console
 
-from utils.config import DEBUG, Environment, get_app_settings, get_environment
+from utils.config import (
+    DEBUG,
+    Environment,
+    get_app_settings,
+    get_environment,
+    normalize_unique_id,
+)
 
 
 console = Console()
+# Attach to the logger the app configures (core.tasks / core.friends call
+# setup_logger). Looking it up by name keeps this module free of import-time
+# side effects such as creating logs/.
+logger = logging.getLogger("app")
 PLAYWRIGHT_BROWSERS_PATH = "../chrome"
 DEFAULT_PROFILE_ROOT = "/opt/douyin-sparkflow/state/browser-profiles"
+BROWSER_ACCOUNT_LOCK_DIR = "logs/browser-account-locks"
 
 
 def _local_browser_bundle_path():
@@ -146,6 +163,178 @@ def browser_profile_root(root=None):
         or DEFAULT_PROFILE_ROOT
     )
     return Path(configured)
+
+
+def account_profile_name(user):
+    """Stable per-account profile directory name, shared by sender and refresher."""
+    account = user or {}
+    unique_id = normalize_unique_id(account.get("unique_id"))
+    username = str(account.get("username") or "").strip()
+    if unique_id:
+        return f"uid-{unique_id}"
+    if username:
+        return f"user-{sanitize_profile_name(username)}"
+    return "unknown"
+
+
+def normalize_persistent_profile_config(active_config):
+    """Read persistent-profile settings; the sender and refresher share defaults."""
+    raw = (active_config or {}).get("persistentBrowserProfiles", {}) or {}
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "root": str(
+            os.getenv("SPARKFLOW_BROWSER_PROFILE_ROOT")
+            or raw.get("root")
+            or DEFAULT_PROFILE_ROOT
+        ),
+        "seedCookiesWhenEmpty": bool(raw.get("seedCookiesWhenEmpty", True)),
+        "syncStoredCookiesBeforeRun": bool(raw.get("syncStoredCookiesBeforeRun", True)),
+        "refreshStoredCookiesAfterLogin": bool(
+            raw.get("refreshStoredCookiesAfterLogin", True)
+        ),
+    }
+
+
+async def first_scrollable_element(page, selectors, *, probe_timeout_ms=2000):
+    """Return ``(selector, handle)`` for the first element that can scroll.
+
+    Douyin renders several zero-height ``[role=grid]`` nodes next to the real
+    list, so a plain ``locator.first`` silently picks a hidden one and every
+    scroll is a no-op. Iterate the matches, prefer one that actually has content
+    below the fold, and only fall back to a rendered-but-unscrollable container
+    (a list short enough to fit entirely). The short probe timeout also keeps a
+    stale selector from burning the full navigation budget.
+    """
+    rendered = []
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = await locator.count()
+        except Exception:
+            continue
+        for index in range(min(count, 8)):
+            try:
+                handle = await locator.nth(index).element_handle(
+                    timeout=probe_timeout_ms
+                )
+            except Exception:
+                continue
+            if not handle:
+                continue
+            try:
+                metrics = await page.evaluate(
+                    """(element) => ({
+                        clientHeight: element.clientHeight,
+                        scrollHeight: element.scrollHeight,
+                    })""",
+                    handle,
+                )
+            except Exception:
+                continue
+            client_height = int(metrics.get("clientHeight") or 0)
+            if client_height <= 0:
+                continue
+            if int(metrics.get("scrollHeight") or 0) > client_height:
+                # A container with content below the fold is the real list.
+                return selector, handle
+            rendered.append((selector, handle))
+    if rendered:
+        # Nothing on this page can scroll: every row is already rendered.
+        return rendered[0]
+    return "", None
+
+
+def browser_account_lock_name(user):
+    """Stable lock-file stem for the browser session that drives one account."""
+    identity = str(
+        (user or {}).get("unique_id") or (user or {}).get("username") or "unknown"
+    ).strip()
+    return "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in identity
+    )[:80]
+
+
+async def acquire_browser_account_lock(
+    user,
+    account_name,
+    *,
+    wait_seconds=7200,
+    poll_seconds=5,
+    lock_dir=None,
+):
+    """Take the per-account browser lock that the sender also holds.
+
+    A persistent profile can only be driven by one browser at a time, so the
+    friend refresher must share this lock instead of racing the sender.
+    """
+    directory = Path(lock_dir or BROWSER_ACCOUNT_LOCK_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / f"{browser_account_lock_name(user)}.lock"
+    guard = FileLock(f"{lock_path}.guard", timeout=0)
+    started_at = asyncio.get_running_loop().time()
+    last_logged_at = 0
+
+    while True:
+        try:
+            guard.acquire()
+            token = uuid.uuid4().hex
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "token": token,
+                        "account": account_name,
+                        "createdAt": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            logger.debug(
+                "Acquired browser account lock for %s at %s", account_name, lock_path
+            )
+            return guard, lock_path, token
+        except FileLockTimeout:
+            now = asyncio.get_running_loop().time()
+            if now - started_at > wait_seconds:
+                raise RuntimeError(
+                    f"timed out waiting for browser account lock for {account_name}"
+                )
+            if now - last_logged_at >= 30:
+                logger.info(
+                    "Waiting for existing browser account lock for %s at %s",
+                    account_name,
+                    lock_path,
+                )
+                last_logged_at = now
+            await asyncio.sleep(poll_seconds)
+        except Exception:
+            guard.release()
+            raise
+
+
+def release_browser_account_lock(handle, lock_path, token, account_name):
+    try:
+        try:
+            current = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            current = {}
+        if str(current.get("token") or "") == token:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+    finally:
+        try:
+            handle.release()
+            logger.debug(
+                "Released browser account lock for %s at %s", account_name, lock_path
+            )
+        except Exception:
+            pass
 
 
 async def install_browser():
