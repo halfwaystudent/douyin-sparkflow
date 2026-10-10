@@ -4123,7 +4123,10 @@ class StreakTaskIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_server_rejection_can_still_persist_visible_weak_evidence(self):
+    def test_unknown_receipt_can_still_persist_visible_weak_evidence(self):
+        # A receipt we could not read is not a refusal: the page bubble stays the
+        # only evidence and the attempt is recorded as unverified. An explicit
+        # refusal (BrowserSendRejected) must not reach this path.
         self.assertTrue(
             tasks._should_persist_recovered_browser_evidence(
                 True,

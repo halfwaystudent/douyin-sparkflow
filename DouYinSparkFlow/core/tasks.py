@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import unicodedata
 import uuid
 from contextlib import contextmanager
@@ -665,8 +666,23 @@ async def start_im_send_observer(page, account_name, target_name):
             receipt.update(_receipt_body_meta(data, body_text))
             if json_ok is not None:
                 receipt["jsonOk"] = bool(json_ok)
+            if item.get("is_send_post"):
+                # A refusal code is the server's answer even when the envelope
+                # is not JSON, so it has to reach the sender as a refusal
+                # instead of an unreadable receipt.
+                rejection = _extract_send_rejection(data, body_text)
+                if rejection:
+                    receipt["rejection"] = rejection
+                    receipt["ok"] = False
             if not receipt["ok"]:
-                receipt["reason"] = _extract_error_text(data, body_text)
+                reason_text = _extract_error_text(data, body_text)
+                rejection = _receipt_rejection(receipt)
+                if rejection:
+                    code_text = f'{rejection["key"]}={rejection["value"]}'
+                    reason_text = (
+                        f"{code_text}; {reason_text}" if reason_text else code_text
+                    )
+                receipt["reason"] = _trim(reason_text, 300)
             if item.get("is_send_post"):
                 state["send_receipt"] = receipt
                 _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"], "jsonParsed": receipt["jsonParsed"], "logid": receipt.get("logid", ""), "reason": receipt.get("reason", "")})
@@ -995,8 +1011,113 @@ def _json_body_success(data):
     return None
 
 
+# Response keys whose non-zero value means the server refused this message.
+# Deliberately narrow: generic metadata such as ``msg_type`` and free-form
+# fields such as ``decision_type`` are not refusal evidence, and neither is the
+# message text the operator asked us to send.
+SEND_REJECTION_CODE_KEYS = (
+    "status_code",
+    "err_no",
+    "errno",
+    "error_code",
+    "check_code",
+    "raw_check_code",
+)
+
+_SEND_REJECTION_PATTERNS = tuple(
+    (key, re.compile(rf'"{re.escape(key)}"\s*:\s*(-?\d+)'))
+    for key in SEND_REJECTION_CODE_KEYS
+)
+
+
+def _coerce_rejection_code(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def _rejection_from_json(data):
+    """First non-zero refusal code inside a parsed response body."""
+    pending = [data]
+    while pending:
+        candidate = pending.pop(0)
+        if isinstance(candidate, dict):
+            for key in SEND_REJECTION_CODE_KEYS:
+                if key not in candidate:
+                    continue
+                code = _coerce_rejection_code(candidate.get(key))
+                if code:
+                    return {"key": key, "value": code, "source": "json"}
+            pending.extend(
+                value
+                for value in candidate.values()
+                if isinstance(value, (dict, list))
+            )
+        elif isinstance(candidate, list):
+            pending.extend(
+                value for value in candidate if isinstance(value, (dict, list))
+            )
+    return None
+
+
+def _rejection_from_raw_text(body_text):
+    """First non-zero refusal code inside a body we could not parse as JSON.
+
+    Douyin answers ``message_send`` with protobuf-wrapped JSON, so the refusal
+    code is visible in the raw bytes long before any JSON parser sees it. Only
+    the quoted JSON form counts: free text that happens to mention a code, such
+    as the message we just tried to send, is not refusal evidence.
+    """
+    text = str(body_text or "")
+    if not text:
+        return None
+    for key, pattern in _SEND_REJECTION_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        code = _coerce_rejection_code(match.group(1))
+        if code:
+            return {"key": key, "value": code, "source": "raw"}
+    return None
+
+
+def _extract_send_rejection(data, body_text):
+    """Refusal evidence from a ``message_send`` response, or ``None``.
+
+    Only a non-zero value on a known code field counts. A response we cannot
+    parse and that carries no such field stays unknown: it is neither evidence
+    of a refusal nor evidence of acceptance.
+    """
+    if isinstance(data, dict):
+        # A body we could parse is authoritative: read its fields, never scan
+        # its text, so a string value cannot masquerade as a refusal code.
+        return _rejection_from_json(data)
+    return _rejection_from_raw_text(body_text)
+
+
+def _receipt_rejection(receipt):
+    """Refusal recorded on a send receipt, if the observer found one."""
+    if not isinstance(receipt, dict):
+        return None
+    rejection = receipt.get("rejection")
+    return dict(rejection) if isinstance(rejection, dict) else None
+
+
 def _should_persist_recovered_browser_evidence(sent_ok, error):
-    del error
+    """Whether the page bubble may stand in for the server's answer.
+
+    A refusal is an explicit answer, so the page must not rewrite it as sent.
+    An unreadable or unknown response keeps the existing fallback: the bubble
+    is the only evidence available and the attempt is recorded as unverified.
+    """
+    if isinstance(error, BrowserSendRejected) or _receipt_rejection(
+        getattr(error, "receipt", None)
+    ):
+        return False
     return bool(sent_ok)
 
 
@@ -1018,6 +1139,10 @@ async def detect_message_already_sent(page, chat_input, message, before_snapshot
 
 
 def classify_browser_failure(stage, exc):
+    if isinstance(exc, BrowserSendRejected):
+        # The server answered with a refusal code: that is a decision about this
+        # message, not a transport hiccup worth retrying within the day.
+        return "send_rejected"
     detail = str(exc or "")
     lowered = detail.lower()
 
@@ -1058,6 +1183,18 @@ class FriendListUnavailableError(RuntimeError):
 
 class FriendListIncompleteError(RuntimeError):
     pass
+
+
+class BrowserSendRejected(RuntimeError):
+    """``message_send`` answered with an explicit refusal code.
+
+    Carries the code so the failure record and the run report show which field
+    refused the message instead of a generic "receipt rejected".
+    """
+
+    def __init__(self, message, rejection=None):
+        super().__init__(message)
+        self.rejection = dict(rejection or {})
 
 
 ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
@@ -1927,13 +2064,13 @@ def _target_failure_category_today(user, target_name, now):
 
 
 def _target_has_non_retryable_failure_today(user, target_name, now):
-    return _target_failure_category_today(user, target_name, now) in {
-        "protocol_check_message_not_pass",
-        "protocol_check_message_self_visible",
-        "protocol_user_blocked",
-        "protocol_user_not_in_conversation",
-        "protocol_check_conversation_not_pass",
-    }
+    # Read the shared terminal set instead of repeating it, so a new terminal
+    # category (for example a refused browser send) cannot be honoured by the
+    # state machine but forgotten by the retry planners.
+    return (
+        _target_failure_category_today(user, target_name, now)
+        in streak_state.TERMINAL_FAILURE_CATEGORIES
+    )
 
 
 def _pending_failed_targets(user, now):
@@ -1955,6 +2092,9 @@ def _pending_failed_targets(user, now):
                 not _target_sent_today(user, target_name, now)
                 and not streak_state.attempt_in_progress(user, target_name, now)
                 and not streak_state.fallback_attempted_today(user, target_name, now)
+                and not _target_has_non_retryable_failure_today(
+                    user, target_name, now
+                )
             ):
                 targets.append(target_name)
         if targets:
@@ -1966,6 +2106,11 @@ def _pending_failed_targets(user, now):
         if streak_state.attempt_in_progress(user, target_name, now):
             continue
         if streak_state.fallback_attempted_today(user, target_name, now):
+            continue
+        if _target_has_non_retryable_failure_today(user, target_name, now):
+            # A terminal category (for example a message the server refused) is
+            # today's decision for this target, so the failure queue must not
+            # offer it for another attempt.
             continue
         if _target_unconfirmed_today(user, target_name, now):
             targets.append(target_name)
@@ -3407,6 +3552,13 @@ async def _do_user_task_locked(
                             raise RuntimeError(f"server send request was not observed; {detail}")
                         if not im_summary.get("send_response_seen"):
                             raise RuntimeError(f"server send response was not observed; {detail}")
+                        rejection = _receipt_rejection(send_receipt)
+                        if rejection:
+                            raise BrowserSendRejected(
+                                "server refused the message "
+                                f"({rejection.get('key')}={rejection.get('value')}); {detail}",
+                                rejection,
+                            )
                         if not server_ok:
                             raise RuntimeError(f"server send receipt rejected; {detail}")
                     elif not sent_ok:

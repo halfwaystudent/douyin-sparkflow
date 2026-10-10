@@ -31,6 +31,9 @@ CONFIRMED_STATES = {STATE_SEND_CONFIRMED, STATE_STREAK_VERIFIED}
 FAILED_STATES = {STATE_FAILED_RETRYABLE, STATE_FAILED_TERMINAL}
 
 TERMINAL_FAILURE_CATEGORIES = {
+    # The server answered message_send with a refusal code: the message itself
+    # was rejected, so retrying the same target today only repeats the refusal.
+    "send_rejected",
     "protocol_check_message_not_pass",
     "protocol_check_message_self_visible",
     "protocol_user_blocked",
