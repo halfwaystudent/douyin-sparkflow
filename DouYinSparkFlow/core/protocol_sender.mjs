@@ -427,16 +427,25 @@ async function fetchSessionIdentity(cookieString, cookieMap) {
     `https://creator.douyin.com/aweme/v1/creator/im/user_token/?${params.toString()}`,
     { headers },
   );
-  if (!response.ok || data?.status_code !== 0 || !data?.user_id) {
+  const userId = extractExactUserId(text);
+  if (!response.ok || data?.status_code !== 0 || !userId) {
     throw new ProtocolError("Failed to resolve creator IM session identity", {
       status: response.status,
       body: text,
     });
   }
   return {
-    userId: String(data.user_id),
+    userId,
     sessionToken: String(data.token || ""),
   };
+}
+
+// JSON.parse turns a numeric 16+ digit user_id into a rounded float, so the
+// UID is read from the raw body text and kept as a decimal string (issue #41).
+export function extractExactUserId(text) {
+  const match = /"user_id"\s*:\s*(?:"(\d{1,32})"|(\d{1,32})(?![\d.eE]))/.exec(String(text || ""));
+  const value = match ? match[1] || match[2] : "";
+  return value && !/^0+$/.test(value) ? value : "";
 }
 
 async function fetchIdentitySecurityToken(cookieString, cookieMap) {

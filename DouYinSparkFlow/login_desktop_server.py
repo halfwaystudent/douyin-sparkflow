@@ -887,18 +887,15 @@ async def collect_www_login_result(page, context):
 
     if not username:
         username = "抖音官网账号"
-    uid_cookie = ""
-    for cookie in cookies:
-        if cookie.get("name") in {"uid_tt", "uid_tt_ss", "sid_uid", "passport_csrf_token"}:
-            uid_cookie = str(cookie.get("value") or "")
-            if uid_cookie:
-                break
-    suffix = "".join(ch for ch in uid_cookie if ch.isalnum())[:24]
-    unique_id = f"web-self-{suffix or username}"
+    # No account ID is derived here: cookie fragments (uid_tt, csrf tokens) are
+    # not the platform UID. The Web console reads the trusted UID from the
+    # cookies and refuses the save when it cannot (issue #41).
     return {
-        "unique_id": unique_id,
+        "unique_id": "",
+        "display_id": "",
         "username": username,
         "cookies": cookies,
+        "identity_source": "www_fallback",
     }
 
 

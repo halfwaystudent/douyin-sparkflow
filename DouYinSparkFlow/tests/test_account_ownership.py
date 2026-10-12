@@ -104,6 +104,16 @@ class AccountOwnershipTests(unittest.TestCase):
             "session_id": "s-1",
         }
 
+    @staticmethod
+    def _trusted(uid):
+        # The trusted platform UID normally comes from the creator self-identity
+        # endpoint; these ownership tests use the same value as the stored key.
+        return patch.object(
+            app_module.account_identity,
+            "fetch_trusted_identity",
+            return_value={"uid": uid, "source": "creator_im_user_token", "version": 1},
+        )
+
     def _post_qr_save(self, username, principal, exported):
         active = {
             "mode": "add",
@@ -126,6 +136,7 @@ class AccountOwnershipTests(unittest.TestCase):
             patch.object(app_module, "begin_login_release"),
             patch.object(app_module, "begin_login_expiration", return_value=None),
             patch.object(app_module, "get_workspace_state", return_value={}),
+            self._trusted(exported["unique_id"]),
         ):
             return self.client.post("/login-desktop/save", data={"csrf_token": "t"})
 
@@ -137,9 +148,20 @@ class AccountOwnershipTests(unittest.TestCase):
             patch.object(
                 app_module,
                 "verify_login_result",
-                return_value=(True, "", {"unique_id": unique_id, "username": "主号"}, ""),
+                return_value=(
+                    True,
+                    "",
+                    {
+                        "unique_id": unique_id,
+                        "username": "主号",
+                        "display_id": "",
+                        "trusted": {"uid": unique_id, "source": "creator_im_user_token", "version": 1},
+                    },
+                    "",
+                ),
             ),
             patch.object(app_module, "call_login_desktop", return_value={"ok": True}),
+            self._trusted(unique_id),
         ):
             return self.client.post(
                 "/accounts/cookies",
@@ -306,9 +328,10 @@ class AccountOwnershipTests(unittest.TestCase):
         self.assertEqual([], self._refs("zxb"))
         self.assertEqual(["acc-a"], self._refs("zcf"))
 
-    def test_save_prefers_the_users_own_row_over_an_unassigned_duplicate(self):
-        # The unassigned duplicate sorts first; a naive pick would update it,
-        # dedupe the user's own row away, then fail validating the stale ref.
+    def test_save_updates_the_users_own_row_and_keeps_the_unassigned_duplicate(self):
+        # Issue #41: a save must never auto-delete another legacy row that shares
+        # the stored key. The unassigned duplicate sorts first, so the save has to
+        # pick the user's own row to update, and both rows stay.
         self._write_accounts(
             [_account("1001", "acc-free", "主号"), _account("1001", "acc-u", "主号")]
         )
@@ -321,10 +344,43 @@ class AccountOwnershipTests(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_code)
-        self.assertEqual(
-            ["acc-u"], [item["account_ref"] for item in self._accounts()]
-        )
+        rows = {item["account_ref"]: item for item in self._accounts()}
+        # Both legacy rows survive: no automatic dedupe/delete on a save.
+        self.assertEqual(["acc-free", "acc-u"], [item["account_ref"] for item in self._accounts()])
+        # The user's own row is the one that was updated and bound.
+        self.assertEqual("1001", rows["acc-u"]["platform_uid"])
+        self.assertNotIn("platform_uid", rows["acc-free"])
+        # The other user's reference set is untouched (there is none here), and
+        # the operator keeps their own row.
         self.assertEqual(["acc-u"], self._refs("zxb"))
+
+    def test_relogin_of_own_row_never_dedupes_another_users_same_key_row(self):
+        # Issue #41 fix: an explicit re-login target still may not take another
+        # user's legacy row that shares its stored key.
+        self._write_accounts(
+            [_account("1001", "acc-u", "主号"), _account("1001", "acc-a", "主号")]
+        )
+        self._write_users([_web_user("zxb", ["acc-u"]), _web_user("zcf", ["acc-a"])])
+        principal = self._principal("zxb", ["acc-u"])
+        active = {"mode": "relogin", "account_ref": "acc-u", "ticket": "t1", "username": "zxb", "session_id": "s-1"}
+        exported = {"unique_id": "1001", "username": "主号", "cookies": [{"name": "ttwid", "value": "v"}]}
+        with (
+            patch.object(app_module, "current_user", return_value="zxb"),
+            patch.object(app_module, "current_principal", return_value=principal),
+            patch.object(app_module, "validate_csrf", return_value=True),
+            patch.object(app_module, "get_login_lock", return_value=active),
+            patch.object(app_module, "owns_login_lock", return_value=True),
+            patch.object(app_module, "call_login_desktop", return_value={"ok": True, "result": exported}),
+            patch.object(app_module, "begin_login_release"),
+            patch.object(app_module, "begin_login_expiration", return_value=None),
+            patch.object(app_module, "get_workspace_state", return_value={}),
+            self._trusted("1001"),
+        ):
+            response = self.client.post("/login-desktop/save", data={"csrf_token": "t", "relogin_unique_id": "1001"})
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(["acc-u", "acc-a"], [item["account_ref"] for item in self._accounts()])
+        self.assertEqual(["acc-a"], self._refs("zcf"))
 
     # -- A3: delete, then rebind the same Douyin account ------------------
 

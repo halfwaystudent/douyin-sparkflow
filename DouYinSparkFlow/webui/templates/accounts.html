@@ -32,6 +32,8 @@
         <span class="account-name">
           <strong>{{ account.username }}</strong>
           <small>{{ account.targets|length }} 个目标好友 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
+          {% set ident_ids = identity_view(account) %}
+          <small class="identity-ids">{% if ident_ids.platform_uid %}平台 UID {{ ident_ids.platform_uid }}{% else %}历史 ID {{ account.unique_id }}（类型未知）{% endif %}{% if ident_ids.display_id %} · 页面显示 ID {{ ident_ids.display_id }}{% endif %}</small>
         </span>
       </span>
       <span class="summary-metrics">
@@ -42,6 +44,8 @@
         {% if check == "verifying" %}<span class="pill" title="保存后正在后台验证登录态并刷新好友列表">登录态验证中</span>
         {% elif check == "unverified" %}<span class="pill warning" title="{{ (account.login_verification or {}).get('reason', '') }}；定时发送不受影响">登录态未能验证</span>
         {% elif check == "login_required" %}<span class="pill danger">需重新登录</span>{% endif %}
+        {% set ident = identity_view(account) %}
+        <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
         <span class="pill {% if enabled %}success{% else %}warning{% endif %}">{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>

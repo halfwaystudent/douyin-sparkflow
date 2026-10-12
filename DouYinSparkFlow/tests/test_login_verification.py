@@ -36,11 +36,19 @@ class FakeStore:
 class SaveFirstVerifyLaterTests(unittest.TestCase):
     def _save(self, store, **kwargs):
         exported = {"unique_id": "1001", "username": "主号", "cookies": ACCOUNT["cookies"]}
+        # The row is already bound to the trusted UID this login reports, so the
+        # save is a same-account update (issue #41).
+        for row in store.accounts:
+            row.setdefault("platform_uid", "1001")
+            row.setdefault("identity_binding", {"source": "creator_im_user_token", "version": 1, "method": "same_uid"})
+        identity = {"uid": "1001", "source": "creator_im_user_token", "version": 1}
         with (
             patch.object(app_module, "update_user_data", side_effect=store.update),
             patch.object(app_module, "remove_account_refs_from_users"),
         ):
-            return app_module.save_exported_login_result(exported, relogin_account_ref="acc-1", **kwargs)
+            return app_module.save_exported_login_result(
+                exported, relogin_account_ref="acc-1", identity=identity, **kwargs
+            )
 
     def test_a_pending_save_is_not_paused(self):
         stale = dict(ACCOUNT, login_required=True, pending_login_verification=True,

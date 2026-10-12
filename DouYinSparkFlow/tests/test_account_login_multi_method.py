@@ -19,6 +19,11 @@ from webui import login_lock
 ACCOUNT_ID = "1234567890"
 
 
+def trusted(uid=ACCOUNT_ID):
+    """A trusted identity as the creator self-identity endpoint reports it."""
+    return {"uid": uid, "source": "creator_im_user_token", "version": 1}
+
+
 def isolate_account_data(test_case, path):
     """Point the account store at ``path`` whatever the ambient environment is.
 
@@ -613,6 +618,7 @@ class SavedLoginHealthTests(unittest.TestCase):
             },
             is_healthy=False,
             verification_reason="登录态仍不可用",
+            identity=trusted(),
         )
 
         self.assertEqual("created", action)
@@ -633,6 +639,7 @@ class SavedLoginHealthTests(unittest.TestCase):
             },
             is_healthy=False,
             verification_reason="登录态仍不可用",
+            identity=trusted(),
         )
 
         account, action = app_module.save_exported_login_result(
@@ -642,6 +649,7 @@ class SavedLoginHealthTests(unittest.TestCase):
                 "cookies": [{"name": "sessionid", "value": "fresh", "domain": ".douyin.com", "path": "/"}],
             },
             is_healthy=True,
+            identity=trusted(),
         )
 
         self.assertEqual("updated", action)
@@ -650,7 +658,10 @@ class SavedLoginHealthTests(unittest.TestCase):
         self.assertNotIn("account_health", account)
         self.assertTrue(streak_state.preflight_account(account)["healthy"])
 
-    def test_relogin_identity_mismatch_is_recorded(self):
+    def test_relogin_with_a_different_trusted_uid_is_refused(self):
+        # Issue #41: a re-login whose trusted platform UID differs from the
+        # account's bound UID is a different person. It used to overwrite the
+        # account and record identity_mismatch; now nothing is written.
         app_module.save_exported_login_result(
             {
                 "unique_id": ACCOUNT_ID,
@@ -658,21 +669,27 @@ class SavedLoginHealthTests(unittest.TestCase):
                 "cookies": [{"name": "sessionid", "value": "v", "domain": ".douyin.com", "path": "/"}],
             },
             is_healthy=True,
+            identity=trusted(),
         )
 
-        account, _ = app_module.save_exported_login_result(
-            {
-                "unique_id": "9999999999",
-                "username": "Other",
-                "cookies": [{"name": "sessionid", "value": "w", "domain": ".douyin.com", "path": "/"}],
-            },
-            relogin_unique_id=ACCOUNT_ID,
-            is_healthy=True,
-        )
+        with self.assertRaises(app_module.IdentityConflict):
+            app_module.save_exported_login_result(
+                {
+                    "unique_id": "9999999999",
+                    "username": "Other",
+                    "cookies": [{"name": "sessionid", "value": "w", "domain": ".douyin.com", "path": "/"}],
+                },
+                relogin_unique_id=ACCOUNT_ID,
+                is_healthy=True,
+                identity=trusted("9999999999"),
+            )
 
-        self.assertEqual("9999999999", account["unique_id"])
-        self.assertEqual(ACCOUNT_ID, account["identity_mismatch"]["expected"])
-        self.assertEqual("9999999999", account["identity_mismatch"]["actual"])
+        stored = json.loads(self.users_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(stored))
+        self.assertEqual(ACCOUNT_ID, stored[0]["unique_id"])
+        self.assertEqual(ACCOUNT_ID, stored[0]["platform_uid"])
+        self.assertEqual("v", stored[0]["cookies"][0]["value"])
+        self.assertNotIn("identity_mismatch", stored[0])
 
 
 class WebCookieLoginEndpointTests(unittest.TestCase):
@@ -797,9 +814,20 @@ class WebCookieLoginEndpointTests(unittest.TestCase):
             patch.object(
                 app_module,
                 "verify_login_result",
-                return_value=(True, "", {"unique_id": ACCOUNT_ID, "username": "Tester"}, ""),
+                return_value=(
+                    True,
+                    "",
+                    {
+                        "unique_id": ACCOUNT_ID,
+                        "username": "Tester",
+                        "display_id": "",
+                        "trusted": trusted(),
+                    },
+                    "",
+                ),
             ),
             patch.object(app_module, "account_by_unique_id", return_value=None),
+            patch.object(app_module, "get_userData", return_value=[]),
             patch.object(app_module, "save_exported_login_result", return_value=(saved, "created")) as save,
             patch.object(app_module, "update_web_user") as update_user,
             patch.object(app_module, "call_login_desktop", return_value={"ok": True}) as clear_state,
@@ -819,7 +847,7 @@ class WebCookieLoginEndpointTests(unittest.TestCase):
         self.assertEqual("/clear-login-state", clear_state.call_args.args[0])
         login_result = save.call_args.args[0]
         self.assertEqual("pasted", login_result["cookie_source"])
-        self.assertEqual(ACCOUNT_ID, login_result["unique_id"])
+        self.assertEqual(ACCOUNT_ID, save.call_args.kwargs["identity"]["uid"])
 
 
 class FriendRefreshEndpointTests(unittest.TestCase):
@@ -1582,6 +1610,13 @@ class ReloginOverwriteTests(unittest.TestCase):
                 "cookies": [{"name": "old", "value": "1"}],
             }
         ]
+        # The legacy row's own saved login proves it is the same platform UID.
+        legacy_check = {
+            "account_ref": "acc-1",
+            "fingerprint": app_module.account_identity.record_fingerprint(accounts[0]),
+            "uid": "999",
+            "reason": "",
+        }
 
         def fake_update(mutator, **_kwargs):
             return mutator(accounts)
@@ -1598,19 +1633,22 @@ class ReloginOverwriteTests(unittest.TestCase):
                 },
                 relogin_account_ref="acc-1",
                 relogin_unique_id="123",
+                identity=trusted("999"),
+                legacy_check=legacy_check,
             )
 
-        # Identity and login state are overwritten...
-        self.assertEqual("999", account["unique_id"])
+        # The login state is overwritten and the trusted UID is bound, while the
+        # stored key, the operator's targets and the send ledger survive and no
+        # second row is created for the same person.
+        self.assertEqual("123", account["unique_id"])
+        self.assertEqual("999", account["platform_uid"])
         self.assertEqual("New", account["username"])
-        # ...while the operator's targets and send ledger survive, and no second
-        # row is created for the same person.
         self.assertEqual(["A", "B"], account["targets"])
         self.assertEqual({"A": {"done": True}}, account["target_states"])
         self.assertEqual(1, len(accounts))
         self.assertEqual("updated", action)
 
-    def test_differing_uid_is_accepted_so_the_account_is_overwritten(self):
+    def test_verification_reports_the_trusted_uid_not_the_page_id(self):
         import asyncio
         from unittest.mock import AsyncMock
 
@@ -1622,11 +1660,18 @@ class ReloginOverwriteTests(unittest.TestCase):
                 {"name": "sid_guard", "value": "y"},
             ],
         }
-        with patch.object(
-            app_module,
-            "verify_account_session",
-            new=AsyncMock(
-                return_value={"identity": {"unique_id": "999", "username": "Tester"}}
+        with (
+            patch.object(
+                app_module,
+                "verify_account_session",
+                new=AsyncMock(
+                    return_value={"identity": {"unique_id": "999", "display_id": "abc999", "username": "Tester"}}
+                ),
+            ),
+            patch.object(
+                app_module.account_identity,
+                "fetch_trusted_identity",
+                return_value=trusted("7000000000000001"),
             ),
         ):
             verified, reason, identity, category = asyncio.run(
@@ -1637,12 +1682,12 @@ class ReloginOverwriteTests(unittest.TestCase):
                 )
             )
 
-        # Refusing here is what used to leave a duplicate row behind, so a
-        # differing id must come back as a successful verification.
         self.assertTrue(verified)
         self.assertEqual("", reason)
         self.assertEqual("", category)
-        self.assertEqual("999", identity["unique_id"])
+        self.assertEqual("7000000000000001", identity["unique_id"])
+        self.assertEqual("7000000000000001", identity["trusted"]["uid"])
+        self.assertEqual("abc999", identity["display_id"])
 
 
 class ScheduleWindowLockTests(unittest.TestCase):
@@ -1833,6 +1878,7 @@ class UnverifiedLoginAttributionTests(unittest.TestCase):
                 "cookies": [{"name": "sessionid", "value": "v", "domain": ".douyin.com", "path": "/"}],
             },
             is_healthy=False,
+            identity=trusted(),
             **kwargs,
         )
         return account

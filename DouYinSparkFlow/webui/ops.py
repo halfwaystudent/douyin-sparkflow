@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
+from core import identity as account_identity
 from core import streak_state
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
 from core.tasks import (
@@ -61,6 +62,7 @@ FAILURE_CATEGORY_LABELS = {
     "protocol_login_required": "协议登录失效",
     "browser_login_required": "浏览器登录失效",
     "account_identity_mismatch": "账号身份不匹配",
+    "identity_unverified": "身份暂时无法核实",
     "network_unavailable": "网络不可用",
     "structure_changed": "页面结构变化",
     "empty_result": "未读到好友",
@@ -1487,6 +1489,18 @@ def _orphan_records(account, configured_targets):
     return orphan_history, orphan_failure
 
 
+
+def identity_view(account):
+    """Identity fields for the console: state, label, hint and both IDs."""
+    state = account_identity.identity_state(account)
+    return {
+        "identity_state": state,
+        "identity_label": account_identity.IDENTITY_STATE_LABELS.get(state, ""),
+        "identity_hint": account_identity.IDENTITY_STATE_HINTS.get(state, ""),
+        "platform_uid": account_identity.account_uid(account),
+        "display_id": str(account.get(account_identity.FIELD_DISPLAY_ID) or ""),
+    }
+
 def get_send_console_snapshot(account_refs=None):
     allowed_refs = None if account_refs is None else {str(ref).strip() for ref in account_refs}
     accounts = [
@@ -1682,6 +1696,7 @@ def get_send_console_snapshot(account_refs=None):
                 "state": account_state,
                 "account_health": account_health,
                 "login_verification_state": str((account.get("login_verification") or {}).get("state") or ""),
+                **identity_view(account),
                 "attention_count": attention_count,
                 "pending_count": pending_count,
                 "last_confirmed_at": last_confirmed_at,

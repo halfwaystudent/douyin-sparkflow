@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   SDK_BUNDLES,
   buildTargetLookup,
+  extractExactUserId,
   isSuccessfulSendResult,
   mergeConversationCache,
   resolveTargetMapping,
@@ -427,4 +428,13 @@ test("a conversation lookup exception preserves earlier sends", async () => {
   assert.equal(result.sent[0].success, true);
   assert.equal(result.sent[1].success, false);
   assert.equal(result.sent[1].statusName, "exception");
+});
+
+test("the creator user_id keeps every digit of a long UID (issue #41)", () => {
+  assert.equal(extractExactUserId('{"status_code":0,"user_id":1234567890123456789}'), "1234567890123456789");
+  assert.equal(extractExactUserId('{"user_id":"2718281828459045","token":"t"}'), "2718281828459045");
+  assert.equal(extractExactUserId('{"user_id":1.5e15}'), "");
+  assert.equal(extractExactUserId('{"user_id":0}'), "");
+  assert.equal(extractExactUserId('{"status_code":0}'), "");
+  assert.equal(extractExactUserId(""), "");
 });

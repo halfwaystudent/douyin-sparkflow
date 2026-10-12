@@ -484,6 +484,30 @@
     return data;
   };
 
+  // A legacy account record has no bound platform UID and its old login could
+  // not be checked: the server asks the operator once (issue #41). The token is
+  // opaque, single-use and expires; it carries no cookie or session material.
+  const confirmIdentityMigration = (info) => {
+    const minutes = Math.max(1, Math.round(Number(info.expires_in || 600) / 60));
+    return window.confirm(
+      "这条旧账号记录无法自动核实身份（旧登录已失效）。\n\n" +
+        `账号：${info.username || "未命名"}\n` +
+        `历史 ID：${info.history_id || "无"}（${info.history_id_type || "类型未知"}）\n` +
+        `本次登录的平台 UID：${info.platform_uid || ""}\n` +
+        (info.display_id ? `本次页面显示的 ID：${info.display_id}\n` : "") +
+        "\n点“确定”＝确认本次登录的就是这个原账号：绑定平台 UID，保留它的目标、发送记录和归属" +
+        `（${minutes} 分钟内有效，只能使用一次）；\n` +
+        "点“取消”＝不做任何改动。",
+    );
+  };
+  const identityFailureText = (error) => {
+    const payload = (error && error.payload) || {};
+    const label = payload.identityLabel || payload.categoryLabel;
+    const hint = payload.hint ? ` ${payload.hint}` : "";
+    const retry = payload.retryable ? " 可稍后重试。" : "";
+    return `${label ? `【${label}】` : ""}${error.message}${hint}${retry}`;
+  };
+
   const loadFrame = (force = false) => {
     if (displayMode === "native") return;
     if (frame && (force || frame.dataset.loaded !== "1") && frame.dataset.src) {
@@ -944,11 +968,23 @@
       const previousLabel = status ? status.textContent : "";
       if (status) status.textContent = "正在验证 Cookie 并登录，请稍候...";
       try {
-        const data = await postForm("/accounts/cookies", {
+        const cookiePayload = {
           cookie_input: cookieInput,
           display_name: String(displayName?.value || "").trim(),
           relogin_unique_id: reloginToggle?.checked ? String(reloginSelect?.value || "") : "",
-        });
+        };
+        let data;
+        try {
+          data = await postForm("/accounts/cookies", cookiePayload);
+        } catch (error) {
+          const info = error.payload && error.payload.identity_confirmation;
+          if (!info) throw error;
+          if (!confirmIdentityMigration(info)) {
+            if (status) status.textContent = "已取消：没有改动任何账号。";
+            return;
+          }
+          data = await postForm("/accounts/cookies", { ...cookiePayload, confirm_identity: info.token });
+        }
         if (status) status.textContent = data.message || "Cookie 登录成功，页面即将刷新。";
         if (input) input.value = "";
         window.setTimeout(() => window.location.reload(), 900);
@@ -963,7 +999,9 @@
             payload.retryable === false
               ? "这类失败重试通常无效，请重新获取 Cookie。"
               : "可稍后重试。";
-          status.textContent = `Cookie 登录失败${label}：${error.message}${retryHint}`;
+          status.textContent = payload.identityState
+            ? `Cookie 登录未保存：${identityFailureText(error)}`
+            : `Cookie 登录失败${label}：${error.message}${retryHint}`;
         }
       } finally {
         submit.disabled = false;
@@ -995,10 +1033,23 @@
   document.querySelectorAll(".login-desktop-save").forEach((button) => {
     button.addEventListener("click", async () => {
       if (button.disabled) return;
-      const saveLogin = (extra = {}) =>
+      const postSave = (extra = {}) =>
         postForm("/login-desktop/save", {
           relogin_unique_id: button.dataset.reloginUniqueId || "",
           ...extra,
+        });
+      const saveLogin = (extra = {}) =>
+        postSave(extra).catch((error) => {
+          const info = error.payload && error.payload.identity_confirmation;
+          if (!info) throw error;
+          setSaving(false);
+          if (!confirmIdentityMigration(info)) {
+            const cancelled = new Error("已取消保存：没有改动任何账号。");
+            cancelled.cancelled = true;
+            throw cancelled;
+          }
+          setSaving(true);
+          return postSave({ ...extra, confirm_identity: info.token });
         });
       setSaving(true);
       try {
@@ -1067,8 +1118,9 @@
               : data.friend_refresh === "running"
                 ? "（好友列表正在刷新中）"
                 : "（好友列表未自动刷新，可手动点刷新）";
+        const identityNote = data.identityLabel ? `（${data.identityLabel}）` : "";
         setStatus(
-          `已保存登录账号：${data.account?.username || ""}${refreshNote}`,
+          `已保存登录账号：${data.account?.username || ""}${identityNote}${refreshNote}`,
           data.verification === "pending" || data.friend_refresh === "started" ? "success" : "warning",
         );
         closeFrame();
@@ -1080,6 +1132,15 @@
           // report the real condition instead of a generic save failure.
           setStatus("保存时本会话已不再持有登录工作区：请重新申请工作区后再保存。", "warning");
           recoverLease();
+          return;
+        }
+        if (error.cancelled) {
+          statusHeldUntil = Date.now() + 8000;
+          setStatus(error.message);
+          return;
+        }
+        if (error.payload && error.payload.identityState) {
+          setStatus(`登录未保存：${identityFailureText(error)}`, error.payload.retryable ? "warning" : "danger");
           return;
         }
         setStatus(`保存登录账号失败：${error.message}`, "danger");

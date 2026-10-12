@@ -338,7 +338,11 @@ def update_web_user(
     password: str | None = None,
     enabled: bool | None = None,
     account_refs: list[str] | None = None,
+    append_account_ref: str | None = None,
 ) -> dict:
+    if append_account_ref is not None and account_refs is not None:
+        raise UserStoreError("cannot replace and append account references together")
+    appended = _validate_refs([append_account_ref]) if append_account_ref is not None else None
     refs = _validate_refs(account_refs) if account_refs is not None else None
     with _web_users_lock():
         auth_epoch = _coerce_session_version(
@@ -367,6 +371,12 @@ def update_web_user(
         if enabled is not None:
             revoke_session = True
             target["enabled"] = bool(enabled)
+        if appended is not None:
+            # A login claims only its own proven ref. Never restore an old
+            # whole-session ref list after an administrator has revoked it.
+            if all_assigned_refs(original_username).intersection(appended):
+                raise UserStoreError("one or more accounts are already assigned")
+            target["account_refs"] = list(dict.fromkeys(list(target.get("account_refs", [])) + appended))
         if account_refs is not None:
             if all_assigned_refs(original_username).intersection(refs):
                 raise UserStoreError("one or more accounts are already assigned")

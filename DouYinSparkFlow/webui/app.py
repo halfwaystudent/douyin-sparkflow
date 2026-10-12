@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from core import identity as account_identity
 from core import streak_state
 from core.cookies import (
     CookieParseError,
@@ -101,6 +104,7 @@ from webui.ops import (
     get_ops_snapshot,
     cache_age_label,
     duplicate_display_names,
+    identity_view,
     log_file_path,
     read_log_tail,
     summarize_log_tail,
@@ -132,6 +136,7 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["cache_age_label"] = cache_age_label
 templates.env.globals["duplicate_display_names"] = duplicate_display_names
 templates.env.globals["schedule_window_state"] = schedule_window_state
+templates.env.globals["identity_view"] = identity_view
 
 
 def _dedupe_targets(values):
@@ -513,40 +518,35 @@ def _incomplete_scan_fields(reason):
     }
 
 
-def _dedupe_account_records(accounts: list[dict], *, unique_id: str, keep_ref: str) -> set[str]:
-    normalized = normalize_unique_id(unique_id)
-    removed_refs = set()
-    remaining = []
-    for account in accounts:
-        if normalize_unique_id(account.get("unique_id")) == normalized and str(account.get("account_ref", "")) != str(keep_ref):
-            ref = str(account.get("account_ref", "")).strip()
-            if ref:
-                removed_refs.add(ref)
-            continue
-        remaining.append(account)
-    if len(remaining) != len(accounts):
-        accounts[:] = remaining
-    if removed_refs:
-        remove_account_refs_from_users(removed_refs)
-    return removed_refs
+# A save never removes or merges other account rows (issue #41 A3/A4): only an
+# explicit user delete or merge may do that. Health clearing is shared with the
+# CLI save through core.identity so both paths lift exactly the same flags.
+HEALTH_CLEARING_KEYS = account_identity.LOGIN_HEALTH_FLAG_KEYS
+LOGIN_RELATED_FAILURE_CATEGORIES = account_identity.LOGIN_RELATED_FAILURE_CATEGORIES
 
 
-HEALTH_CLEARING_KEYS = (
-    "account_failure",
-    "account_health",
-    "account_identity_mismatch",
-    "identity_mismatch",
-    "login_required",
-    "needs_relogin",
-    "pending_login_verification",
-)
+def _clear_login_health(account):
+    account_identity.clear_login_health(account)
 
 
-def write_login_verification(account_ref, token, outcome, *, category="", reason=""):
+def write_login_verification(
+    account_ref,
+    token,
+    outcome,
+    *,
+    category="",
+    reason="",
+    expected_uid="",
+    actual_uid="",
+    generation="",
+):
     """Record a background login check on the account it was started for.
 
-    outcome is "verified", "login_required" or "unverified". The token ties the
-    result to the save that queued it, so a newer login is never overwritten.
+    outcome is "verified", "login_required", "identity_conflict" or
+    "unverified". The token (and, for a new save, the login generation) ties the
+    result to the save that queued it, so a stale check never touches a newer
+    login. Records written before generations existed only carry the token and
+    are still accepted on the token alone.
     """
     def mutate(accounts):
         target = account_by_ref(accounts, account_ref)
@@ -554,12 +554,35 @@ def write_login_verification(account_ref, token, outcome, *, category="", reason
         if not target or not token or current.get("token") != token:
             # Deleted meanwhile, or a newer login replaced this one.
             return None, False
+        if generation:
+            # A CLI save (or any newer login) that kept the same token but moved
+            # to a new generation must not be judged by this stale result.
+            if account_identity.account_login_generation(target) != generation:
+                return None, False
         finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if outcome == "verified":
             # Only lift this check's own marker. The save already cleared the old
             # health flags; anything written since (an identity mismatch, a real
             # send failure today) is newer and must stay.
             target.pop("login_verification", None)
+        elif outcome == "identity_conflict":
+            if expected_uid and account_identity.account_uid(target) != expected_uid:
+                # The binding changed since this check started; not ours to judge.
+                return None, False
+            target["identity_mismatch"] = {
+                "kind": "platform_uid",
+                "expected": expected_uid,
+                "actual": actual_uid,
+                "detectedAt": finished_at,
+                "reason": "saved login belongs to a different platform UID",
+            }
+            target["login_verification"] = {
+                "state": "identity_conflict",
+                "token": token,
+                "finishedAt": finished_at,
+                "category": account_identity.CATEGORY_IDENTITY_CONFLICT,
+                "reason": reason,
+            }
         elif outcome == "login_required":
             target["login_required"] = True
             health = dict(target.get("account_health") or {})
@@ -578,8 +601,8 @@ def write_login_verification(account_ref, token, outcome, *, category="", reason
                 "reason": reason,
             }
         else:
-            # Not confirmed either way (network or page): shown on the
-            # account, but sending is not paused for it.
+            # Not confirmed either way (network, page or identity endpoint):
+            # shown on the account, but sending is not paused for it.
             target["login_verification"] = {
                 "state": "unverified",
                 "token": token,
@@ -591,6 +614,34 @@ def write_login_verification(account_ref, token, outcome, *, category="", reason
 
     return update_user_data(mutate, force_reload=True)
 
+
+
+async def check_saved_login_identity(account):
+    """After a usable login, check it still belongs to the record's bound UID.
+
+    Returns ``(outcome, category, reason, expected_uid, actual_uid)``. A usable
+    login is not proof of the right account; an unreadable identity is shown
+    but does not pause sending; a legacy record (no bound UID) is not judged.
+    """
+    expected_uid = account_identity.account_uid(account)
+    if not expected_uid:
+        return "verified", "", "", "", ""
+    try:
+        trusted = await asyncio.to_thread(
+            account_identity.fetch_trusted_identity,
+            list(account.get("cookies") or []),
+        )
+    except account_identity.IdentityUnavailable as exc:
+        return "unverified", account_identity.CATEGORY_IDENTITY_UNVERIFIED, str(exc), expected_uid, ""
+    if trusted["uid"] != expected_uid:
+        return (
+            "identity_conflict",
+            account_identity.CATEGORY_IDENTITY_CONFLICT,
+            "保存的登录属于另一个平台 UID",
+            expected_uid,
+            trusted["uid"],
+        )
+    return "verified", "", "", expected_uid, trusted["uid"]
 
 def find_same_name_account(accounts, username):
     """Accounts sharing a nickname, used to ask before adding a duplicate.
@@ -610,7 +661,7 @@ def find_same_name_account(accounts, username):
 
 
 def unique_id_owned_by_other(accounts, unique_id, current):
-    """True when another Web user owns any row for this Douyin account.
+    """True when another Web user owns any row for this stored key.
 
     Duplicate rows for one ``unique_id`` are legacy data. The save path updates
     one row and then dedupes the rest, so the permission check has to look at
@@ -629,7 +680,7 @@ def unique_id_owned_by_other(accounts, unique_id, current):
 
 
 def preferred_account_for_unique_id(accounts, unique_id, current):
-    """Pick the row a save should update for one Douyin account.
+    """Pick the row a save should update for one stored key.
 
     Duplicate rows for a single ``unique_id`` are legacy data. Prefer a row the
     caller may access so a save updates the user's own row instead of an
@@ -648,6 +699,222 @@ def preferred_account_for_unique_id(accounts, unique_id, current):
     return fallback
 
 
+def rows_for_identity(accounts, uid, display_id=""):
+    """Rows a login with this trusted UID may belong to.
+
+    Rows bound to the UID are the answer when they exist. Otherwise legacy
+    rows (no bound UID) whose stored key equals the UID or the ID the page
+    displayed are candidates; they still need proof or a confirmation before
+    the login is written to them.
+    """
+    bound = account_identity.accounts_bound_to(accounts, uid)
+    if bound:
+        return bound, "bound"
+    # Old saves stored the digits-only form of whatever the page showed, so a
+    # handle with letters ("abc123") lives under "123"; match both forms.
+    shown = str(display_id or "").strip()
+    keys = {str(uid or "").strip(), shown, normalize_unique_id(shown)} - {""}
+    legacy = []
+    for row in accounts or []:
+        if account_identity.account_uid(row):
+            continue
+        stored = str(row.get("unique_id") or "").strip()
+        if stored in keys or (stored and normalize_unique_id(stored) == uid and stored.isdigit()):
+            legacy.append(row)
+    return legacy, "legacy"
+
+
+def identity_owned_by_other(accounts, uid, current, display_id=""):
+    """True when a row this login maps to belongs to another Web user."""
+    rows, _kind = rows_for_identity(accounts, uid, display_id)
+    for row in rows:
+        if can_access_account(current, row):
+            continue
+        if account_owner_username(row.get("account_ref", "")):
+            return True
+    return False
+
+
+def may_claim_account(current, account):
+    """The caller's own row, or an unassigned row a proven login may adopt."""
+    if can_access_account(current, account):
+        return True
+    return not account_owner_username(account.get("account_ref", ""))
+
+
+def preferred_row(rows, current):
+    fallback = None
+    for row in rows or []:
+        if can_access_account(current, row):
+            return row
+        if fallback is None:
+            fallback = row
+    return fallback
+
+
+class IdentityConflict(RuntimeError):
+    """The login's trusted UID differs from the account it would update."""
+
+    def __init__(self, message, *, account_ref="", expected_uid="", actual_uid=""):
+        super().__init__(message)
+        self.account_ref = account_ref
+        self.expected_uid = expected_uid
+        self.actual_uid = actual_uid
+
+
+class NeedsIdentityConfirmation(RuntimeError):
+    """A legacy record cannot be checked automatically; ask the operator once."""
+
+    def __init__(self, message, *, account, fingerprint, uid, candidate_fingerprint=""):
+        super().__init__(message)
+        self.account_ref = str(account.get("account_ref", ""))
+        self.username = str(account.get("username", ""))
+        self.history_id = str(account.get("unique_id", ""))
+        self.fingerprint = fingerprint
+        self.uid = uid
+        # Digest of the whole login candidate (UID + display/nickname + every
+        # cookie with its metadata). Server-side only; never sent to the client.
+        self.candidate_fingerprint = candidate_fingerprint
+
+
+class LoginSavePermissionDenied(RuntimeError):
+    """The live session or account assignment changed before saving."""
+
+
+# Raised by the shared identity helpers too, so there is exactly one class.
+AccountChangedConcurrently = account_identity.AccountChangedConcurrently
+
+
+IDENTITY_SAVE_ERRORS = (
+    IdentityConflict,
+    NeedsIdentityConfirmation,
+    AccountChangedConcurrently,
+    account_identity.IdentityUnavailable,
+)
+IDENTITY_CONFIRMATION_TTL_SECONDS = 600
+
+
+def identity_category_label(category):
+    if category == account_identity.CATEGORY_IDENTITY_UNVERIFIED:
+        return account_identity.IDENTITY_STATE_LABELS["unverified"]
+    return CATEGORY_LABELS.get(category, CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED])
+
+
+# One-time migration confirmations live only in this process: they carry the
+# record fingerprint and the candidate UID, never cookies or tokens, and the
+# client only ever sees an opaque random key.
+_identity_confirmations: dict[str, dict] = {}
+
+
+def _issue_identity_confirmation(current, exc, route):
+    now = time.monotonic()
+    for key in [key for key, item in _identity_confirmations.items() if item["expires"] <= now]:
+        _identity_confirmations.pop(key, None)
+    token = secrets.token_urlsafe(24)
+    _identity_confirmations[token] = {
+        "username": str(current.get("username", "")),
+        "session_id": str(current.get("session_id", "")),
+        "route": route,
+        "account_ref": exc.account_ref,
+        "fingerprint": exc.fingerprint,
+        "uid": exc.uid,
+        "candidate_fingerprint": exc.candidate_fingerprint,
+        "expires": now + IDENTITY_CONFIRMATION_TTL_SECONDS,
+    }
+    return token
+
+
+def _take_identity_confirmation(token, current, route):
+    """Consume a confirmation once; returns (record, problem)."""
+    record = _identity_confirmations.pop(str(token or ""), None)
+    if not record:
+        return None, "确认已失效或已使用，请重新保存登录"
+    if record["expires"] <= time.monotonic():
+        return None, "确认已过期，请重新保存登录"
+    if (
+        record["username"] != str(current.get("username", ""))
+        or record["session_id"] != str(current.get("session_id", ""))
+        or record["route"] != route
+    ):
+        return None, "确认不属于当前会话，请重新保存登录"
+    return record, ""
+
+
+def _identity_error_response(exc, current, route, *, display_id=""):
+    if isinstance(exc, NeedsIdentityConfirmation):
+        token = _issue_identity_confirmation(current, exc, route)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "category": "identity_confirmation_required",
+                "identityState": "pending_confirmation",
+                "identityLabel": account_identity.IDENTITY_STATE_LABELS["pending_confirmation"],
+                "identity_confirmation": {
+                    "token": token,
+                    "account_ref": exc.account_ref,
+                    "username": exc.username,
+                    "history_id": exc.history_id,
+                    "history_id_type": "类型未知（可能是抖音号，也可能是平台 UID）",
+                    "platform_uid": exc.uid,
+                    "display_id": display_id,
+                    "expires_in": IDENTITY_CONFIRMATION_TTL_SECONDS,
+                },
+            },
+            status_code=409,
+        )
+    if isinstance(exc, IdentityConflict):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "category": account_identity.CATEGORY_IDENTITY_CONFLICT,
+                "identityState": "conflict",
+                "identityLabel": account_identity.IDENTITY_STATE_LABELS["conflict"],
+                "hint": account_identity.IDENTITY_STATE_HINTS["conflict"],
+                "retryable": False,
+            },
+            status_code=409,
+        )
+    if isinstance(exc, AccountChangedConcurrently):
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "category": "account_changed", "retryable": True},
+            status_code=409,
+        )
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": str(exc),
+            "category": account_identity.CATEGORY_IDENTITY_UNVERIFIED,
+            "categoryLabel": account_identity.IDENTITY_STATE_LABELS["unverified"],
+            "identityState": "unverified",
+            "retryable": True,
+        },
+        status_code=503,
+    )
+
+
+def legacy_identity_check(account) -> dict:
+    """Read the UID a legacy record's own saved cookies log in as.
+
+    Runs outside the data lock (it is a network call); the fingerprint lets the
+    save refuse to use the answer if the record changed meanwhile.
+    """
+    check = {
+        "account_ref": str(account.get("account_ref", "")),
+        "fingerprint": account_identity.record_fingerprint(account),
+        "uid": "",
+        "reason": "",
+    }
+    if account_identity.account_uid(account):
+        return check
+    try:
+        check["uid"] = account_identity.fetch_trusted_identity(list(account.get("cookies") or []))["uid"]
+    except account_identity.IdentityUnavailable as exc:
+        check["reason"] = str(exc)
+    return check
+
+
 def save_exported_login_result(
     login_result: dict,
     *,
@@ -658,14 +925,64 @@ def save_exported_login_result(
     verification_reason: str = "",
     verification_category: str = "",
     verification_token: str = "",
+    identity: dict | None = None,
+    legacy_check: dict | None = None,
+    confirmation: dict | None = None,
+    auto_matched: bool = False,
+    expected_records: dict | None = None,
+    principal_resolver=None,
+    expected_principal: dict | None = None,
 ) -> tuple[dict, str]:
-    unique_id = normalize_unique_id(login_result.get("unique_id"))
+    """Write a login to the account its trusted platform UID belongs to.
+
+    The match is decided before anything is written: the same bound UID
+    updates the row in place (keeping its key, targets, history, owner and
+    profile); a different bound UID is refused; a legacy row is bound only on
+    proof from its own saved cookies or a confirmed one-time migration. Any
+    refusal raises before the data file is written.
+    """
+    identity = dict(identity or login_result.get("identity") or {})
+    uid = str(identity.get("uid") or "")
+    if not account_identity.is_valid_uid(uid):
+        raise account_identity.IdentityUnavailable("暂时无法核实账号身份，未保存本次登录，请稍后重试")
     username = str(display_name or login_result.get("username") or "").strip()
     cookies = list(login_result.get("cookies") or [])
-    if not unique_id or not cookies:
+    display_id = account_identity.display_id_from_text(
+        login_result.get("display_id") or ""
+    )
+    if not cookies:
         raise RuntimeError("Exported login result is incomplete")
     if not username:
-        username = unique_id
+        username = display_id or uid
+    # The whole candidate this save belongs to: the UID plus every parameter
+    # that would change what gets written (nickname, displayed ID and the full
+    # cookie list). A one-time confirmation is bound to this digest, so a
+    # different candidate cannot reuse an older confirmation. Server-side only.
+    candidate = account_identity.candidate_fingerprint(
+        uid=uid,
+        username=str(login_result.get("username") or ""),
+        display_id=display_id,
+        display_name=str(display_name or ""),
+        cookies=cookies,
+    )
+    # Every saved login gets a new generation; a background check started for an
+    # older generation must not touch this one (issue #41 A7).
+    login_generation = account_identity.new_login_generation()
+
+    def verify_snapshot(target, accounts):
+        """Refuse when the chosen record changed since the pre-check snapshot.
+
+        The snapshot is read before any network identity check; verifying inside
+        the data lock keeps the compare-then-write atomic (issue #41 A8).
+        """
+        authorize_save(target, accounts)
+        if expected_records is None:
+            return
+        ref = str((target or {}).get("account_ref") or "")
+        if ref not in expected_records:
+            raise AccountChangedConcurrently("目标账号在核实期间被新建或已删除，请重新保存")
+        if account_identity.record_fingerprint(target) != expected_records[ref]:
+            raise AccountChangedConcurrently("账号记录在核实期间被修改，请重新保存")
 
     def apply_health(account):
         """Record what is known about this login's usability on the account."""
@@ -673,23 +990,23 @@ def save_exported_login_result(
             # Saved before the login state was re-checked in a second browser:
             # the background verifier decides. Until then the account is not
             # paused, and the token lets a newer login supersede the check.
-            for key in HEALTH_CLEARING_KEYS:
-                account.pop(key, None)
+            _clear_login_health(account)
             account["login_verification"] = {
                 "state": "verifying",
                 "token": verification_token,
+                "generation": login_generation,
                 "startedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             return
         account.pop("login_verification", None)
         if is_healthy:
-            for key in HEALTH_CLEARING_KEYS:
-                account.pop(key, None)
-            account.pop("pending_login_verification", None)
+            _clear_login_health(account)
             return
         # A verification that failed for a page or transport reason must not
         # masquerade as a logged-out account: only a real login failure sets
         # login_required, and the recorded category is the one the verifier found.
+        # The identity itself is proven, so old identity markers go either way.
+        account_identity.clear_identity_markers(account)
         category = str(verification_category or CATEGORY_LOGIN_REQUIRED)
         account["pending_login_verification"] = True
         if category in streak_state.LOGIN_FAILURE_CATEGORIES:
@@ -706,6 +1023,124 @@ def save_exported_login_result(
         )
         account["account_health"] = existing_health
 
+    def resolve_legacy(target, accounts):
+        """Return the binding method for an unbound target, or raise."""
+        others = [
+            row
+            for row in account_identity.accounts_bound_to(accounts, uid)
+            if row is not target
+        ]
+        if others:
+            raise IdentityConflict(
+                "这个平台 UID 已绑定到另一条账号记录，不能再写入这条记录",
+                account_ref=str(target.get("account_ref", "")),
+                actual_uid=uid,
+            )
+        fingerprint = account_identity.record_fingerprint(target)
+        ref = str(target.get("account_ref", ""))
+        for evidence in (legacy_check, confirmation):
+            if evidence and evidence.get("account_ref") == ref and evidence.get("fingerprint") != fingerprint:
+                raise AccountChangedConcurrently("账号记录在核实期间被修改，请重新保存")
+        if legacy_check and legacy_check.get("account_ref") == ref and legacy_check.get("uid"):
+            if legacy_check["uid"] != uid:
+                raise IdentityConflict(
+                    "本次登录的平台 UID 与这条账号原来的登录不一致，未覆盖原账号",
+                    account_ref=ref,
+                    expected_uid=legacy_check["uid"],
+                    actual_uid=uid,
+                )
+            return account_identity.BINDING_LEGACY_COOKIE, ""
+        if confirmation:
+            if confirmation.get("account_ref") != ref or confirmation.get("uid") != uid:
+                raise AccountChangedConcurrently("确认已失效：本次登录或目标账号已变化，请重新保存")
+            # The confirmation is bound to the exact candidate that was shown
+            # (UID, nickname/display and every cookie); a different candidate
+            # that happens to yield the same UID must not reuse it (issue #41 A5).
+            if str(confirmation.get("candidate_fingerprint") or "") != candidate:
+                raise AccountChangedConcurrently("本次登录的账号凭据与发起确认时不同，请重新保存")
+            return account_identity.BINDING_CONFIRMED, str(confirmation.get("confirmed_by") or "")
+        raise NeedsIdentityConfirmation(
+            "这条旧账号记录无法自动核实身份，请确认本次登录的是原账号",
+            account=target,
+            fingerprint=fingerprint,
+            uid=uid,
+            candidate_fingerprint=candidate,
+        )
+
+    def authorize_save(target, accounts):
+        # Resolve again inside the account-data lock, not from the principal
+        # captured before the network await. Check live ownership even when a
+        # caller still has an old account_refs list.
+        if principal_resolver is None:
+            return
+        live = principal_resolver()
+        previous = expected_principal or {}
+        if not live or any(
+            live.get(key) != previous.get(key)
+            for key in ("username", "role", "session_id")
+        ):
+            raise LoginSavePermissionDenied("登录会话在核实期间已变化，请重新登录")
+        if live.get("role") == "admin":
+            return
+        candidates = account_identity.accounts_bound_to(accounts, uid)
+        if target is not None:
+            candidates = candidates + [target]
+        for row in candidates:
+            owner = account_owner_username(row.get("account_ref", ""))
+            if owner and owner != live.get("username"):
+                raise LoginSavePermissionDenied("账号归属在核实期间已变化，无权保存该账号")
+
+    def update_row(target, accounts, method, confirmed_by=""):
+        authorize_save(target, accounts)
+        target["username"] = username
+        target["cookies"] = cookies
+        if display_id:
+            target[account_identity.FIELD_DISPLAY_ID] = display_id
+        target.setdefault("enabled", True)
+        target[account_identity.FIELD_LOGIN_GENERATION] = login_generation
+        if method:
+            account_identity.bind_identity(target, identity, method, confirmed_by=confirmed_by)
+        # The identity is proven (same UID, own-cookie match or confirmation),
+        # so markers from the old mixed-ID comparison no longer apply.
+        account_identity.clear_identity_markers(target)
+        apply_health(target)
+        # The save never removes, merges or re-keys any other row: only an
+        # explicit user delete or merge does that (issue #41 A3/A4).
+        return dict(target)
+
+    def create_row(accounts):
+        account_identity.check_expected_records(accounts, expected_records)
+        authorize_save(None, accounts)
+        for row in accounts:
+            # A new record may not reuse a stored key or a platform UID that
+            # another record already occupies, even one bound to a different
+            # UID: that would be a cross-identity key collision (issue #41 A4).
+            if str(row.get("unique_id") or "").strip() == uid:
+                raise IdentityConflict(
+                    "已有一条以该 ID 保存的旧记录，请从那条账号重新登录以完成核实",
+                    actual_uid=uid,
+                )
+            if account_identity.account_uid(row) == uid:
+                raise IdentityConflict(
+                    "这个平台 UID 已绑定到另一条账号记录，请先在账号管理里处理",
+                    actual_uid=uid,
+                )
+        account = {
+            "account_ref": f"acc-{uuid.uuid4().hex}",
+            "unique_id": uid,
+            "username": username,
+            "cookies": cookies,
+            "targets": [],
+            "enabled": True,
+        }
+        if display_id:
+            account[account_identity.FIELD_DISPLAY_ID] = display_id
+        account_identity.bind_identity(account, identity, account_identity.BINDING_NEW)
+        account[account_identity.FIELD_LOGIN_GENERATION] = login_generation
+        apply_health(account)
+        accounts.append(account)
+        return dict(account)
+
     def mutate(accounts):
         for item in accounts:
             if not str(item.get("account_ref", "")).strip():
@@ -718,67 +1153,57 @@ def save_exported_login_result(
                 else find_account(accounts, relogin_unique_id)
             )
             if not target:
+                if expected_records is not None:
+                    raise AccountChangedConcurrently("目标账号在核实期间被删除，请重新保存")
                 raise RuntimeError("Target account not found for relogin")
-            previous_unique_id = normalize_unique_id(target.get("unique_id"))
-            target["unique_id"] = unique_id
-            target["username"] = username
-            target["cookies"] = cookies
-            target.setdefault("enabled", True)
-            apply_health(target)
-            if previous_unique_id and previous_unique_id != unique_id:
-                target["identity_mismatch"] = {
-                    "expected": previous_unique_id,
-                    "actual": unique_id,
-                    "detectedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "reason": "relogin exported a different Douyin account",
-                }
-            _dedupe_account_records(
-                accounts,
-                unique_id=unique_id,
-                keep_ref=target.get("account_ref", ""),
-            )
-            return dict(target), "updated", True
+            # The operator-chosen record must be the one the pre-check saw.
+            verify_snapshot(target, accounts)
+            bound_uid = account_identity.account_uid(target)
+            if bound_uid:
+                if bound_uid != uid:
+                    raise IdentityConflict(
+                        "本次登录的是另一个抖音账号（平台 UID 不同），未覆盖原账号",
+                        account_ref=str(target.get("account_ref", "")),
+                        expected_uid=bound_uid,
+                        actual_uid=uid,
+                    )
+                return update_row(target, accounts, ""), "updated", True
+            try:
+                method, confirmed_by = resolve_legacy(target, accounts)
+            except IdentityConflict:
+                if not auto_matched or not legacy_check or not legacy_check.get("uid"):
+                    raise
+                # The row was only guessed from a matching ID, and its own
+                # cookies prove it is someone else: this is a new account.
+                return create_row(accounts), "created", True
+            return update_row(target, accounts, method, confirmed_by), "updated", True
 
-        existing = find_account(accounts, unique_id)
-        if existing:
-            existing["username"] = username
-            existing["cookies"] = cookies
-            existing.setdefault("enabled", True)
-            apply_health(existing)
-            _dedupe_account_records(
-                accounts,
-                unique_id=unique_id,
-                keep_ref=existing.get("account_ref", ""),
-            )
-            return dict(existing), "updated", True
-
-        account = {
-            "account_ref": f"acc-{uuid.uuid4().hex}",
-            "unique_id": unique_id,
-            "username": username,
-            "cookies": cookies,
-            "targets": [],
-            "enabled": True,
-        }
-        apply_health(account)
-        accounts.append(account)
-        return dict(account), "created", True
+        bound = account_identity.accounts_bound_to(accounts, uid)
+        if len(bound) > 1:
+            raise IdentityConflict("有多条账号记录绑定了同一个平台 UID，请先在账号管理里处理", actual_uid=uid)
+        if bound:
+            # An auto-matched record is subject to the same snapshot constraint.
+            verify_snapshot(bound[0], accounts)
+            return update_row(bound[0], accounts, ""), "updated", True
+        return create_row(accounts), "created", True
 
     account, action, _ = update_user_data(mutate, force_reload=True)
     return account, action
 
 
 async def verify_login_result(login_result, *, relogin_account_ref="", relogin_unique_id=""):
-    """Verify a freshly exported or pasted login result against the real pages.
+    """Verify a pasted login result: usable login state, then trusted identity.
 
     Returns ``(verified, reason, identity, category)`` and never raises for a
-    plain login-state failure: the caller records the reason on the account and
-    reports the real category to the user.
+    plain login-state failure. ``identity`` carries the trusted UID under
+    ``identity["trusted"]``; the page-read ID is kept only as ``display_id``.
     """
     cookies = list(login_result.get("cookies") or [])
     identity = {
-        "unique_id": normalize_unique_id(login_result.get("unique_id")),
+        "unique_id": "",
+        "display_id": "",
         "username": str(login_result.get("username") or "").strip(),
+        "trusted": {},
     }
     try:
         require_auth_cookies(cookies)
@@ -787,7 +1212,7 @@ async def verify_login_result(login_result, *, relogin_account_ref="", relogin_u
 
     account = {
         "cookies": cookies,
-        "unique_id": identity["unique_id"],
+        "unique_id": "",
         "username": identity["username"],
         "account_ref": relogin_account_ref,
     }
@@ -800,32 +1225,18 @@ async def verify_login_result(login_result, *, relogin_account_ref="", relogin_u
         return False, f"登录态验证失败：{exc}", identity, CATEGORY_LOGIN_REQUIRED
 
     resolved = dict(result.get("identity") or {})
-    if resolved.get("unique_id"):
-        identity = {
-            "unique_id": normalize_unique_id(resolved["unique_id"]),
-            "username": str(resolved.get("username") or identity["username"]).strip(),
-        }
-    if not identity["unique_id"]:
-        # Without a stable identity the account cannot be matched or created, so
-        # report a categorised failure instead of an opaque save error.
-        return (
-            False,
-            "登录态已通过但无法读取账号身份，请稍后重试或改用扫码登录",
-            identity,
-            CATEGORY_LOGIN_REQUIRED,
-        )
-    if relogin_unique_id and identity["unique_id"]:
-        requested = normalize_unique_id(relogin_unique_id)
-        if requested != identity["unique_id"]:
-            # Re-logging into a chosen account must overwrite it, not refuse.
-            # The same person's Douyin id can come back in a different form, and
-            # refusing here is what used to leave a duplicate row behind. The
-            # save records an identity_mismatch entry so the change is visible.
-            logger.info(
-                "Relogin identity differs from the stored id; overwriting the account: requested=%s scanned=%s",
-                requested,
-                identity["unique_id"],
-            )
+    identity["display_id"] = account_identity.display_id_from_text(
+        resolved.get("display_id") or resolved.get("unique_id") or ""
+    )
+    identity["username"] = str(resolved.get("username") or identity["username"]).strip()
+    try:
+        trusted = await asyncio.to_thread(account_identity.fetch_trusted_identity, cookies)
+    except account_identity.IdentityUnavailable as exc:
+        # The login works but who it belongs to is unknown: retry later, do not
+        # create or overwrite an account and do not call it a logout.
+        return False, str(exc), identity, account_identity.CATEGORY_IDENTITY_UNVERIFIED
+    identity["trusted"] = trusted
+    identity["unique_id"] = trusted["uid"]
     return True, "", identity, ""
 
 
@@ -1595,7 +2006,7 @@ def create_app():
             await asyncio.sleep(LOGIN_VERIFICATION_IDLE_POLL_SECONDS)
         return False
 
-    async def _verify_saved_login(account_ref, token, *, delay=0):
+    async def _verify_saved_login(account_ref, token, generation="", *, delay=0):
         loop = asyncio.get_running_loop()
         if delay:
             await asyncio.sleep(delay)
@@ -1610,15 +2021,20 @@ def create_app():
                     "unverified",
                     category="busy",
                     reason="长时间没有空闲的浏览器可用于验证",
+                    generation=generation,
                 )
                 return
             account = account_by_ref(get_userData(force_reload=True), account_ref)
             if not account or (account.get("login_verification") or {}).get("token") != token:
                 return
+            if generation and account_identity.account_login_generation(account) != generation:
+                # A newer login superseded this check while it waited (A7).
+                return
             # Only a page that shows the login is gone pauses the account; a
             # timeout, a browser error or an unreadable identity is "unverified"
             # and leaves sending alone (D12/Q4).
             reason, category = "", ""
+            expected_uid = actual_uid = ""
             try:
                 await asyncio.wait_for(
                     verify_account_session(account, auth_only=True),
@@ -1638,6 +2054,8 @@ def create_app():
             except Exception as exc:  # noqa: BLE001 - any other failure is not a verdict
                 logger.warning("Background login verification errored: %s", exc)
                 category, reason, outcome = "verification_error", f"验证时出错：{exc}", "unverified"
+            if outcome == "verified":
+                outcome, category, reason, expected_uid, actual_uid = await check_saved_login_identity(account)
             logger.info(
                 "Background login verification: ref=%s outcome=%s category=%s",
                 account_ref,
@@ -1651,6 +2069,9 @@ def create_app():
                 outcome,
                 category=category or "",
                 reason=reason or "",
+                expected_uid=expected_uid,
+                actual_uid=actual_uid,
+                generation=generation,
             )
             if outcome != "verified" or not saved:
                 return
@@ -1672,8 +2093,10 @@ def create_app():
                 }
                 await _run_friend_refresh_job(normalized_id, saved, "")
 
-    def _queue_login_verification(account_ref, token, *, delay=0):
-        task = asyncio.create_task(_verify_saved_login(account_ref, token, delay=delay))
+    def _queue_login_verification(account_ref, token, generation="", *, delay=0):
+        task = asyncio.create_task(
+            _verify_saved_login(account_ref, token, generation, delay=delay)
+        )
         login_verification_tasks.add(task)
 
         def finished(done):
@@ -1689,7 +2112,12 @@ def create_app():
             check = dict(account.get("login_verification") or {})
             ref = str(account.get("account_ref") or "")
             if check.get("state") == "verifying" and check.get("token") and ref:
-                _queue_login_verification(ref, check["token"], delay=LOGIN_VERIFICATION_RESTART_DELAY_SECONDS)
+                _queue_login_verification(
+                    ref,
+                    check["token"],
+                    str(check.get("generation") or ""),
+                    delay=LOGIN_VERIFICATION_RESTART_DELAY_SECONDS,
+                )
 
     @app.post("/accounts/{unique_id}/friends/refresh/async")
     async def refresh_account_friend_list_async(request: Request, unique_id: str):
@@ -3062,6 +3490,10 @@ def create_app():
                 )
             relogin_account_ref = str(account.get("account_ref", ""))
             relogin_unique_id = str(account.get("unique_id", ""))
+        # The operator-chosen target (from the form), kept apart from a target a
+        # one-time confirmation would introduce: a confirmation may never switch
+        # the explicit target to another account (issue #41 A5).
+        explicit_relogin_ref = relogin_account_ref
 
         try:
             cookies = parse_cookie_input(raw_cookies)
@@ -3077,12 +3509,21 @@ def create_app():
                 status_code=400,
             )
 
+        # Snapshot the store before the network identity check; the save refuses
+        # to write when the chosen record changed meanwhile (issue #41 A8).
+        expected_records = {
+            str(row.get("account_ref") or ""): account_identity.record_fingerprint(row)
+            for row in get_userData(force_reload=True)
+            if str(row.get("account_ref") or "").strip()
+        }
+
         verified, verification_reason, identity, verification_category = await verify_login_result(
             {"cookies": cookies},
-            relogin_unique_id=relogin_unique_id,
+            relogin_account_ref=relogin_account_ref,
         )
         if not verified:
-            # Reject without touching any account: the pasted state was not usable.
+            # Reject without touching any account: the pasted state was not
+            # usable, or whose account it is could not be confirmed yet.
             category = verification_category or CATEGORY_LOGIN_REQUIRED
             logger.warning(
                 "Cookie login rejected for user=%s category=%s reason=%s",
@@ -3095,61 +3536,108 @@ def create_app():
                     "ok": False,
                     "error": verification_reason or "Cookie 验证失败",
                     "category": category,
-                    "categoryLabel": CATEGORY_LABELS.get(
-                        category,
-                        CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED],
-                    ),
-                    # A transport or page problem is worth retrying; a rejected
-                    # Cookie is not.
+                    "categoryLabel": identity_category_label(category),
+                    # A transport, page or identity-endpoint problem is worth
+                    # retrying; a rejected Cookie is not.
                     "retryable": category != CATEGORY_LOGIN_REQUIRED,
                 },
                 status_code=400,
             )
 
-        if not relogin_account_ref and identity.get("unique_id"):
+        trusted = dict(identity.get("trusted") or {})
+        uid = trusted.get("uid", "")
+        display_id = identity.get("display_id", "")
+        confirmation = None
+        confirm_token = str(form.get("confirm_identity", "")).strip()
+        if confirm_token:
+            record, problem = _take_identity_confirmation(confirm_token, current, "cookies")
+            if not record:
+                return JSONResponse({"ok": False, "error": problem, "category": "identity_confirmation_invalid"}, status_code=409)
+            confirmed_account = account_by_ref(get_userData(force_reload=True), record["account_ref"])
+            if not confirmed_account or not may_claim_account(current, confirmed_account):
+                return JSONResponse({"ok": False, "error": "无权操作该账号"}, status_code=403)
+            if explicit_relogin_ref and explicit_relogin_ref != record["account_ref"]:
+                # The confirmation is for a different account than the one the
+                # operator explicitly chose; never repoint the target silently.
+                return JSONResponse(
+                    {"ok": False, "error": "确认的账号与本次重新登录的账号不一致"},
+                    status_code=409,
+                )
+            relogin_account_ref = record["account_ref"]
+            confirmation = {
+                "account_ref": record["account_ref"],
+                "fingerprint": record["fingerprint"],
+                "uid": record["uid"],
+                "candidate_fingerprint": record.get("candidate_fingerprint", ""),
+                "confirmed_by": current.get("username", ""),
+            }
+
+        auto_matched = False
+        if not relogin_account_ref and uid:
             saved_accounts = get_userData(force_reload=True)
-            existing = preferred_account_for_unique_id(
-                saved_accounts, identity["unique_id"], current
-            )
+            if identity_owned_by_other(saved_accounts, uid, current, display_id):
+                return JSONResponse(
+                    {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
+                    status_code=403,
+                )
+            rows, kind = rows_for_identity(saved_accounts, uid, display_id)
+            existing = preferred_row(rows, current)
             if existing:
-                if unique_id_owned_by_other(
-                    saved_accounts, identity["unique_id"], current
-                ):
-                    return JSONResponse(
-                        {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
-                        status_code=403,
-                    )
                 if not can_access_account(current, existing):
                     # No other row for this Douyin account is owned, so the user
                     # who just proved control may claim this one in place.
                     logger.info(
-                        "Cookie login adopts an unassigned account: scanned_uid=%s account_ref=%s user=%s",
-                        normalize_unique_id(identity["unique_id"]),
+                        "Cookie login adopts an unassigned account: platform_uid=%s account_ref=%s user=%s",
+                        uid,
                         existing.get("account_ref", ""),
                         current.get("username", ""),
                     )
                 relogin_account_ref = str(existing.get("account_ref", ""))
+                auto_matched = kind == "legacy"
+
+        legacy_check = None
+        if relogin_account_ref:
+            saved_accounts = get_userData(force_reload=True)
+            target_row = account_by_ref(saved_accounts, relogin_account_ref)
+            if target_row and unique_id_owned_by_other(saved_accounts, target_row.get("unique_id"), current):
+                # Another user's row shares this record's key; the save's dedupe
+                # must never take it (or its ownership) away.
+                return JSONResponse(
+                    {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
+                    status_code=403,
+                )
+            if target_row and not confirmation and not account_identity.account_uid(target_row):
+                legacy_check = await asyncio.to_thread(legacy_identity_check, target_row)
 
         login_result = {
-            "unique_id": identity.get("unique_id", ""),
             "username": identity.get("username", ""),
+            "display_id": display_id,
             "cookies": cookies,
             "cookie_source": "pasted",
         }
         try:
             account, action = save_exported_login_result(
                 login_result,
-                relogin_unique_id=relogin_unique_id,
                 relogin_account_ref=relogin_account_ref,
                 display_name=display_name,
                 is_healthy=True,
+                identity=trusted,
+                legacy_check=legacy_check,
+                confirmation=confirmation,
+                auto_matched=auto_matched,
+                expected_records=expected_records,
+                principal_resolver=lambda: principal(request),
+                expected_principal=current,
             )
+        except LoginSavePermissionDenied as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+        except IDENTITY_SAVE_ERRORS as exc:
+            return _identity_error_response(exc, current, "cookies", display_id=display_id)
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
         if current.get("role") == "user":
-            refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
-            update_web_user(current["username"], account_refs=refs)
+            update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
 
         try:
             call_login_desktop("/clear-login-state", method="POST", payload={}, timeout=60)
@@ -3168,11 +3656,14 @@ def create_app():
             {
                 "ok": True,
                 "action": action,
-                "message": f"Cookie 登录成功，已{'更新' if action == 'updated' else '添加'}账号 {account.get('username', '')}",
+                "message": f"Cookie 登录成功，已{'更新' if action == 'updated' else '添加'}账号 {account.get('username', '')}（{account_identity.IDENTITY_STATE_LABELS['verified']}）",
+                "identityState": "verified",
                 "account": {
                     "account_ref": account.get("account_ref"),
                     "unique_id": account.get("unique_id"),
                     "username": account.get("username"),
+                    "platform_uid": account.get(account_identity.FIELD_UID, ""),
+                    "display_id": account.get(account_identity.FIELD_DISPLAY_ID, ""),
                     "enabled": account.get("enabled", True),
                     "healthy": True,
                 },
@@ -3204,6 +3695,13 @@ def create_app():
             operation = "relogin"
         elif operation != "add" and current.get("role") != "admin":
             return JSONResponse({"ok": False, "error": "普通用户必须选择自己的抖音账号"}, status_code=400)
+        # Snapshot the store before the export and the identity check: the save
+        # refuses to write when the chosen record changed meanwhile (A8).
+        expected_records = {
+            str(row.get("account_ref") or ""): account_identity.record_fingerprint(row)
+            for row in get_userData(force_reload=True)
+            if str(row.get("account_ref") or "").strip()
+        }
         try:
             # Off the event loop: exporting reads the live login page and must not
             # freeze every other request (noVNC, heartbeats) while it runs.
@@ -3211,11 +3709,50 @@ def create_app():
             if not payload.get("ok"):
                 raise RuntimeError("login-desktop export did not return ok")
             exported = payload.get("result", {}) or {}
-            existing = preferred_account_for_unique_id(
-                get_userData(force_reload=True), exported.get("unique_id"), current
+            display_id = account_identity.display_id_from_text(
+                exported.get("display_id") or ""
             )
+            # The page-read ID may be the public handle or the platform UID;
+            # only the authenticated self-identity response decides who this is.
+            try:
+                trusted = await asyncio.to_thread(
+                    account_identity.fetch_trusted_identity,
+                    list(exported.get("cookies") or []),
+                )
+            except account_identity.IdentityUnavailable as exc:
+                # Keep the workspace: the operator can retry the save.
+                return _identity_error_response(exc, current, "login-desktop", display_id=display_id)
+            uid = trusted["uid"]
+            rows, match_kind = rows_for_identity(
+                get_userData(force_reload=True), uid, display_id
+            )
+            existing = preferred_row(rows, current)
+            confirmation = None
+            confirm_adopts = False
+            confirm_token = str(form.get("confirm_identity", "")).strip()
+            if confirm_token:
+                record, problem = _take_identity_confirmation(confirm_token, current, "login-desktop")
+                if not record:
+                    return JSONResponse({"ok": False, "error": problem, "category": "identity_confirmation_invalid"}, status_code=409)
+                candidate = account_by_ref(get_userData(force_reload=True), record["account_ref"])
+                if not candidate or not may_claim_account(current, candidate):
+                    return JSONResponse({"ok": False, "error": "无权操作该账号"}, status_code=403)
+                confirm_adopts = not can_access_account(current, candidate)
+                if relogin_account_ref and relogin_account_ref != record["account_ref"]:
+                    return JSONResponse({"ok": False, "error": "确认的账号与本次重新登录的账号不一致"}, status_code=409)
+                existing = candidate
+                relogin_account_ref = record["account_ref"]
+                relogin_unique_id = candidate.get("unique_id", "")
+                operation = "relogin"
+                confirmation = {
+                    "account_ref": record["account_ref"],
+                    "fingerprint": record["fingerprint"],
+                    "uid": record["uid"],
+                    "candidate_fingerprint": record.get("candidate_fingerprint", ""),
+                    "confirmed_by": current.get("username", ""),
+                }
             merge_with = str(form.get("merge_with", "")).strip()
-            if merge_with:
+            if merge_with and not confirmation:
                 # The operator confirmed that a same-name account is the one they
                 # are re-logging into, so update it instead of adding a duplicate.
                 candidate = account_by_ref(get_userData(force_reload=True), merge_with)
@@ -3232,32 +3769,27 @@ def create_app():
             )
             if allow_duplicate_requested and not existing:
                 logger.info(
-                    "Login save creates a separate account past a same-name match: scanned_uid=%s",
-                    normalize_unique_id(exported.get("unique_id")),
+                    "Login save creates a separate account past a same-name match: platform_uid=%s",
+                    uid,
                 )
             # A chosen re-login target means the operator already picked which
-            # account this login belongs to, so it is overwritten in place
-            # instead of being treated as a possible duplicate.
+            # account this login belongs to; it is still only written when the
+            # identity check agrees.
             relogin_target_given = bool(
-                str(form.get("relogin_unique_id", "")).strip() or merge_with
+                str(form.get("relogin_unique_id", "")).strip() or merge_with or confirmation
             )
             if (
                 not existing
                 and not allow_duplicate_requested
                 and not relogin_target_given
             ):
-                # No account matched this unique_id, so creating a row is the
-                # only remaining outcome. Ask first if the nickname already
-                # exists, otherwise a changed unique_id silently duplicates the
-                # account. This deliberately does not depend on the requested
-                # mode: a crafted relogin request without a target would skip it.
-                # Adding an account whose nickname already exists usually means
-                # the same person came back with a different unique_id; creating
-                # a second row is what produced the duplicate accounts. Ask first.
-                # Fall back to the unique_id when the export carries no nickname,
-                # otherwise an empty name silently skips the duplicate check.
+                # No account matched this login, so creating a row is the only
+                # remaining outcome. Ask first if the nickname already exists:
+                # the operator may be re-logging into a legacy record.
+                # Fall back to the displayed ID when the export carries no
+                # nickname, otherwise an empty name silently skips the check.
                 exported_name = str(
-                    exported.get("username") or exported.get("unique_id") or ""
+                    exported.get("username") or display_id or ""
                 ).strip()
                 same_name = [
                     item
@@ -3269,8 +3801,8 @@ def create_app():
                 if same_name:
                     duplicate = same_name[0]
                     logger.info(
-                        "Login save paused for confirmation: scanned_uid=%s candidates=%s",
-                        normalize_unique_id(exported.get("unique_id")),
+                        "Login save paused for confirmation: platform_uid=%s candidates=%s",
+                        uid,
                         len(same_name),
                     )
                     return JSONResponse(
@@ -3296,9 +3828,10 @@ def create_app():
                         },
                         status_code=409,
                     )
-            adopt_unassigned = False
-            if unique_id_owned_by_other(
-                get_userData(force_reload=True), exported.get("unique_id"), current
+            # Confirming an unassigned legacy row claims it, like adopting it.
+            adopt_unassigned = confirm_adopts
+            if not relogin_account_ref and identity_owned_by_other(
+                get_userData(force_reload=True), uid, current, display_id
             ):
                 raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
             if existing and str(existing.get("account_ref", "")) != relogin_account_ref and not can_access_account(current, existing):
@@ -3306,8 +3839,8 @@ def create_app():
                 # who just proved control may claim this unassigned row in place.
                 adopt_unassigned = True
                 logger.info(
-                    "Login save adopts an unassigned account: scanned_uid=%s account_ref=%s user=%s",
-                    normalize_unique_id(existing.get("unique_id")),
+                    "Login save adopts an unassigned account: platform_uid=%s account_ref=%s user=%s",
+                    uid,
                     existing.get("account_ref", ""),
                     current.get("username", ""),
                 )
@@ -3315,6 +3848,20 @@ def create_app():
                 relogin_account_ref = existing.get("account_ref", "")
                 relogin_unique_id = existing.get("unique_id", "")
                 operation = "relogin"
+            # A row found only by a matching ID (not chosen by the operator) is
+            # written only once a legacy row is proven or confirmed; if its own
+            # cookies prove it is someone else, the login becomes a new account.
+            auto_matched = bool(existing) and not relogin_target_given and match_kind == "legacy"
+            if existing and not relogin_account_ref:
+                relogin_account_ref = existing.get("account_ref", "")
+            legacy_check = None
+            if relogin_account_ref:
+                saved_accounts = get_userData(force_reload=True)
+                target_row = account_by_ref(saved_accounts, relogin_account_ref)
+                if target_row and unique_id_owned_by_other(saved_accounts, target_row.get("unique_id"), current):
+                    raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
+                if target_row and not confirmation and not account_identity.account_uid(target_row):
+                    legacy_check = await asyncio.to_thread(legacy_identity_check, target_row)
             # Only the instant checks run here. Re-reading the login state in a
             # second browser took minutes on this host, so it runs after the
             # save, in the background (D12); the account shows "verifying".
@@ -3327,23 +3874,36 @@ def create_app():
                 verification_reason = str(exc)
                 verification_category = getattr(exc, "category", "cookie_format_invalid")
             verification_token = uuid.uuid4().hex if verified is None else ""
-            account, action = save_exported_login_result(
-                exported,
-                relogin_unique_id=relogin_unique_id,
-                relogin_account_ref=relogin_account_ref,
-                display_name=display_name,
-                is_healthy=verified,
-                verification_reason=verification_reason,
-                verification_category=verification_category,
-                verification_token=verification_token,
-            )
+            try:
+                account, action = save_exported_login_result(
+                    exported,
+                    relogin_unique_id=relogin_unique_id,
+                    relogin_account_ref=relogin_account_ref,
+                    display_name=display_name,
+                    is_healthy=verified,
+                    verification_reason=verification_reason,
+                    verification_category=verification_category,
+                    verification_token=verification_token,
+                    identity=trusted,
+                    legacy_check=legacy_check,
+                    confirmation=confirmation,
+                    auto_matched=auto_matched,
+                    expected_records=expected_records,
+                    principal_resolver=lambda: principal(request),
+                    expected_principal=current,
+                )
+            except LoginSavePermissionDenied as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+            except IDENTITY_SAVE_ERRORS as exc:
+                # Nothing was written and the workspace is kept for a retry.
+                return _identity_error_response(exc, current, "login-desktop", display_id=display_id)
             normalized_saved = normalize_unique_id(account.get("unique_id"))
             friend_refresh_state = "queued" if verified is None else "skipped"
             # Without this trail a wrong match is invisible: a duplicate account
             # only shows up later as two same-name rows in the list.
             logger.info(
-                "Login save: scanned_uid=%s name_len=%s requested_uid=%s operation=%s action=%s verified=%s matched_before=%s",
-                normalize_unique_id(exported.get("unique_id")),
+                "Login save: platform_uid=%s name_len=%s requested_uid=%s operation=%s action=%s verified=%s matched_before=%s",
+                uid,
                 len(str(exported.get("username") or "")),
                 normalize_unique_id(relogin_unique_id) or "",
                 operation,
@@ -3352,14 +3912,17 @@ def create_app():
                 bool(existing),
             )
             if (operation == "add" or adopt_unassigned) and current.get("role") == "user":
-                refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
-                update_web_user(current["username"], account_refs=refs)
+                update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
             begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=active.get("ticket", ""), account_ref=active.get("account_ref", ""))
             # The account is saved; do not hold the answer until the login
             # browser is reset and reopened for whoever is queued next.
             _reset_and_promote_later()
             if verification_token:
-                _queue_login_verification(account.get("account_ref", ""), verification_token)
+                _queue_login_verification(
+                    account.get("account_ref", ""),
+                    verification_token,
+                    account_identity.account_login_generation(account),
+                )
             return JSONResponse({
                 "ok": True,
                 "action": action,
@@ -3368,10 +3931,14 @@ def create_app():
                 "verification_error": verification_reason,
                 "verification_category": verification_category,
                 "friend_refresh": friend_refresh_state,
+                "identityState": "verified",
+                "identityLabel": account_identity.IDENTITY_STATE_LABELS["verified"],
                 "account": {
                     "account_ref": account.get("account_ref"),
                     "unique_id": account.get("unique_id"),
                     "username": account.get("username"),
+                    "platform_uid": account.get(account_identity.FIELD_UID, ""),
+                    "display_id": account.get(account_identity.FIELD_DISPLAY_ID, ""),
                     "enabled": account.get("enabled", True),
                     "healthy": bool(verified),
                 },

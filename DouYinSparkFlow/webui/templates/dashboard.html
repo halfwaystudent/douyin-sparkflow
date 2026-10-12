@@ -167,6 +167,9 @@
             {% if row.login_verification_state == "verifying" %}登录态验证中 ·
             {% elif row.login_verification_state == "unverified" %}登录态未能验证 ·
             {% endif %}
+            {% if row.identity_state == "conflict" %}{{ row.identity_label }}：请用原账号重新扫码 ·
+            {% elif row.identity_state == "unverified" %}{{ row.identity_label }} ·
+            {% endif %}
             {% if row.state == "paused" %}账号已暂停
             {% elif row.state == "attention" %}有目标需要处理
             {% elif row.state == "warning" %}存在数据警告

@@ -535,7 +535,9 @@ async def _fetch_account_friends_once(
             await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
             await _wait_for_chat_or_login(page)
             return {
+                # Page text only (handle or UID); not an identity proof.
                 "unique_id": normalize_unique_id(identity.get("unique_id")),
+                "display_id": str(identity.get("display_id") or ""),
                 "username": str(identity.get("username") or "").strip(),
             }
 

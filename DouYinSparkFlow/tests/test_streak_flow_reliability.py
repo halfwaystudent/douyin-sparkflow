@@ -3385,6 +3385,8 @@ class StreakTaskIntegrationTests(unittest.TestCase):
             "account_ref": "acc-1",
             "username": "demo",
             "unique_id": "1001",
+            "platform_uid": "1001",
+            "identity_binding": {"source": "creator_im_user_token", "version": 1, "method": "same_uid"},
             "targets": ["Alice"],
             "cookies": [{"name": "sessionid", "value": "old"}],
             "account_failure": {
@@ -3419,6 +3421,7 @@ class StreakTaskIntegrationTests(unittest.TestCase):
                     "cookies": [{"name": "sessionid", "value": "new"}],
                 },
                 relogin_unique_id="1001",
+                identity={"uid": "1001", "source": "creator_im_user_token", "version": 1},
             )
 
         self.assertEqual("updated", action)

@@ -154,6 +154,8 @@
             {% if account.account_paused %}<span class="status-chip danger">账号暂停</span>{% endif %}
             {% if account.login_verification_state == "verifying" %}<span class="status-chip">登录态验证中</span>
             {% elif account.login_verification_state == "unverified" %}<span class="status-chip warning">登录态未能验证</span>{% endif %}
+            {% if account.identity_state == "conflict" %}<span class="status-chip danger" title="{{ account.identity_hint }}">{{ account.identity_label }}</span>
+            {% elif account.identity_state == "unverified" %}<span class="status-chip warning" title="{{ account.identity_hint }}">{{ account.identity_label }}</span>{% endif %}
           </span>
           <i class="fold-chevron" data-lucide="chevron-down"></i>
         </summary>
