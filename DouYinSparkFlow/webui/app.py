@@ -58,6 +58,7 @@ from utils.config import (
     merge_user_account_into,
     update_user_data,
 )
+from utils import notify
 from utils.logger import setup_logger
 from webui.auth import (
     bootstrap_admin_password,
@@ -1716,10 +1717,15 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
+        context = console_context(request, with_admin_data=True)
+        if principal(request).get("role") == "admin":
+            context["notify"] = notify.notifications_view(
+                get_config(force_reload=True).get("notifications")
+            )
         return render_template(
             request,
             "settings.html",
-            console_context(request, with_admin_data=True),
+            context,
         )
 
     @app.get("/ops/send-console", response_class=HTMLResponse)
@@ -2684,6 +2690,60 @@ def create_app():
 
         flash(request, "Panel settings saved.", "success")
         return redirect("/settings#system")
+
+    @app.post("/settings/notifications")
+    async def save_notifications(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+
+        def mutate(config):
+            normalized, errors = notify.apply_form(config.get("notifications"), form)
+            if errors:
+                return errors, False
+            config["notifications"] = normalized
+            return errors, True
+
+        errors = update_config(mutate, force_reload=True)
+        if errors:
+            message = "推送设置未保存：" + "；".join(errors)
+            flash(request, message, "error")
+        else:
+            message = "推送设置已保存。"
+            flash(request, message, "success")
+        if request.headers.get("x-requested-with") == "XMLHttpRequest":
+            request.session.pop("flash", None)
+            return JSONResponse({"message": message, "level": "error" if errors else "success"})
+        return redirect("/settings#notify")
+
+    @app.post("/settings/notifications/test")
+    async def test_notification_channel(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+
+        channel = str(form.get("channel", "")).strip()
+        if channel not in notify.CHANNEL_NAMES:
+            flash(request, "未知推送渠道，测试没有发送。", "error")
+            return redirect("/settings#notify")
+
+        # Test uses the saved config, so unsaved edits are not sent.
+        saved = get_config(force_reload=True).get("notifications")
+        ok, message = await asyncio.to_thread(notify.send_test, channel, saved)
+        level = "success" if ok else "error"
+        flash(request, message, level)
+        if request.headers.get("x-requested-with") == "XMLHttpRequest":
+            request.session.pop("flash", None)
+            return JSONResponse({"message": message, "level": level})
+        return redirect("/settings#notify")
 
     @app.post("/ops/run-now")
     async def run_now(request: Request):

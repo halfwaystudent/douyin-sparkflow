@@ -17,6 +17,7 @@
     <a href="#schedule"><i data-lucide="calendar-clock"></i>发送窗口</a>
     <a href="#ops"><i data-lucide="wrench"></i>运维操作</a>
     <a href="#system"><i data-lucide="server-cog"></i>系统</a>
+    <a href="#notify"><i data-lucide="bell"></i>推送通知</a>
     <a href="#users"><i data-lucide="users-round"></i>Web 用户</a>
   </nav>
 
@@ -165,6 +166,78 @@
         <div class="form-actions"><button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存系统设置</span></button></div>
       </form>
     </section>
+
+    {% if notify is defined %}
+    <section class="card settings-section" id="notify">
+      <div class="card-head">
+        <div>
+          <h2><i data-lucide="bell"></i>推送通知</h2>
+          <p>任务失败和每日汇总推送到下列机器人。全局一套配置，接收所有账号的消息；仅管理员可见。</p>
+        </div>
+      </div>
+      <form method="post" action="/settings/notifications" class="form-stack" data-ajax-submit>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="check"><input type="checkbox" name="notify_enabled" {% if notify.enabled %}checked{% endif %}><span>启用推送通知（关闭时所有渠道都不发送）</span></label>
+
+        {% set tg = notify.channels.telegram %}
+        <fieldset>
+          <legend>Telegram Bot</legend>
+          <label class="check"><input type="checkbox" name="notify_telegram_enabled" {% if tg.enabled %}checked{% endif %}><span>启用</span></label>
+          <label class="check"><input type="checkbox" name="notify_telegram_use_proxy" {% if tg.useProxy %}checked{% endif %}><span>通过 Mihomo 代理发送（服务器直连 api.telegram.org 不可用时开启）</span></label>
+          <div class="form-grid">
+            <label class="field"><span>Bot Token</span><input type="password" name="notify_telegram_botToken" value="" placeholder="{{ tg.masked.botToken or '未设置' }}" autocomplete="off"><small>已保存：{{ tg.masked.botToken or "未设置" }}。留空保持原值。</small></label>
+            <label class="field"><span>Chat ID</span><input type="text" name="notify_telegram_chatId" value="{{ tg.chatId }}"></label>
+          </div>
+          <label class="check"><input type="checkbox" name="notify_telegram_botToken_clear"><span>清除已保存的 Token</span></label>
+        </fieldset>
+
+        {% set dt = notify.channels.dingtalk %}
+        <fieldset>
+          <legend>钉钉自定义机器人</legend>
+          <label class="check"><input type="checkbox" name="notify_dingtalk_enabled" {% if dt.enabled %}checked{% endif %}><span>启用</span></label>
+          <label class="check"><input type="checkbox" name="notify_dingtalk_use_proxy" {% if dt.useProxy %}checked{% endif %}><span>通过 Mihomo 代理发送</span></label>
+          <div class="form-grid">
+            <label class="field"><span>Webhook 地址</span><input type="password" name="notify_dingtalk_webhookUrl" value="" placeholder="{{ dt.masked.webhookUrl or '未设置' }}" autocomplete="off"><small>已保存：{{ dt.masked.webhookUrl or "未设置" }}。留空保持原值。</small></label>
+            <label class="field"><span>加签密钥（可选）</span><input type="password" name="notify_dingtalk_secret" value="" placeholder="{{ dt.masked.secret or '未设置' }}" autocomplete="off"><small>已保存：{{ dt.masked.secret or "未设置" }}。留空保持原值。</small></label>
+          </div>
+          <label class="check"><input type="checkbox" name="notify_dingtalk_webhookUrl_clear"><span>清除已保存的 Webhook 地址</span></label>
+          <label class="check"><input type="checkbox" name="notify_dingtalk_secret_clear"><span>清除已保存的加签密钥</span></label>
+        </fieldset>
+
+        {% set wc = notify.channels.wecom %}
+        <fieldset>
+          <legend>企业微信群机器人</legend>
+          <label class="check"><input type="checkbox" name="notify_wecom_enabled" {% if wc.enabled %}checked{% endif %}><span>启用</span></label>
+          <label class="check"><input type="checkbox" name="notify_wecom_use_proxy" {% if wc.useProxy %}checked{% endif %}><span>通过 Mihomo 代理发送</span></label>
+          <label class="field"><span>Webhook 地址</span><input type="password" name="notify_wecom_webhookUrl" value="" placeholder="{{ wc.masked.webhookUrl or '未设置' }}" autocomplete="off"><small>已保存：{{ wc.masked.webhookUrl or "未设置" }}。留空保持原值。</small></label>
+          <label class="check"><input type="checkbox" name="notify_wecom_webhookUrl_clear"><span>清除已保存的 Webhook 地址</span></label>
+        </fieldset>
+
+        {% set wh = notify.channels.webhook %}
+        <fieldset>
+          <legend>通用 Webhook（JSON POST，可接入 Bark、Server酱等）</legend>
+          <label class="check"><input type="checkbox" name="notify_webhook_enabled" {% if wh.enabled %}checked{% endif %}><span>启用</span></label>
+          <label class="check"><input type="checkbox" name="notify_webhook_use_proxy" {% if wh.useProxy %}checked{% endif %}><span>通过 Mihomo 代理发送</span></label>
+          <label class="field"><span>接收地址</span><input type="password" name="notify_webhook_url" value="" placeholder="{{ wh.masked.url or '未设置' }}" autocomplete="off"><small>已保存：{{ wh.masked.url or "未设置" }}。留空保持原值。请求体包含 title、text、event、date。</small></label>
+          <label class="check"><input type="checkbox" name="notify_webhook_url_clear"><span>清除已保存的接收地址</span></label>
+        </fieldset>
+
+        <div class="form-actions"><button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存推送设置</span></button></div>
+        <div id="notify-feedback" class="flash" role="status" aria-live="polite" tabindex="-1" hidden></div>
+      </form>
+      <div class="notify-tests">
+        <p class="page-sub"><small>测试消息使用已保存的配置，修改后请先保存再测试。</small></p>
+        {% for key, channel in notify.channels.items() %}
+        <form method="post" action="/settings/notifications/test" class="form-actions" data-ajax-submit>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="channel" value="{{ key }}">
+          <button class="button button-quiet" type="submit"><i data-lucide="send"></i><span>发送测试消息（{{ channel.label }}）</span></button>
+          <div id="notify-test-feedback-{{ key }}" class="flash" data-form-feedback role="status" aria-live="polite" tabindex="-1" hidden></div>
+        </form>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
 
     <section class="card settings-section" id="users">
       <div class="card-head">

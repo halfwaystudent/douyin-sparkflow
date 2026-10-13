@@ -1,4 +1,64 @@
 (() => {
+  const forms = document.querySelectorAll("form[data-ajax-submit]");
+  if (!forms.length) return;
+
+  const setFeedback = (node, level, message) => {
+    if (!node) return;
+    node.hidden = false;
+    node.className = `flash flash-${level}`;
+    node.textContent = message;
+    node.setAttribute("tabindex", "-1");
+    node.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    node.focus({ preventScroll: true });
+  };
+
+  const feedbackMessageFor = (response) => {
+    if (response.status === 401 || response.redirected) {
+      return "登录状态已失效，请重新登录后重试。";
+    }
+    if (response.status === 403) {
+      return "会话已失效或请求校验失败，请刷新页面后重试。";
+    }
+    return `请求失败（HTTP ${response.status}），请检查后重试。`;
+  };
+
+  forms.forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const feedback = form.querySelector("[data-form-feedback]")
+        || document.getElementById("notify-feedback");
+      const submit = form.querySelector('button[type="submit"]');
+      const buttons = document.querySelectorAll("form[data-ajax-submit] button[type=submit]");
+      buttons.forEach((button) => { button.disabled = true; });
+      setFeedback(feedback, "info", "正在处理…");
+
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          body: new FormData(form),
+          credentials: "same-origin",
+          headers: { "X-Requested-With": "XMLHttpRequest" },
+        });
+        if (!response.ok) {
+          setFeedback(feedback, "error", feedbackMessageFor(response));
+          return;
+        }
+        if (!response.headers.get("content-type")?.includes("application/json")) {
+          setFeedback(feedback, "error", "登录状态已失效，请刷新页面后重试。");
+          return;
+        }
+        const result = await response.json();
+        setFeedback(feedback, result.level || "info", result.message || "操作完成。");
+      } catch {
+        setFeedback(feedback, "error", "网络请求失败，请检查连接后重试。");
+      } finally {
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    });
+  });
+})();
+
+(() => {
   const root = document.documentElement;
   const storageKey = "sparkflow-theme";
   const systemDark = window.matchMedia

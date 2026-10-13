@@ -17,6 +17,7 @@ from rich.console import Console
 from utils.config import (
     DEBUG,
     Environment,
+    douyin_proxy_url,
     get_app_settings,
     get_environment,
     normalize_unique_id,
@@ -91,10 +92,7 @@ def _douyin_browser_proxy(network_mode=None):
     mode = str(network_mode or _douyin_network_mode()).strip().lower()
     if mode != "mihomo":
         return None
-    return str(
-        os.getenv("SPARKFLOW_DOUYIN_PROXY_URL")
-        or settings.get("douyin_proxy_url", "http://proxy:7890")
-    ).strip() or None
+    return douyin_proxy_url(settings) or None
 
 
 def _browser_launch_options(GUI=False, network_mode=None):

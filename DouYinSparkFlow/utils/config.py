@@ -72,6 +72,34 @@ DEFAULT_CONFIG = {
         "seedCookiesWhenEmpty": True,
         "syncStoredCookiesBeforeRun": True,
         "refreshStoredCookiesAfterLogin": True
+    },
+    "notifications": {
+        "enabled": False,
+        "channels": {
+            "telegram": {
+                "enabled": False,
+                "useProxy": True,
+                "botToken": "",
+                "chatId": ""
+            },
+            "dingtalk": {
+                "enabled": False,
+                "useProxy": False,
+                "webhookUrl": "",
+                "secret": ""
+            },
+            "wecom": {
+                "enabled": False,
+                "useProxy": False,
+                "webhookUrl": ""
+            },
+            "webhook": {
+                "enabled": False,
+                "useProxy": False,
+                "url": "",
+                "extraFields": {}
+            }
+        }
     }
 }
 
@@ -472,6 +500,19 @@ def get_app_settings(force_reload=False):
             appSettings["compose_root"] = default_compose_root()
         _save_json_file(app_settings_path(), appSettings)
     return deepcopy(appSettings)
+
+
+def douyin_proxy_url(settings=None):
+    """Explicit proxy for Douyin traffic: SPARKFLOW_DOUYIN_PROXY_URL wins over the panel setting.
+
+    Returns "" when nothing is configured; callers decide the fallback.
+    """
+    if settings is None:
+        settings = get_app_settings(force_reload=True)
+    return str(
+        os.getenv("SPARKFLOW_DOUYIN_PROXY_URL")
+        or settings.get("douyin_proxy_url", DEFAULT_APP_SETTINGS["douyin_proxy_url"])
+    ).strip()
 
 
 def save_app_settings(new_settings):

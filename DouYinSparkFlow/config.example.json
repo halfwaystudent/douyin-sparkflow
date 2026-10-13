@@ -48,5 +48,33 @@
     "seedCookiesWhenEmpty": true,
     "syncStoredCookiesBeforeRun": true,
     "refreshStoredCookiesAfterLogin": true
+  },
+  "notifications": {
+    "enabled": false,
+    "channels": {
+      "telegram": {
+        "enabled": false,
+        "useProxy": true,
+        "botToken": "",
+        "chatId": ""
+      },
+      "dingtalk": {
+        "enabled": false,
+        "useProxy": false,
+        "webhookUrl": "",
+        "secret": ""
+      },
+      "wecom": {
+        "enabled": false,
+        "useProxy": false,
+        "webhookUrl": ""
+      },
+      "webhook": {
+        "enabled": false,
+        "useProxy": false,
+        "url": "",
+        "extraFields": {}
+      }
+    }
   }
 }

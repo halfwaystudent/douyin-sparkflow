@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-13
+
+- Added run-result push notifications (Telegram, DingTalk with signing, WeCom, generic JSON webhook): immediate failure notices merged per run and deduplicated per account/target/category per day, plus a once-per-day summary. Configured by admins in the settings page; secrets are shown masked and never logged.
+
 ## 2026-08-27
 
 - Changed the project license for project-owned code from MIT License to PolyForm Noncommercial License 1.0.0. Future versions are source-available for noncommercial use only; prior versions remain governed by their applicable license terms.

@@ -28,7 +28,7 @@ from core.browser import (
 )
 from core.msg_builder import build_message, build_message_candidates
 from core.protocol_dispatch import run_protocol_tasks
-from core import streak_state
+from core import notifications, streak_state
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -3799,13 +3799,27 @@ async def runTasks():
         raise
     finally:
         try:
+            finished_users = get_userData(force_reload=True)
             _append_streak_run_report(
                 run_id,
                 started_at,
                 active_config,
-                get_userData(force_reload=True),
+                finished_users,
                 run_status=run_status,
             )
+            try:
+                notifications.notify_run_finished(
+                    run_id,
+                    run_status,
+                    active_config,
+                    finished_users,
+                    schedule_tz=_schedule_timezone(),
+                    send_window=_normalize_send_window(active_config),
+                    manual_run=_is_manual_run(),
+                    fallback_run=_is_fallback_run(),
+                )
+            except Exception as exc:
+                logger.warning("run notification hook failed: %s", type(exc).__name__)
         finally:
             _ACTIVE_RUN_ID = ""
 

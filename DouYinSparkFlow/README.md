@@ -182,6 +182,28 @@ docker run -d \
 | `friendListScan` | 好友列表扫描时限、空闲等待和滚动参数 |
 | `persistentBrowserProfiles` | 持久化 Playwright Profile 及 Cookie 同步策略 |
 | `browserSenderAccounts` | 强制使用浏览器发送的账号列表；公开模板默认为空 |
+| `notifications` | 运行结果推送（Telegram / 钉钉 / 企业微信 / 通用 Webhook），默认关闭 |
+
+#### 运行结果推送（`notifications`）
+
+任务失败（账号预检失败、目标当天最终失败或需人工处理、整次运行异常）时即时推送一条合并消息，同一账号、目标、类别每天只推一次；每天推送一条汇总（启用目标数、成功数、失败数与失败明细）：当天所有启用目标都确认成功后立即推送；否则在发送窗口末次兜底运行（每日窗口结束时的 `0 <endHour>` 任务，`SPARKFLOW_FALLBACK_PHASE=1`）后推送，此时仍未确认成功的目标全部计为失败（类别为“当天未发送成功”或其原始失败原因）。发送窗口关闭时，在当天的定时运行后推送。手动运行（非兜底）不推送汇总，只可能推送失败通知。推送只由管理员在 Web 设置页「推送通知」配置，全局一套；设置页只显示脱敏的 Token 与地址，留空保存保持原值，「发送测试消息」使用已保存的配置。
+
+- 去重与汇总状态保存在 `logs/notify_state.json`，重启后同一天不会重复推送。
+- 每个渠道单次请求，超时 10 秒，失败只写日志，不影响续火花任务的执行与运行报告。
+- `useProxy` 为 true 时经 `douyin_proxy_url`（默认 `http://proxy:7890`）发送，适用于服务器直连不可用的渠道（如 Telegram）。
+- 通用 Webhook 以 JSON POST 发送 `title`、`text`、`event`、`date`，可通过 `extraFields` 追加固定字段（不会覆盖上述四项）。
+
+```json
+"notifications": {
+  "enabled": true,
+  "channels": {
+    "telegram": {"enabled": true, "useProxy": true, "botToken": "<BotToken>", "chatId": "<ChatId>"},
+    "dingtalk": {"enabled": false, "useProxy": false, "webhookUrl": "", "secret": ""},
+    "wecom": {"enabled": false, "useProxy": false, "webhookUrl": ""},
+    "webhook": {"enabled": false, "useProxy": false, "url": "", "extraFields": {}}
+  }
+}
+```
 
 ### `usersData.json` - 用户数据
 
