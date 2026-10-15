@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import urllib.error
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -40,6 +40,8 @@ from core.friends import (
     fetch_account_friends,
     verify_account_session,
 )
+from core import friend_identity
+from core import patrol as account_patrol
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
 from core.protocol_dispatch import run_protocol_tasks
 from core.tasks import (
@@ -138,6 +140,7 @@ templates.env.globals["cache_age_label"] = cache_age_label
 templates.env.globals["duplicate_display_names"] = duplicate_display_names
 templates.env.globals["schedule_window_state"] = schedule_window_state
 templates.env.globals["identity_view"] = identity_view
+templates.env.globals["patrol_view"] = account_patrol.patrol_view
 
 
 def _dedupe_targets(values):
@@ -487,12 +490,26 @@ LOGIN_VERIFICATION_MAX_WAIT_SECONDS = 2 * 3600
 LOGIN_VERIFICATION_TIMEOUT_SECONDS = 300
 LOGIN_VERIFICATION_RESTART_DELAY_SECONDS = 30
 _friend_refresh_active = set()
+# Accounts with a Web-triggered patrol in flight (one uvicorn process).
+_patrol_active = set()
+_background_tasks = set()
+
+
+def _start_background(coro):
+    """Run a Web-triggered job in the background of the serving event loop."""
+    task = asyncio.create_task(coro)
+    # Keep a reference so the loop does not drop the task before it finishes.
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 def friend_refresh_conflict(unique_id):
     """Return a conflict reason when this account already has a refresh running."""
     if normalize_unique_id(unique_id) in _friend_refresh_active:
         return "该账号已有好友刷新正在进行，请稍后重试"
+    if normalize_unique_id(unique_id) in _patrol_active:
+        return "该账号正在巡查，请稍后重试"
     active = get_login_lock()
     if active:
         return "登录工作区正在被使用，请等扫码登录结束后再刷新好友"
@@ -1413,7 +1430,28 @@ def create_app():
         )
 
     def redirect(path="/", status_code=303):
+        # Some mobile clients encode a Location fragment into the request path.
+        # Keep in-page positioning in a query parameter instead of a fragment.
+        parts = urlsplit(str(path))
+        if parts.fragment and not parts.scheme and not parts.netloc and parts.path.startswith("/"):
+            query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "_anchor"]
+            query.append(("_anchor", parts.fragment))
+            path = urlunsplit(("", "", parts.path, urlencode(query), ""))
         return RedirectResponse(url=path, status_code=status_code)
+
+    @app.get("/settings#notify", include_in_schema=False)
+    async def legacy_notify_fragment(request: Request):
+        if not principal(request):
+            return redirect("/login")
+        return redirect("/settings?_anchor=notify")
+
+    @app.get("/accounts#account-{unique_id}", include_in_schema=False)
+    async def legacy_account_fragment(request: Request, unique_id: str):
+        if not (unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32):
+            return Response(status_code=404)
+        if not principal(request):
+            return redirect("/login")
+        return redirect(f"/accounts?_anchor=account-{unique_id}")
 
     def principal(request):
         return current_principal(request)
@@ -1758,9 +1796,13 @@ def create_app():
 
         def mutate(account, accounts):
             del accounts
+            previous_targets = list(account.get("targets") or [])
             account["username"] = username or account.get("username", "")
             account["targets"] = targets
             account["enabled"] = str(form.get("enabled", "")) == "on"
+            # Selecting a friend as a target binds it to that friend's uid; a
+            # target that stays selected keeps its existing binding.
+            friend_identity.apply_web_target_selection(account, previous_targets)
             return None
 
         account, _, access_error = mutate_account_for_request(
@@ -1826,6 +1868,39 @@ def create_app():
             return None, True
 
         return update_user_data(mutate, force_reload=True)
+
+    def _record_friend_identity(account, friends):
+        """Save the uids a complete refresh read and reconcile the targets."""
+        try:
+            result = friend_identity.persist_identity_scan(
+                account,
+                getattr(friends, "uid_entries", None) or [],
+                scan_complete=True,
+                scanned_names=list(friends),
+                sync_user=False,
+            )
+        except Exception:
+            logger.warning(
+                "Friend uid update after refresh failed for %s",
+                account.get("username", "unknown"),
+                exc_info=True,
+            )
+            return {}
+        if not result:
+            return {}
+        return {
+            "uidCount": result["uidCount"],
+            "uidDataTrusted": result["uidDataTrusted"],
+            "renamed": [
+                {"oldName": item["oldName"], "newName": item["newName"]}
+                for item in result["renamed"]
+            ],
+            "missing": [
+                item["target"]
+                for item in result["targets"]
+                if item["status"] == friend_identity.STATUS_MISSING
+            ],
+        }
 
     def _finish_friend_job(normalized_id, **fields):
         job = friend_refresh_jobs.get(normalized_id)
@@ -1959,6 +2034,7 @@ def create_app():
                     account.get("username", normalized_id),
                     exc_info=True,
                 )
+        identity = _record_friend_identity(account, friends) if index_updated else {}
 
         _finish_friend_job(
             normalized_id,
@@ -1968,6 +2044,7 @@ def create_app():
             updatedAt=updated_at,
             scanComplete=scan_complete,
             indexUpdated=index_updated,
+            identity=identity,
             message=f"已刷新 {len(friends)} 个好友"
             + ("，并已重建发送索引" if index_updated else ""),
         )
@@ -2204,6 +2281,121 @@ def create_app():
             )
         return JSONResponse(dict(job))
 
+    # "Immediate patrol" for one account. Same permission and CSRF checks as
+    # the friend refresh; the patrol itself runs in the background and shares
+    # the per-account browser lock with the sender and the refresher.
+    patrol_jobs: dict[str, dict] = {}
+
+    async def _run_patrol_job(normalized_id, account_ref):
+        try:
+            outcome = await account_patrol.run_patrol(
+                [account_ref],
+                trigger="manual",
+            )
+            results = list((outcome or {}).get("accounts") or [])
+            result = results[0] if results else {}
+            job = patrol_jobs.get(normalized_id)
+            if job is not None:
+                job.update(
+                    {
+                        "state": "done" if result else "failed",
+                        "conclusion": str(result.get("conclusion") or ""),
+                        "conclusionLabel": account_patrol.CONCLUSION_LABELS.get(
+                            str(result.get("conclusion") or ""), ""
+                        ),
+                        "reason": str(result.get("reason") or ("" if result else "账号未启用或已不存在")),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - reported on the job only
+            logger.warning("Manual patrol failed for %s: %s", normalized_id, type(exc).__name__, exc_info=True)
+            job = patrol_jobs.get(normalized_id)
+            if job is not None:
+                job.update({"state": "failed", "reason": f"巡查出错：{type(exc).__name__}"})
+        finally:
+            job = patrol_jobs.get(normalized_id)
+            if job is not None:
+                job["finishedAt"] = datetime.now().isoformat(timespec="seconds")
+            _patrol_active.discard(normalized_id)
+
+    @app.post("/accounts/{unique_id}/patrol")
+    async def patrol_account_now(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
+
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+        if not account.get("enabled", True):
+            return JSONResponse(
+                {"error": "账号已停用，巡查只检查启用的账号。", "category": "disabled"},
+                status_code=409,
+            )
+
+        normalized_id = normalize_unique_id(unique_id)
+        if task_run_lock_status().get("running"):
+            # A send run drives its own browser per account; same rule as the
+            # friend refresh.
+            return JSONResponse(
+                {
+                    "error": "发送任务正在运行，为避免与发送流程同时驱动同一账号的浏览器，请稍后再巡查。",
+                    "category": "busy",
+                    "retryable": True,
+                },
+                status_code=409,
+                headers={"Retry-After": "30"},
+            )
+        if normalized_id in _patrol_active:
+            return JSONResponse(
+                {"error": "该账号已有巡查正在进行，请稍后再试", "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "10"},
+            )
+        conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            return JSONResponse(
+                {"error": conflict, "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+        _patrol_active.add(normalized_id)
+        patrol_jobs[normalized_id] = {
+            "state": "running",
+            "startedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+        _start_background(
+            _run_patrol_job(normalized_id, str(account.get("account_ref") or normalized_id))
+        )
+        return JSONResponse(
+            {"ok": True, "state": "running", "job": dict(patrol_jobs[normalized_id])},
+            status_code=202,
+        )
+
+    @app.get("/accounts/{unique_id}/patrol/status")
+    async def patrol_account_status(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+        normalized_id = normalize_unique_id(unique_id)
+        job = dict(patrol_jobs.get(normalized_id) or {"state": "idle"})
+        job["latest"] = account_patrol.patrol_view(account)
+        return JSONResponse(job)
+
     @app.post("/accounts/{unique_id}/friends/refresh")
     async def refresh_account_friend_list(request: Request, unique_id: str):
         maybe_redirect = require_user(request)
@@ -2373,6 +2565,7 @@ def create_app():
                     account.get("username", normalized_id),
                     exc_info=True,
                 )
+        identity = _record_friend_identity(account, friends) if index_updated else {}
 
         logger.info(
             "Friend refresh stored for %s: count=%s complete=%s index_updated=%s",
@@ -2388,6 +2581,7 @@ def create_app():
                 "previous_updated_at": previous_updated_at,
                 "scan_complete": scan_complete,
                 "index_updated": index_updated,
+                "identity": identity,
                 "message": f"已刷新 {len(friends)} 个好友"
                 + ("，并已重建发送索引" if index_updated else ""),
             }

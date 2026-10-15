@@ -192,6 +192,17 @@ class RedesignedPagesTests(unittest.TestCase):
             with self.subTest(anchor=anchor):
                 self.assertIn(f'"{anchor}": "{target}"', base)
 
+    def test_legacy_encoded_fragment_paths_redirect_to_safe_query_anchors(self):
+        self._as(ADMIN)
+        for path, location in (
+            ("/settings%23notify", "/settings?_anchor=notify"),
+            ("/accounts%23account-1001", "/accounts?_anchor=account-1001"),
+        ):
+            response = self._get(path + "?next=https%3A%2F%2Fevil.test")
+            self.assertEqual(303, response.status_code)
+            self.assertEqual(location, response.headers["location"])
+        self.assertEqual(404, self._get("/accounts%23account-invalid").status_code)
+
     def test_form_posts_return_to_the_page_they_came_from(self):
         self._as(ADMIN)
         with (
@@ -200,9 +211,9 @@ class RedesignedPagesTests(unittest.TestCase):
             patch.object(app_module, "refresh_proxy"),
             patch.object(app_module, "create_web_user"),
         ):
-            self.assertEqual("/settings#messages", self.client.post("/config", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
-            self.assertEqual("/settings#ops", self.client.post("/ops/proxy/refresh", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
-            self.assertEqual("/settings#users", self.client.post("/admin/users/create", data={"csrf_token": "t", "username": "a", "password": "b"}, follow_redirects=False).headers["location"])
+            self.assertEqual("/settings?_anchor=messages", self.client.post("/config", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
+            self.assertEqual("/settings?_anchor=ops", self.client.post("/ops/proxy/refresh", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
+            self.assertEqual("/settings?_anchor=users", self.client.post("/admin/users/create", data={"csrf_token": "t", "username": "a", "password": "b"}, follow_redirects=False).headers["location"])
 
     def test_theme_follows_the_system_until_the_user_picks_one(self):
         base = (Path(app_module.TEMPLATES_DIR) / "base.html").read_text(encoding="utf-8")

@@ -44,6 +44,7 @@ CATEGORY_LABELS = {
     "identity_confirmation_invalid": "账号身份确认失败",
     "login_verification_pending": "登录状态待验证",
     "send_rejected": "消息被平台拒绝",
+    "friend_not_found": "好友列表中找不到该目标",
     "protocol_user_blocked": "对方已拒收或拉黑",
     "protocol_user_not_in_conversation": "未找到与对方的会话",
     "protocol_check_message_not_pass": "发送结果校验未通过",
@@ -391,4 +392,180 @@ def _notify_run_finished(
         notify.send_message(failure_message, channels_config)
     if summary_message:
         notify.send_message(summary_message, channels_config)
-    return {"failure": bool(failure_message), "summary": bool(summary_message), "final": final}
+    # Renames and missing targets the send scan recorded today (A7/A8). They
+    # share their keys with the patrol, so each is pushed once per day.
+    identity_sent = _push_identity_entries(
+        _identity_event_entries(enabled_users, today),
+        channels_config,
+        path=path,
+        today=today,
+        now_iso=now_iso,
+        local_now=local_now,
+        title="目标变化提醒",
+        event="identity",
+    )
+    return {
+        "failure": bool(failure_message),
+        "summary": bool(summary_message),
+        "final": final,
+        "identity": identity_sent,
+    }
+
+
+# --------------------------------------------------------------------------
+# account patrol and target identity notices
+
+IDENTITY_EVENT_RENAMED = "renamed"
+IDENTITY_EVENT_MISSING = "missing"
+IDENTITY_EVENT_AMBIGUOUS = "rename_ambiguous"
+PATROL_LOGIN_CATEGORIES = frozenset(
+    {"login_required", "account_identity_mismatch", "missing_cookies"}
+)
+
+
+def login_failure_key(today, account_key, category):
+    """Shared with the preflight failure key, so one login problem is one push."""
+    return f"{today.isoformat()}|{account_key}|-|{category}"
+
+
+def _identity_event_entries(users, today, *, account_keys=None):
+    """Today's rename/missing events, keyed by account, category and identity.
+
+    The event identity is the opaque uid token (or the nickname for an unbound
+    target) recorded by core.friend_identity; no full uid ever reaches a key or
+    a line.
+    """
+    today_text = today.isoformat()
+    entries = []
+    for account in users or []:
+        if not account.get("enabled", True):
+            continue
+        account_key = _account_key(account)
+        if account_keys is not None and account_key not in account_keys:
+            continue
+        for event in account.get("identity_events") or []:
+            if not isinstance(event, dict) or str(event.get("date") or "") != today_text:
+                continue
+            category = str(event.get("category") or "")
+            if category not in (
+                IDENTITY_EVENT_RENAMED,
+                IDENTITY_EVENT_MISSING,
+                IDENTITY_EVENT_AMBIGUOUS,
+            ):
+                continue
+            identity = str(event.get("identity") or event.get("targetName") or "")
+            entries.append(
+                {
+                    "key": f"{today_text}|identity|{account_key}|{category}|{identity}",
+                    "account": _account_name(account),
+                    "category": category,
+                    "target": str(event.get("targetName") or ""),
+                    "oldName": str(event.get("oldName") or ""),
+                    "newName": str(event.get("newName") or ""),
+                    "uidSuffix": str(event.get("uidSuffix") or "")[-4:],
+                }
+            )
+    return entries
+
+
+def _identity_line(entry):
+    category = entry["category"]
+    if category == "login":
+        return f"- 账号「{entry['account']}」：登录态失效，{category_label(entry['loginCategory'])}"
+    suffix = f"（尾号 {entry['uidSuffix']}）" if entry.get("uidSuffix") else ""
+    if category == IDENTITY_EVENT_RENAMED:
+        old_name = entry.get("oldName") or entry.get("target")
+        new_name = entry.get("newName") or entry.get("target")
+        return f"- 账号「{entry['account']}」 目标已改名：「{old_name}」→「{new_name}」{suffix}，已自动跟随"
+    if category == IDENTITY_EVENT_AMBIGUOUS:
+        old_name = entry.get("oldName") or entry.get("target")
+        new_name = entry.get("newName") or "新昵称"
+        return f"- 账号「{entry['account']}」 目标「{old_name}」的新昵称「{new_name}」对应多个好友 uid，未自动跟随，请在 Web 核对"
+    target = entry.get("target") or entry.get("oldName")
+    return f"- 账号「{entry['account']}」 目标「{target}」{suffix}不在好友列表中（目标缺失）"
+
+
+def _push_identity_entries(entries, channels_config, *, path, today, now_iso, local_now, title, event):
+    """Reserve unseen keys in the shared notify state, then send one message."""
+    if not entries or not notify.enabled_channel_names(channels_config):
+        return False
+    new_entries = []
+    with FileLock(f"{path}.lock", timeout=30):
+        state = _load_state(path)
+        _prune_state(state, today)
+        for entry in entries:
+            if entry["key"] in state["dedupe"]:
+                continue
+            state["dedupe"][entry["key"]] = now_iso
+            new_entries.append(entry)
+        if new_entries:
+            _save_state(path, state)
+    if not new_entries:
+        return False
+    text = f"时间：{local_now.strftime('%m-%d %H:%M')}\n" + "\n".join(
+        _identity_line(entry) for entry in new_entries
+    )
+    message = notify.make_message(title, text, event=event, date=today.isoformat())
+    # Keys are reserved before sending: a failed push is only logged by
+    # utils.notify and never retried or raised into the caller.
+    notify.send_message(message, channels_config)
+    return True
+
+
+def notify_patrol_finished(results, config, users, *, schedule_tz, now=None, state_path=None):
+    """Push what the account patrol found. Never raises; never sends a summary.
+
+    Only problems are pushed: a login that is no longer usable, a missing
+    target and an automatically followed rename. One account/target/category
+    is pushed at most once per local day, shared with the run notices.
+    """
+    try:
+        channels_config = dict((config or {}).get("notifications") or {})
+        if not notify.enabled_channel_names(channels_config):
+            return False
+        now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        local_now = now.astimezone(schedule_tz)
+        today = local_now.date()
+        path = Path(state_path) if state_path is not None else NOTIFY_STATE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        by_ref = {}
+        for account in users or []:
+            by_ref[str(account.get("account_ref") or "")] = account
+        entries = []
+        account_keys = set()
+        for result in results or []:
+            account = by_ref.get(str(result.get("accountRef") or "")) or {
+                "account_ref": result.get("accountRef"),
+                "username": result.get("account"),
+            }
+            account_key = _account_key(account)
+            account_keys.add(account_key)
+            login = dict(result.get("login") or {})
+            category = str(login.get("category") or "")
+            if login.get("ok") is False and category in PATROL_LOGIN_CATEGORIES:
+                entries.append(
+                    {
+                        "key": login_failure_key(today, account_key, category),
+                        "account": _account_name(account),
+                        "category": "login",
+                        "loginCategory": category,
+                    }
+                )
+        entries.extend(_identity_event_entries(users, today, account_keys=account_keys))
+        return _push_identity_entries(
+            entries,
+            channels_config,
+            path=path,
+            today=today,
+            now_iso=now.isoformat(timespec="seconds"),
+            local_now=local_now,
+            title="账号巡查提醒",
+            event="patrol",
+        )
+    except Exception as exc:  # noqa: BLE001 - a push never changes the patrol
+        logger.warning(
+            "patrol notification skipped: %s",
+            notify.redact_text(f"{type(exc).__name__}: {exc}"),
+        )
+        return False

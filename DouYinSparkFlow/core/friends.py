@@ -11,6 +11,7 @@ from core.browser import (
     normalize_persistent_profile_config,
     release_browser_account_lock,
 )
+from core.friend_identity import UserDetailCollector
 from core.login import collect_login_result
 from core.streak_state import AUTH_COOKIE_NAMES
 from utils.config import get_config, normalize_unique_id
@@ -49,11 +50,17 @@ class FriendScanResult(list):
 
     complete = False
     reason = ""
+    uid_entries = ()
+    uid_summary = None
 
-    def __init__(self, names=(), *, complete=False, reason=""):
+    def __init__(self, names=(), *, complete=False, reason="", uid_entries=(), uid_summary=None):
         super().__init__(names)
         self.complete = bool(complete)
         self.reason = str(reason or "")
+        # Friend uids read passively from the page's own user_detail responses.
+        # They only add stable keys; names and completeness stay DOM-owned.
+        self.uid_entries = [dict(entry) for entry in uid_entries or ()]
+        self.uid_summary = dict(uid_summary or {})
 
 
 class FriendRefreshError(RuntimeError):
@@ -144,6 +151,8 @@ FRIEND_LIST_IDLE_ROUNDS = 5
 FRIEND_LIST_STUCK_ROUNDS = 2
 SCROLL_STEP_PX = 800
 SCROLL_SETTLE_SECONDS = 1.5
+# How long to wait for in-flight user_detail response bodies after the read.
+UID_DRAIN_TIMEOUT_SECONDS = 5
 
 
 def update_collection_progress(new_names_count, no_more_visible, scroll_moved, idle_rounds, stuck_rounds, idle_limit=5, stuck_limit=2):
@@ -425,6 +434,7 @@ async def _fetch_account_friends_once(
     account_name = str(account.get("username") or account.get("unique_id") or "")
     playwright = browser = context = page = None
     lock_handle = lock_path = lock_token = None
+    uid_collector = None
     try:
         # Reuse the account's persistent profile so the read drives the same
         # browser identity as the sender instead of a throwaway cookie context.
@@ -541,18 +551,34 @@ async def _fetch_account_friends_once(
                 "username": str(identity.get("username") or "").strip(),
             }
 
+        # Listen (never request) for the page's own friend-profile responses so
+        # the read also learns each friend's uid.
+        uid_collector = UserDetailCollector(account_name).attach(page)
         await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
         await asyncio.sleep(1)
 
         friends = await collect_friend_names(page, on_progress=on_progress)
-        if isinstance(friends, FriendScanResult):
-            return friends
-        return FriendScanResult(friends)
+        if not isinstance(friends, FriendScanResult):
+            friends = FriendScanResult(friends)
+        await uid_collector.drain(timeout=UID_DRAIN_TIMEOUT_SECONDS)
+        friends.uid_entries = uid_collector.entries()
+        friends.uid_summary = uid_collector.summary()
+        logger.info(
+            "Friend uid collection account=%s responses=%s parsed=%s uids=%s errors=%s",
+            account_name or "unknown",
+            friends.uid_summary.get("responses"),
+            friends.uid_summary.get("parsed"),
+            len(friends.uid_entries),
+            friends.uid_summary.get("errors") or "-",
+        )
+        return friends
     except RuntimeError:
         raise
     except Exception as exc:
         raise RuntimeError(f"刷新好友列表失败，请重试：{exc}") from exc
     finally:
+        if uid_collector is not None:
+            uid_collector.detach()
         if page:
             try:
                 await page.close()
@@ -784,7 +810,13 @@ async def fetch_account_friends(account, on_progress=None):
                 len(modes),
             )
             if friends or index == len(modes) - 1:
-                return FriendScanResult(friends, complete=complete, reason=reason)
+                return FriendScanResult(
+                    friends,
+                    complete=complete,
+                    reason=reason,
+                    uid_entries=getattr(payload, "uid_entries", ()) or (),
+                    uid_summary=getattr(payload, "uid_summary", None),
+                )
             logger.warning(
                 "Friend refresh route=%s returned zero friends; trying next route",
                 network_mode,

@@ -70,7 +70,10 @@ class WebUiSafetyTests(unittest.TestCase):
     def test_schedule_alignment_accepts_a_fixed_single_run(self):
         fixed_line = (
             "20 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' "
-            "bash /app/scripts/run_scheduled_task.sh"
+            "bash /app/scripts/run_scheduled_task.sh\n"
+            # The fixed run's daily account patrol, 30 minutes earlier.
+            "50 17 * * * env SPARKFLOW_TASK_MODE=patrol PYTHONUNBUFFERED=1 "
+            "SPARKFLOW_TRIGGER_LABEL='account patrol' bash /app/scripts/run_scheduled_task.sh"
         )
         with (
             patch.object(

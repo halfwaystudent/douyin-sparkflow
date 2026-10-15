@@ -46,6 +46,8 @@
         {% elif check == "login_required" %}<span class="pill danger">需重新登录</span>{% endif %}
         {% set ident = identity_view(account) %}
         <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
+        {% set patrol = patrol_view(account) %}
+        {% if patrol.has and patrol.conclusion != 'ok' %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">巡查：{{ patrol.conclusionLabel }}</span>{% endif %}
         <span class="pill {% if enabled %}success{% else %}warning{% endif %}">{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>
@@ -97,6 +99,43 @@
           </a>
         </div>
       </form>
+      {% set patrol = patrol_view(account) %}
+      <section class="patrol-panel" data-patrol-panel style="padding-top: 14px; border-top: 1px solid var(--line)">
+        <div class="friend-picker-toolbar">
+          <div>
+            <strong>账号巡查</strong>
+            <p class="friend-picker-status" data-patrol-status>
+              {% if patrol.has %}最近一次：{{ patrol.checkedDisplay or patrol.checkedAt }}（{{ patrol.trigger }}） · <span class="pill {{ patrol.pill }}" data-patrol-conclusion="{{ patrol.conclusion }}">{{ patrol.conclusionLabel }}</span>{% if patrol.friendCount %} · 读到 {{ patrol.friendCount }} 个好友{% endif %}{% else %}尚未巡查。每天发送窗口开始前 30 分钟自动巡查一次。{% endif %}
+            </p>
+          </div>
+          <button
+            class="button button-quiet button-sm"
+            type="button"
+            data-patrol-url="/accounts/{{ account.unique_id }}/patrol"
+            data-patrol-status-url="/accounts/{{ account.unique_id }}/patrol/status"
+            data-csrf-token="{{ csrf_token }}"
+            {% if not enabled %}disabled title="账号已停用，巡查只检查启用的账号"{% endif %}
+          >
+            <i data-lucide="shield-check"></i><span>立即巡查</span>
+          </button>
+        </div>
+        <p class="notice-inline" data-patrol-message hidden></p>
+        {% if patrol.has %}
+        {% if patrol.issues or patrol.targets or patrol.reason %}
+        <ul class="patrol-issues" style="margin: 8px 0 0; padding-left: 18px">
+          {% for issue in patrol.issues %}
+          <li data-patrol-issue>{{ issue }}</li>
+          {% endfor %}
+          {% if patrol.reason and not patrol.completed %}
+          <li data-patrol-reason>未完成原因：{{ patrol.reason }}</li>
+          {% endif %}
+          {% for item in patrol.targets %}
+          <li data-patrol-target="{{ item.status }}"><span class="pill {% if item.status == 'found' %}success{% elif item.status == 'missing' %}danger{% else %}warning{% endif %}">{{ item.label }}</span> {{ item.text }}{% if item.problem and item.reason %}<small>（{{ item.reason }}）</small>{% endif %}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+        {% endif %}
+      </section>
       <div class="form-actions" style="padding-top: 14px; border-top: 1px solid var(--line)">
         <form method="post" action="/accounts/{{ account.unique_id }}/toggle-enabled">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

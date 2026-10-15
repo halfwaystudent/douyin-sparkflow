@@ -28,7 +28,7 @@ from core.browser import (
 )
 from core.msg_builder import build_message, build_message_candidates
 from core.protocol_dispatch import run_protocol_tasks
-from core import notifications, streak_state
+from core import friend_identity, notifications, streak_state
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -1542,7 +1542,15 @@ async def _first_scrollable_friends_element(page, selectors):
     return await first_scrollable_element(page, selectors)
 
 
-async def scroll_and_select_user(page, user, account_name, targets, friend_scan_config=None, index_targets=None):
+async def scroll_and_select_user(
+    page,
+    user,
+    account_name,
+    targets,
+    friend_scan_config=None,
+    index_targets=None,
+    uid_collector=None,
+):
     friends_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
     target_selectors = (
         '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
@@ -1634,7 +1642,82 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
     def missing_index_target_names():
         return sorted(normalized_index_targets[item] for item in remaining_index_targets)
 
-    def persist_index(scan_complete):
+    def apply_target_rename(old_name, new_name):
+        """Point this scan (and the caller's lists) at a followed rename."""
+        old_key = _normalize_target_name(old_name)
+        new_key = _normalize_target_name(new_name)
+        if not old_key or not new_key or old_key == new_key:
+            return
+        lists = [targets]
+        if index_targets is not None and index_targets is not targets:
+            lists.append(index_targets)
+        user_targets = user.get("targets")
+        if isinstance(user_targets, list) and all(
+            user_targets is not item for item in lists
+        ):
+            lists.append(user_targets)
+        for items in lists:
+            for position, item in enumerate(items):
+                if isinstance(item, str) and _normalize_target_name(item) == old_key:
+                    items[position] = new_name
+        for mapping, remaining in (
+            (normalized_targets, remaining_targets),
+            (normalized_index_targets, remaining_index_targets),
+        ):
+            if old_key not in mapping:
+                continue
+            mapping.pop(old_key, None)
+            mapping[new_key] = new_name
+            was_pending = old_key in remaining or (
+                mapping is normalized_targets and old_key in missing_delivery_targets
+            )
+            remaining.discard(old_key)
+            if mapping is normalized_targets:
+                missing_delivery_targets.discard(old_key)
+            if was_pending and not (
+                mapping is normalized_index_targets and new_key in found_usernames
+            ):
+                remaining.add(new_key)
+        target_order[:] = [new_key if item == old_key else item for item in target_order]
+
+    uid_state = {"version": -1}
+
+    def follow_uid_renames(*, scan_complete=False, final=False):
+        """Reconcile targets with the uids the page reported so far."""
+        if uid_collector is None:
+            return
+        if not final and uid_collector.version == uid_state["version"]:
+            return
+        uid_state["version"] = uid_collector.version
+        entries = uid_collector.entries()
+        if not entries and not final:
+            return
+        try:
+            result = friend_identity.persist_identity_scan(
+                user,
+                entries,
+                scan_complete=scan_complete,
+                scanned_names=sorted(found_usernames),
+                allow_partial_rename=True,
+                max_follow_per_day=1,
+            )
+        except Exception:
+            logger.warning(
+                "Account %s friend uid reconcile failed; continuing by nickname",
+                account_name,
+                exc_info=True,
+            )
+            return
+        for item in (result or {}).get("renamed") or []:
+            apply_target_rename(item["oldName"], item["newName"])
+            logger.info(
+                "Account %s follows renamed target %s -> %s for this run",
+                account_name,
+                item["oldName"],
+                item["newName"],
+            )
+
+    async def persist_index(scan_complete, *, reached_end=False):
         _persist_friend_index(
             user,
             friend_index,
@@ -1642,6 +1725,11 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
             scan_complete=scan_complete,
             missing_targets=missing_index_target_names(),
         )
+        if uid_collector is not None:
+            await uid_collector.drain(timeout=3)
+            # Only a scan that reached the list end may conclude "missing";
+            # stopping once every target was found is not a full list read.
+            follow_uid_renames(scan_complete=reached_end, final=True)
 
     _, initial_scroll_element = await _first_scrollable_friends_element(
         page,
@@ -1654,10 +1742,16 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
         )
         await asyncio.sleep(min(scroll_delay_seconds, 1))
 
+    if uid_collector is not None:
+        # The friends tab load already triggered the page's own user_detail
+        # request; use it to follow renames before selecting anyone by name.
+        await uid_collector.drain(timeout=3)
+
     while True:
+        follow_uid_renames()
         now_monotonic = asyncio.get_running_loop().time()
         if now_monotonic - scan_started_at > max_scan_seconds:
-            persist_index(False)
+            await persist_index(False)
             logger.warning(
                 "Account %s friend list scan timed out after %ss. Missing delivery targets: %s; missing indexed targets=%s; scannedFriends=%s",
                 account_name,
@@ -1739,7 +1833,7 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                 clicked_delivery_target = True
                 if not remaining_targets and not remaining_index_targets:
                     logger.info("Account %s found all delivery and indexed target friends", account_name)
-                    persist_index(True)
+                    await persist_index(True)
                     return
                 break
         if clicked_delivery_target:
@@ -1758,7 +1852,7 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
 
         if not remaining_targets and not remaining_index_targets:
             logger.info("Account %s found all delivery and indexed target friends", account_name)
-            persist_index(True)
+            await persist_index(True)
             return
 
         else:
@@ -1783,7 +1877,21 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                             )
                             await asyncio.sleep(min(scroll_delay_seconds, 1))
                         continue
-                persist_index(True)
+                await persist_index(True, reached_end=True)
+                if remaining_targets:
+                    # A rename followed from the final uid data re-queued a
+                    # target under its new nickname; go back and select it.
+                    _, scrollable_element = await _first_scrollable_friends_element(
+                        page,
+                        scrollable_friends_selectors,
+                    )
+                    if scrollable_element:
+                        await page.evaluate(
+                            "(element) => { element.scrollTop = 0; }",
+                            scrollable_element,
+                        )
+                        await asyncio.sleep(min(scroll_delay_seconds, 1))
+                    continue
                 logger.warning(
                     "Account %s reached the end of the friend list. Missing delivery targets: %s; missing indexed targets=%s",
                     account_name,
@@ -1815,7 +1923,7 @@ async def scroll_and_select_user(page, user, account_name, targets, friend_scan_
                             )
                             await asyncio.sleep(min(scroll_delay_seconds, 1))
                         continue
-                persist_index(False)
+                await persist_index(False)
                 logger.warning(
                     "Account %s friend list scan made no progress for %ss. Missing delivery targets: %s; missing indexed targets=%s; scannedFriends=%s",
                     account_name,
@@ -2540,12 +2648,23 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
         existing_index = dict(matched.get("friend_index") or {})
         for normalized_name, record in (friend_records or {}).items():
             entry = dict(existing_index.get(normalized_name) or {})
+            new_keys = list(record.get("stableKeys") or [])
+            if new_keys and not any(
+                str(key).startswith(("peer:", "sec:")) for key in new_keys
+            ):
+                # DOM keys never carry the friend uid; keep the uid keys learned
+                # from the page's user_detail responses.
+                new_keys = [
+                    key
+                    for key in entry.get("stableKeys") or []
+                    if str(key).startswith(("peer:", "sec:"))
+                ] + new_keys
             entry.update(
                 {
                     "visibleName": record.get("visibleName") or "",
                     "normalizedName": normalized_name,
                     "stableKeys": list(
-                        record.get("stableKeys") or entry.get("stableKeys") or []
+                        new_keys or entry.get("stableKeys") or []
                     ),
                     "lastSeenAt": scanned_at,
                 }
@@ -2632,8 +2751,28 @@ def record_friend_scan(user, names, *, scan_complete, targets=None, missing_targ
     return records
 
 
+def _log_rejected_state_transition(action, user, target_name, state, now, *, requested, detail=""):
+    """Log a write the state machine refused, with the state that was kept."""
+    event_at = streak_state.state_event_at(state)
+    logger.warning(
+        "State machine rejected %s for user=%s target=%s requested=%s "
+        "existingStatus=%s existingEventAt=%s rejection=%s detail=%s",
+        action,
+        user.get("username", "unknown"),
+        target_name,
+        requested,
+        str(dict(state or {}).get("status") or ""),
+        event_at.isoformat(timespec="seconds") if event_at else "",
+        streak_state.failure_rejection_reason(state, now)
+        if action == "browser send failure"
+        else "existing_state_preferred",
+        detail,
+    )
+
+
 def _persist_browser_send_failure(user, target_name, message, category, reason, attempted_at, server_receipt=None):
     state_now = parse_sent_at(attempted_at, timezone.utc) or datetime.now(timezone.utc)
+    rejected = {}
 
     def mutate(accounts):
         matched = _find_matching_account(accounts, user)
@@ -2654,6 +2793,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
             or str(state.get("lastAttemptAt") or "")
             != state_now.isoformat(timespec="seconds")
         ):
+            rejected["state"] = dict(state)
             return None, False
         queue = dict(matched.get("failure_queue") or {})
         existing_entry = streak_state.failure_entry(
@@ -2677,6 +2817,17 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
 
     saved = update_user_data(mutate, force_reload=True)
     if saved is None:
+        if "state" in rejected:
+            _log_rejected_state_transition(
+                "browser send failure",
+                user,
+                target_name,
+                rejected["state"],
+                state_now,
+                requested=category,
+                detail=reason,
+            )
+            return
         logger.warning(
             "Could not find account to persist browser send failure for user=%s target=%s",
             user.get("username", "unknown"),
@@ -2773,6 +2924,7 @@ def _persist_browser_send_success(
     }
     if server_receipt:
         strong_entry["serverReceipt"] = server_receipt
+    rejected = {}
 
     def mutate(accounts):
         matched = _find_matching_account(accounts, user)
@@ -2805,6 +2957,7 @@ def _persist_browser_send_success(
                 and str(state.get("sentAt") or "") == expected_iso
             )
         if not state_accepted:
+            rejected["state"] = dict(state)
             return None, False
         history = dict(matched.get("message_history") or {})
         history[target_name] = dict(strong_entry)
@@ -2820,6 +2973,20 @@ def _persist_browser_send_success(
 
     matched_account = update_user_data(mutate, force_reload=True)
     if matched_account is None:
+        if "state" in rejected:
+            _log_rejected_state_transition(
+                "browser send success",
+                user,
+                target_name,
+                rejected["state"],
+                state_now,
+                requested=(
+                    streak_state.STATE_SEND_CONFIRMED
+                    if strong_receipt
+                    else streak_state.STATE_SENT_UNVERIFIED
+                ),
+            )
+            return
         logger.warning(
             "Could not find account to persist browser send history for user=%s target=%s",
             user.get("username", "unknown"),
@@ -3047,6 +3214,9 @@ def _prepare_protocol_fallback_users(active_config, protocol_users):
     return update_user_data(mutate, force_reload=True) or []
 
 
+REPORT_STATUS_NOT_SENT_TODAY = "not_sent_today"
+
+
 def _append_streak_run_report(
     run_id,
     started_at,
@@ -3068,22 +3238,49 @@ def _append_streak_run_report(
     report_dir = Path("logs/run_reports")
     report_records = []
     for account in users or []:
+        # Disabled accounts are not part of today's run: their old results must
+        # not show up as today's failures in the report or its summaries.
+        if not account.get("enabled", True):
+            continue
         account_ref = str(
             account.get("account_ref")
-            or account.get("unique_id")
             or account.get("username")
             or ""
         )
+        if account_ref.isdigit():
+            account_ref = friend_identity.uid_token(account_ref, "account")
         account_health = dict(account.get("account_health") or {})
-        preflight_failed = account_health.get("healthy") is False
+        health_checked_at = parse_sent_at(account_health.get("checkedAt"), timezone.utc)
+        preflight_failed = account_health.get("healthy") is False and (
+            health_checked_at is None
+            or streak_state.same_calendar_day(health_checked_at, completed_at)
+        )
         for target_name in account.get("targets") or []:
             state = streak_state.target_state(account, target_name, completed_at)
-            state_category = str(state.get("lastErrorCategory") or "")
-            state_reason = str(state.get("lastErrorReason") or "")
-            report_status = str(state.get("status") or "")
             history_entry = dict(account.get("message_history") or {}).get(target_name) or {}
             report_sent_at = parse_sent_at(history_entry.get("sentAt"), timezone.utc)
-            state_needs_verification = state.get("needsVerification")
+            if report_sent_at and not streak_state.same_calendar_day(report_sent_at, completed_at):
+                report_sent_at = None
+            if streak_state.state_is_from_today(state, completed_at):
+                state_category = str(state.get("lastErrorCategory") or "")
+                state_reason = str(state.get("lastErrorReason") or "")
+                report_status = str(state.get("status") or "")
+                state_needs_verification = state.get("needsVerification")
+            else:
+                # The latest state is from an earlier day: today has no result
+                # for this target yet, so none of the old outcome is carried over.
+                state = {
+                    "targetRef": friend_identity.redact_target_ref(
+                    state.get("targetRef") or ""
+                ),
+                    "displayName": state.get("displayName") or "",
+                }
+                history_entry = {}
+                report_sent_at = None
+                state_category = ""
+                state_reason = ""
+                report_status = REPORT_STATUS_NOT_SENT_TODAY
+                state_needs_verification = False
             if preflight_failed:
                 state_category = str(account_health.get("category") or "")
                 state_reason = str(account_health.get("reason") or "")
@@ -3091,7 +3288,9 @@ def _append_streak_run_report(
             report_record = {
                 "runId": run_id,
                 "accountRef": account_ref,
-                "targetRef": state.get("targetRef") or "",
+                "targetRef": friend_identity.redact_target_ref(
+                    state.get("targetRef") or ""
+                ),
                 "displayName": state.get("displayName") or target_name,
                 "status": report_status,
                 "strategy": state.get("strategy") or "",
@@ -3408,9 +3607,13 @@ async def _do_user_task_locked(
         raise
     yielded_targets = set()
     page = None
+    uid_collector = None
 
     try:
         page = await context.new_page()
+        # Passively read the friend uids the chat page requests by itself; no
+        # request is built or replayed here.
+        uid_collector = friend_identity.UserDetailCollector(account_name).attach(page)
         try:
             await retry_operation(
                 "open creator home",
@@ -3463,6 +3666,7 @@ async def _do_user_task_locked(
                 targets,
                 friend_scan_config,
                 index_targets=index_targets,
+                uid_collector=uid_collector,
             ):
                 yielded_targets.add(target_name)
                 message = ""
@@ -3698,6 +3902,8 @@ async def _do_user_task_locked(
                     attempted_at,
                 )
     finally:
+        if uid_collector is not None:
+            uid_collector.detach()
         if page is not None:
             try:
                 await page.close()

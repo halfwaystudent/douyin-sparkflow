@@ -661,7 +661,7 @@ class NotificationWebTests(unittest.TestCase):
                 data={"notify_enabled": "on", "notify_telegram_enabled": "on", "notify_telegram_chatId": "77", "notify_telegram_botToken": ""},
                 follow_redirects=False,
             )
-            self.assertEqual("/settings#notify", response.headers["location"])
+            self.assertEqual("/settings?_anchor=notify", response.headers["location"])
             telegram = self.store["notifications"]["channels"]["telegram"]
             self.assertEqual("123456:SECRETTOKENVALUE", telegram["botToken"])
             self.assertEqual("77", telegram["chatId"])
@@ -774,7 +774,7 @@ class NotificationWebTests(unittest.TestCase):
                 data={"channel": "telegram", "notify_telegram_chatId": "unsaved"},
                 follow_redirects=False,
             )
-        self.assertEqual("/settings#notify", response.headers["location"])
+        self.assertEqual("/settings?_anchor=notify", response.headers["location"])
         self.assertEqual("telegram", send.call_args.args[0])
         self.assertEqual("123456:SECRETTOKENVALUE", send.call_args.args[1]["channels"]["telegram"]["botToken"])
         self.assertEqual("42", send.call_args.args[1]["channels"]["telegram"]["chatId"])

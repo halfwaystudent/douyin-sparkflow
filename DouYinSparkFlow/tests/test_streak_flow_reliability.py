@@ -2263,6 +2263,8 @@ class StreakRunReportTests(unittest.TestCase):
         self.assertEqual("account has no cookies", record["reason"])
 
     def test_run_report_carries_evidence_level_and_sent_time(self):
+        # The report only presents today's outcome, so the weak send is today.
+        sent_today = datetime.now(timezone.utc).replace(microsecond=0)
         account = {
             "username": "demo",
             "unique_id": "1001",
@@ -2280,7 +2282,7 @@ class StreakRunReportTests(unittest.TestCase):
             },
             "message_history": {
                 "Alice": {
-                    "sentAt": "2026-09-18T10:05:00+08:00",
+                    "sentAt": sent_today.isoformat(),
                     "confirmationLevel": "weak",
                     "confirmationSource": "browser_visible_count_increased",
                     "confirmationDetail": "page echo only",
@@ -2308,7 +2310,7 @@ class StreakRunReportTests(unittest.TestCase):
         self.assertEqual("browser_visible_count_increased", record["confirmationSource"])
         self.assertEqual("page echo only", record["confirmationDetail"])
         self.assertTrue(record["needsVerification"])
-        self.assertTrue(str(record["sentAt"]).startswith("2026-09-18T"))
+        self.assertEqual(sent_today.isoformat(), record["sentAt"])
 
     def test_report_redacts_credentials_from_free_text(self):
         with tempfile.TemporaryDirectory() as temp_dir:

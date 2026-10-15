@@ -1,3 +1,18 @@
+// Query-based positioning avoids fragment-encoding bugs in mobile redirects.
+(() => {
+  const position = () => {
+    const anchor = new URLSearchParams(window.location.search).get("_anchor");
+    if (!anchor) return;
+    const target = document.getElementById(anchor);
+    if (target) target.scrollIntoView({ block: "start" });
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", position, { once: true });
+  } else {
+    position();
+  }
+})();
+
 (() => {
   const forms = document.querySelectorAll("form[data-ajax-submit]");
   if (!forms.length) return;
@@ -1707,5 +1722,62 @@ window.addEventListener("DOMContentLoaded", () => {
     } finally {
       button.disabled = false;
     }
+  });
+})();
+
+// "Immediate patrol" on the accounts page: start it, then poll until it ends
+// and reload so the server-rendered result is shown.
+(() => {
+  const buttons = document.querySelectorAll("[data-patrol-url]");
+  buttons.forEach((button) => {
+    const panel = button.closest("[data-patrol-panel]");
+    const message = panel ? panel.querySelector("[data-patrol-message]") : null;
+    const show = (text, level) => {
+      if (!message) return;
+      message.hidden = false;
+      message.className = `notice-inline${level ? ` ${level}` : ""}`;
+      message.textContent = text;
+    };
+    const poll = async () => {
+      for (let round = 0; round < 120; round += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        try {
+          const response = await fetch(button.dataset.patrolStatusUrl, { credentials: "same-origin" });
+          const data = await response.json().catch(() => ({}));
+          if (data.state && data.state !== "running") {
+            show(data.state === "done" ? `巡查完成：${data.conclusionLabel || ""}` : `巡查失败：${data.reason || ""}`, data.state === "done" ? "" : "warning");
+            setTimeout(() => window.location.reload(), 800);
+            return;
+          }
+        } catch (error) {
+          // keep polling; a transient error is not the patrol's result
+        }
+      }
+      show("巡查仍在进行，请稍后刷新页面查看结果。", "warning");
+      button.disabled = false;
+    };
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      show("正在巡查：检查登录态并读取好友列表，不会打开聊天或发送消息…", "");
+      try {
+        const body = new FormData();
+        body.set("csrf_token", button.dataset.csrfToken || "");
+        const response = await fetch(button.dataset.patrolUrl, {
+          method: "POST",
+          body,
+          credentials: "same-origin",
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.status !== 202) {
+          show(data.error || `无法开始巡查（${response.status}）`, "warning");
+          button.disabled = false;
+          return;
+        }
+        poll();
+      } catch (error) {
+        show(`无法开始巡查：${error.message}`, "warning");
+        button.disabled = false;
+      }
+    });
   });
 })();

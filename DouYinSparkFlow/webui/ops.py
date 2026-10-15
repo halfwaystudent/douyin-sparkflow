@@ -33,11 +33,19 @@ logger = logging.getLogger(__name__)
 
 TASK_ALREADY_RUNNING = -2
 
+# Every patrol line carries this env assignment, whichever way the task command
+# is built (container script, compose ``-e`` or a local env prefix), so the
+# panel can tell it apart from the send lines.
+PATROL_SCHEDULE_MARKER = "SPARKFLOW_TASK_MODE=patrol"
+PATROL_TRIGGER_LABEL = "account patrol"
+PATROL_LEAD_MINUTES = 30
+
 TASK_SCHEDULE_MARKERS = (
     "docker compose run --rm task",
     "docker compose run --rm douyin",
     "main.py --doTask",
     "run_scheduled_task.sh",
+    PATROL_SCHEDULE_MARKER,
 )
 HOST_CRONTAB_PATH = Path("/host-spool-cron/root")
 # The scheduler container mounts ./DouYinSparkFlow/logs at /app/logs, so trigger
@@ -287,6 +295,47 @@ def build_unsent_fallback_task_command():
         },
         trigger_label="unsent fallback",
     )
+
+
+def build_patrol_task_command():
+    return build_scheduled_task_command(
+        {
+            "SPARKFLOW_TASK_MODE": "patrol",
+            "PYTHONUNBUFFERED": "1",
+        },
+        trigger_label=PATROL_TRIGGER_LABEL,
+    )
+
+
+def is_patrol_schedule_line(line):
+    return PATROL_SCHEDULE_MARKER in str(line or "")
+
+
+def patrol_time_for_schedule(schedule):
+    """(hour, minute) of the daily patrol, or None when nothing is scheduled.
+
+    The patrol runs ``PATROL_LEAD_MINUTES`` before the first scheduled send of
+    the day: the window start, or the single fixed run. A send at 00:00 puts
+    the patrol at 23:30 of the previous day.
+    """
+    if not schedule:
+        return None
+    if schedule.get("mode") == "window":
+        first_minute = int(schedule["startHour"]) * 60
+    elif schedule.get("mode") == "fixed":
+        first_minute = int(schedule["hour"]) * 60 + int(schedule["minute"])
+    else:
+        return None
+    patrol_minute = (first_minute - PATROL_LEAD_MINUTES) % (24 * 60)
+    return patrol_minute // 60, patrol_minute % 60
+
+
+def patrol_cron_line(schedule):
+    when = patrol_time_for_schedule(schedule)
+    if when is None:
+        return ""
+    hour, minute = when
+    return f"{minute} {hour} * * * {build_patrol_task_command()} >> {CRON_LOG_PATH} 2>&1"
 
 
 def run_command(args, cwd=None, timeout=120, check=False):
@@ -606,6 +655,12 @@ def douyin_schedule_lines(crontab_text=None):
 
 def schedule_line_kind(line):
     """Classify a douyin task line as a windowed schedule or a single fixed run."""
+    if is_patrol_schedule_line(line):
+        return "patrol"
+    if "SPARKFLOW_FALLBACK_PHASE=1" in str(line or ""):
+        # The end-of-window fallback runs at one fixed minute but only exists
+        # as part of a window schedule.
+        return "window"
     fields = str(line or "").split()
     if len(fields) < 5:
         return "unknown"
@@ -625,7 +680,9 @@ def get_schedule_alignment(recent_triggers=None):
     """
     window = dict(get_config(force_reload=True).get("dailySendWindow") or {})
     enabled = bool(window.get("enabled"))
-    lines = douyin_schedule_lines()
+    all_lines = douyin_schedule_lines()
+    patrol_lines = [line for line in all_lines if is_patrol_schedule_line(line)]
+    lines = [line for line in all_lines if not is_patrol_schedule_line(line)]
     kinds = sorted({schedule_line_kind(line) for line in lines})
     if enabled:
         aligned = bool(lines) and kinds == ["window"]
@@ -642,7 +699,13 @@ def get_schedule_alignment(recent_triggers=None):
             detail = "按单次固定时间调度（该模式的时间保存在任务行内）"
         else:
             detail = "配置未启用发送窗口，但 spool 中仍存在窗口式任务行"
+    patrol = _patrol_alignment(enabled, window, lines, patrol_lines)
+    if not patrol["aligned"]:
+        aligned = False
+        detail = f"{detail}；{patrol['detail']}"
     triggers = recent_trigger_lines() if recent_triggers is None else recent_triggers
+    # The patrol fires before the window opens; it is not a send trigger.
+    triggers = [line for line in triggers if PATROL_TRIGGER_LABEL not in str(line)]
     missing_triggers = False
     if enabled:
         try:
@@ -658,9 +721,58 @@ def get_schedule_alignment(recent_triggers=None):
         "kinds": kinds,
         "aligned": aligned,
         "detail": detail,
+        "patrolLines": patrol_lines,
+        "patrolExpected": patrol["expected"],
+        "patrolAligned": patrol["aligned"],
+        "patrolDetail": patrol["detail"],
         "recentTriggerCount": len(triggers),
         "missingTriggers": missing_triggers,
     }
+
+
+def _expected_patrol_time(enabled, window, send_lines):
+    """Patrol (hour, minute) the live send lines call for, or None."""
+    if enabled:
+        try:
+            return patrol_time_for_schedule(
+                {"mode": "window", "startHour": int(window.get("startHour") or 0)}
+            )
+        except (TypeError, ValueError):
+            return None
+    fixed = [line for line in send_lines if schedule_line_kind(line) == "fixed"]
+    if len(fixed) != 1:
+        return None
+    fields = fixed[0].split()
+    if not (fields[0].isdigit() and fields[1].isdigit()):
+        return None
+    return patrol_time_for_schedule(
+        {"mode": "fixed", "hour": int(fields[1]), "minute": int(fields[0])}
+    )
+
+
+def _patrol_alignment(enabled, window, send_lines, patrol_lines):
+    expected = _expected_patrol_time(enabled, window, send_lines) if send_lines else None
+    expected_label = f"{expected[0]:02d}:{expected[1]:02d}" if expected else ""
+    actual = []
+    for line in patrol_lines:
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            actual.append((int(fields[1]), int(fields[0])))
+        else:
+            actual.append(None)
+    if expected is None:
+        aligned = not patrol_lines
+        detail = "没有定时发送，也没有巡查任务行" if aligned else "没有定时发送，但 spool 中仍有巡查任务行"
+    elif actual == [expected]:
+        aligned = True
+        detail = f"每日巡查 {expected_label}（首次发送前 {PATROL_LEAD_MINUTES} 分钟）"
+    elif not patrol_lines:
+        aligned = False
+        detail = f"缺少每日巡查任务行（应为 {expected_label}）"
+    else:
+        aligned = False
+        detail = f"巡查任务行与发送时间不一致（应为 {expected_label}）"
+    return {"aligned": aligned, "expected": expected_label, "detail": detail}
 
 
 def replace_douyin_cron_schedule(crontab_text, time_string):
@@ -706,6 +818,11 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
             f"{schedule['minute']} {schedule['hour']} * * * "
             f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
         )
+
+    # One daily account patrol before the first scheduled send of the day.
+    patrol_line = patrol_cron_line(schedule)
+    if patrol_line:
+        updated.append(patrol_line)
 
     normalized = "\n".join(line for line in updated if line.strip())
     if normalized:
@@ -758,9 +875,17 @@ def sync_daily_schedule_from_config():
     config = get_config(force_reload=True)
     window = dict(config.get("dailySendWindow") or {})
     if not window.get("enabled"):
-        lines = douyin_schedule_lines()
+        all_lines = douyin_schedule_lines()
+        lines = [line for line in all_lines if not is_patrol_schedule_line(line)]
         kinds = {schedule_line_kind(line) for line in lines}
-        if not lines or kinds == {"fixed"}:
+        if lines and kinds == {"fixed"}:
+            # A single fixed run carries its own time in the task line; only
+            # keep its daily patrol line present and on time.
+            return _sync_fixed_schedule_patrol(lines, all_lines)
+        if not lines and all_lines:
+            # Nothing is scheduled to send, so no patrol either: drop it below.
+            lines = all_lines
+        if not lines:
             # No window configured, and either nothing is scheduled or a single
             # fixed run carries its own time in the task line: leave it alone.
             return subprocess.CompletedProcess(
@@ -827,6 +952,58 @@ def sync_daily_schedule_from_config():
         return _empty_result(stderr=str(exc))
 
 
+def _sync_fixed_schedule_patrol(send_lines, all_lines):
+    """Keep the patrol line of a single fixed-time schedule in step with it."""
+    unchanged = subprocess.CompletedProcess(
+        args=["sync-daily-schedule"],
+        returncode=0,
+        stdout="schedule disabled; existing crontab left unchanged",
+        stderr="",
+    )
+    if len(send_lines) != 1:
+        return unchanged
+    fields = send_lines[0].split()
+    if not (fields[0].isdigit() and fields[1].isdigit()):
+        return unchanged
+    expected = patrol_cron_line(
+        {"mode": "fixed", "hour": int(fields[1]), "minute": int(fields[0])}
+    )
+    patrol_lines = [line.strip() for line in all_lines if is_patrol_schedule_line(line)]
+    if patrol_lines == [expected.strip()]:
+        return unchanged
+    try:
+        kept = [
+            raw_line.rstrip("\n")
+            for raw_line in read_crontab().splitlines()
+            if raw_line.strip() and not is_patrol_schedule_line(raw_line)
+        ]
+        kept.append(expected)
+        updated = "\n".join(kept) + "\n"
+        if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
+            HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+            stdout = "host spool updated"
+        else:
+            subprocess.run(
+                ["crontab", "-"],
+                input=updated,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            stdout = "crontab updated"
+        logger.info("Synchronized the daily patrol line of the fixed-time schedule")
+        return subprocess.CompletedProcess(
+            args=["sync-daily-schedule"],
+            returncode=0,
+            stdout=f"fixed schedule kept; patrol line synchronized ({stdout})",
+            stderr="",
+        )
+    except Exception as exc:
+        logger.error("sync_daily_schedule_from_config failed: %s", exc)
+        return _empty_result(stderr=str(exc))
+
+
 def current_daily_schedule():
     config = get_config(force_reload=True)
     window = dict(config.get("dailySendWindow") or {})
@@ -837,6 +1014,9 @@ def current_daily_schedule():
             logger.warning("current_daily_schedule found invalid dailySendWindow=%s", window)
 
     for line in read_crontab().splitlines():
+        if is_patrol_schedule_line(line):
+            # The patrol line is not a send time.
+            continue
         if any(marker in line for marker in TASK_SCHEDULE_MARKERS):
             parts = line.split(maxsplit=5)
             if len(parts) >= 2:

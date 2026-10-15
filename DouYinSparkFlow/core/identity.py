@@ -66,6 +66,9 @@ LOGIN_HEALTH_FLAG_KEYS = (
     "login_required",
     "needs_relogin",
     "pending_login_verification",
+    # Written by the pre-window account patrol (core.patrol) when the page
+    # proved the login unusable; a proven new login resolves it.
+    "patrol_login_failure",
 )
 
 # Categories describing a login or identity problem (not a send problem). These

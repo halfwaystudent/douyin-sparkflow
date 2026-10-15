@@ -405,6 +405,8 @@ MERGE_MAP_KEYS = (
     "friend_index",
     "friend_index_meta",
     "message_history",
+    "friend_uids",
+    "target_uid_bindings",
 )
 
 

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 
 from rich.console import Console
 from rich.prompt import Prompt
@@ -42,23 +43,57 @@ def interactive_cli():
 def build_parser():
     parser = argparse.ArgumentParser(description="DouYin Spark Flow")
     parser.add_argument("--doTask", action="store_true", help="Run the message task immediately")
+    parser.add_argument(
+        "--patrol",
+        action="store_true",
+        help="Run the read-only account patrol (login state and target friends)",
+    )
+    parser.add_argument(
+        "--account",
+        action="append",
+        default=None,
+        help="Limit --patrol to these account refs (repeatable or comma separated)",
+    )
     parser.add_argument("--web", action="store_true", help="Start the Web Admin UI")
     parser.add_argument("--host", default=None, help="Web UI bind host")
     parser.add_argument("--port", type=int, default=None, help="Web UI bind port")
     return parser
 
 
-if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
+def patrol_account_refs(values):
+    refs = [
+        part.strip()
+        for value in values or []
+        for part in str(value or "").split(",")
+        if part.strip()
+    ]
+    return refs or None
 
+
+def run_patrol_cli(account_refs=None):
+    from core.patrol import run_patrol
+
+    return asyncio.run(run_patrol(account_refs, trigger="scheduled"))
+
+
+def task_mode():
+    """Cron passes SPARKFLOW_TASK_MODE=patrol to the shared task entry point."""
+    return str(os.getenv("SPARKFLOW_TASK_MODE") or "").strip().lower()
+
+
+def run(args):
+    if args.patrol or (args.doTask and task_mode() == "patrol"):
+        return run_patrol_cli(patrol_account_refs(args.account))
     if args.doTask:
         from core.tasks import runTasks
 
-        asyncio.run(runTasks())
-    elif args.web:
+        return asyncio.run(runTasks())
+    if args.web:
         from webui.app import run_web_app
 
-        run_web_app(host=args.host, port=args.port)
-    else:
-        interactive_cli()
+        return run_web_app(host=args.host, port=args.port)
+    return interactive_cli()
+
+
+if __name__ == "__main__":
+    run(build_parser().parse_args())
