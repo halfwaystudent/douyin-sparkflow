@@ -869,7 +869,7 @@ async def count_visible_message_matches(page, message, chat_input=None):
     return visible_count
 
 
-async def confirm_message_sent(page, chat_input, message, before_snapshot=None):
+async def confirm_message_sent(page, chat_input, message, before_snapshot=None, before_indicator=None):
     expected_message = _normalize_message_text(message)
     before_signature = None
     if before_snapshot:
@@ -882,6 +882,14 @@ async def confirm_message_sent(page, chat_input, message, before_snapshot=None):
     # detect a *new* occurrence even if the last-own-message slot was taken by
     # a manual send from the user's phone.
     before_count = await count_today_own_message_matches(page, expected_message)
+    # Baseline the page-wide send-failure indicator *before* judging this
+    # attempt. The indicator scan covers the whole page, so a failure marker
+    # left over from an earlier attempt in the same conversation (or anywhere
+    # else in the DOM) would otherwise veto the bubble and count evidence of a
+    # send the server actually accepted. Only an indicator that is new or
+    # changed after the send is treated as evidence about *this* message.
+    if before_indicator is None:
+        before_indicator = await _detect_send_failure_indicator(page)
 
     last_input_text = ""
     last_snapshot = None
@@ -890,9 +898,11 @@ async def confirm_message_sent(page, chat_input, message, before_snapshot=None):
         await asyncio.sleep(1)
         last_input_text = await read_chat_input_text(chat_input)
         # Fail fast if the page shows a send-failure indicator (red exclamation,
-        # retry button, or explicit failure text) before we even check the bubble.
+        # retry button, or explicit failure text) before we even check the
+        # bubble — but only when it is new or changed relative to the
+        # pre-send baseline; an unchanged one is a leftover.
         failure_indicator = await _detect_send_failure_indicator(page)
-        if failure_indicator:
+        if failure_indicator and failure_indicator != before_indicator:
             return False, f"send failure indicator detected: {failure_indicator}"
         last_snapshot = await snapshot_last_own_message(page, chat_input=chat_input)
         last_signature = None
@@ -3723,6 +3733,10 @@ async def _do_user_task_locked(
                     await save_debug_artifacts(page, account_name, target_name, "typed-message")
 
                     im_observer_summary = await start_im_send_observer(page, account_name, target_name)
+                    # Baseline the failure indicator while the message is still
+                    # sitting in the input: anything on the page now predates
+                    # this send and must not veto the confirmation below.
+                    pre_send_indicator = await _detect_send_failure_indicator(page)
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
                     await chat_input.press("Enter")
 
@@ -3731,6 +3745,7 @@ async def _do_user_task_locked(
                         chat_input,
                         message,
                         before_snapshot=last_own_message_before,
+                        before_indicator=pre_send_indicator,
                     )
                     im_summary = await im_observer_summary()
                     logger.info(
