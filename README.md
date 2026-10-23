@@ -88,6 +88,8 @@
 
 **适用场景**：服务器部署、生产环境
 
+> **Apple Silicon（M 系列）**：默认 Playwright 基础镜像同时支持 `amd64` 和 `arm64`，无需指定 `platform`。如需设置 `PLAYWRIGHT_BASE_IMAGE` 使用镜像站，请确认所选镜像也提供 `arm64`；这只解决容器镜像架构兼容性，不保证抖音登录流程可用。
+
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/halfwaystudent/douyin-sparkflow.git

@@ -171,6 +171,22 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("node --version", dockerfile)
         self.assertNotIn("github.com/docker/compose", dockerfile)
 
+    def test_playwright_defaults_use_the_multi_architecture_upstream_image(self):
+        upstream = "mcr.microsoft.com/playwright/python:v1.56.0-jammy"
+        mirror = "swr.cn-north-4.myhuaweicloud.com/ddn-k8s/mcr.microsoft.com/playwright/python:v1.56.0-jammy"
+        dockerfile = (SOURCE_ROOT / "Dockerfile.server").read_text(encoding="utf-8")
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn(f"ARG PLAYWRIGHT_BASE_IMAGE={upstream}", dockerfile)
+        self.assertIn(f"PLAYWRIGHT_BASE_IMAGE: ${{PLAYWRIGHT_BASE_IMAGE:-{upstream}}}", compose)
+        self.assertIn(f"PLAYWRIGHT_BASE_IMAGE={upstream}", env_example)
+        self.assertNotIn(mirror, compose)
+        self.assertNotIn(mirror, env_example)
+        self.assertIn("Apple Silicon", readme)
+        self.assertIn("PLAYWRIGHT_BASE_IMAGE", readme)
+
     def test_docker_build_context_excludes_runtime_data(self):
         dockerignore = (SOURCE_ROOT / ".dockerignore").read_text(encoding="utf-8")
         for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json"):
