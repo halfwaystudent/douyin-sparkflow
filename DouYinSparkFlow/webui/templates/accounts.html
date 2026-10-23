@@ -89,7 +89,7 @@
           <script type="application/json" id="selected-targets-{{ account.unique_id }}">{{ account.targets|default([], true)|tojson }}</script>
         </div>
         <label class="field">
-          <span>目标好友（每行一个，和上面的选择同步）</span>
+          <span>目标会话（每行一个；群聊请写“群聊：群名称”，和上面的好友选择同步）</span>
           <textarea class="targets-textarea" name="targets" rows="4">{{ account.targets|default([], true)|join('\n') }}</textarea>
         </label>
         <div class="form-actions">

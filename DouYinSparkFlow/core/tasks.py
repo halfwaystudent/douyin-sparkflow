@@ -1352,11 +1352,10 @@ async def _click_first_visible_locator(candidates, account_name, stage):
 
 async def _open_friends_tab(page, account_name, fallback_selector, target_selectors):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_friends_tab")
-
-    _, existing_locator = await _first_non_empty_locator(page, target_selectors)
-    if existing_locator:
-        logger.info("Account %s friend list is already visible before tab click", account_name)
-        return "already_visible"
+    # Group and friend rows use the same DOM shape.  A visible row therefore
+    # proves neither that the friends tab is active nor that it is safe to
+    # select from it; always explicitly open the friends tab first.
+    del target_selectors
 
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     text_selector = (
@@ -1391,6 +1390,191 @@ async def _open_friends_tab(page, account_name, fallback_selector, target_select
     logger.info("Account %s clicked fallback friends tab after explicit wait", account_name)
     await asyncio.sleep(1)
     return "fallback_wait_clicked"
+
+
+GROUP_TARGET_PREFIXES = ("群聊：", "群聊:")
+
+
+def parse_chat_target(target_name):
+    """Return a configured target namespace and its creator-page label."""
+    raw = str(target_name or "").strip()
+    for prefix in GROUP_TARGET_PREFIXES:
+        if raw.startswith(prefix):
+            return "group", raw[len(prefix):].strip()
+    return "friend", raw
+
+
+def target_match_key(target_name):
+    kind, visible_name = parse_chat_target(target_name)
+    return kind, _normalize_target_name(visible_name)
+
+
+def _dedupe_group_target_aliases(targets):
+    """Keep one configured spelling for each explicit group target."""
+    result = []
+    seen_groups = set()
+    for target in targets:
+        kind, name_key = target_match_key(target)
+        if kind == "group":
+            if name_key in seen_groups:
+                continue
+            seen_groups.add(name_key)
+        result.append(target)
+    return result
+
+
+async def _open_groups_tab(page, account_name):
+    await _dismiss_non_login_dialogs(page, account_name, "before_open_groups_tab")
+    sub_app = page.locator('xpath=//*[@id="sub-app"]')
+    candidates = [
+        ("page role tab 群消息", page.get_by_role("tab", name="群消息", exact=True)),
+        ("page tab text 群消息", page.get_by_text("群消息", exact=True)),
+        ("sub-app tab text 群消息", sub_app.get_by_text("群消息", exact=True)),
+
+    ]
+    if await _click_first_visible_locator(candidates, account_name, "open_groups_tab"):
+        await asyncio.sleep(2)
+        if await _group_tab_is_active(page, account_name):
+            return
+    raise FriendListUnavailableError(
+        f"group_list_unavailable for {account_name}: 群消息 tab is not active"
+    )
+
+
+async def _group_tab_is_active(page, account_name):
+    """Trust group rows only while the visible 群消息 role tab is selected."""
+    locator = page.get_by_role("tab", name="群消息", exact=True)
+    count = await _locator_count_with_timeout(
+        locator, account_name, "verify_groups_tab", "role=tab[name=群消息]"
+    )
+    for index in range(min(count or 0, 5)):
+        tab = locator.nth(index)
+        try:
+            if not await tab.is_visible(timeout=800):
+                continue
+            if (await tab.get_attribute("aria-selected")) == "true":
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def scroll_and_select_group_targets(page, account_name, targets, friend_scan_config=None):
+    """Select groups from 群消息 without changing the friend UID/index state."""
+    group_targets = {}
+    for original in targets:
+        kind, visible = parse_chat_target(original)
+        name_key = _normalize_target_name(visible)
+        if kind == "group" and name_key:
+            # Both accepted prefixes name one logical target.  Preserve the
+            # first configuration spelling so it has exactly one send ledger.
+            group_targets.setdefault(name_key, original)
+    if not group_targets:
+        return
+    target_selectors = (
+        '#sub-app li.semi-list-item:visible:has(span[class*="item-header-name-"])',
+    )
+    no_more_selectors = (
+        'xpath=//div[contains(@class, "no-more-tip-ftdJnu")]',
+        'xpath=//*[@id="sub-app"]//*[contains(text(), "没有更多") or contains(text(), "暂无")]',
+    )
+    scrollable_selectors = ('#sub-app [role="grid"]', '#sub-app .ReactVirtualized__Grid', 'xpath=//*[@id="sub-app"]//ul/div')
+    config = friend_scan_config or _normalize_friend_list_scan_config({})
+    await _open_groups_tab(page, account_name)
+    try:
+        active_selector, _ = await _wait_for_friend_list_ready(
+            page, account_name, target_selectors, no_more_selectors, (),
+            timeout_seconds=min(60, config["maxScanSeconds"]), empty_grace_seconds=0,
+        )
+    except FriendListUnavailableError:
+        # A group without a spark is still a valid empty/nonmatching result.
+        return
+    _, initial_scrollable = await _first_scrollable_friends_element(page, scrollable_selectors)
+    if not initial_scrollable:
+        raise FriendListIncompleteError(
+            f"group_list_incomplete for {account_name}: could not reset group list to its start"
+        )
+    try:
+        reset_confirmed = await page.evaluate(
+            "(element) => { element.scrollTop = 0; return element.scrollTop === 0; }",
+            initial_scrollable,
+        )
+    except Exception as exc:
+        raise FriendListIncompleteError(
+            f"group_list_incomplete for {account_name}: could not reset group list to its start: {exc}"
+        ) from exc
+    if reset_confirmed is not True:
+        raise FriendListIncompleteError(
+            f"group_list_incomplete for {account_name}: group list reset was not confirmed"
+        )
+    candidates = {}
+    ambiguous_names = set()
+    deadline = asyncio.get_running_loop().time() + config["maxScanSeconds"]
+    while asyncio.get_running_loop().time() < deadline:
+        await _dismiss_non_login_dialogs(page, account_name, "group_list_scan")
+        _, locator = await _first_non_empty_locator(page, (active_selector,) + target_selectors)
+        if locator:
+            for element in await locator.all():
+                try:
+                    if not await element.is_visible(timeout=800):
+                        continue
+                except Exception:
+                    continue
+                record = await _extract_friend_record(element)
+                if not record:
+                    continue
+                name_key = record["normalizedName"]
+                if name_key not in group_targets:
+                    continue
+                previous = candidates.get(name_key)
+                if previous is not None and previous is not element:
+                    ambiguous_names.add(name_key)
+                else:
+                    candidates[name_key] = element
+        if await _selector_visible(page, no_more_selectors):
+            if ambiguous_names:
+                names = sorted(group_targets[name] for name in ambiguous_names)
+                raise FriendListIncompleteError(
+                    f"group_list_incomplete for {account_name}: ambiguous group names={names}"
+                )
+            # Completion must precede selection: group rows lack a stable DOM
+            # identity, so clicking during the scan could send before a later
+            # same-name row makes the target ambiguous.
+            for name_key, configured in group_targets.items():
+                element = candidates.get(name_key)
+                if element is None:
+                    continue
+                try:
+                    if not await element.is_visible(timeout=800):
+                        raise FriendListIncompleteError(
+                            f"group_list_incomplete for {account_name}: target {configured} is no longer visible after scan"
+                        )
+                    record = await _extract_friend_record(element)
+                except FriendListIncompleteError:
+                    raise
+                except Exception as exc:
+                    raise FriendListIncompleteError(
+                        f"group_list_incomplete for {account_name}: could not revalidate {configured}: {exc}"
+                    ) from exc
+                if not record or record.get("normalizedName") != name_key:
+                    raise FriendListIncompleteError(
+                        f"group_list_incomplete for {account_name}: target {configured} changed before selection"
+                    )
+                await element.click()
+                logger.info("Account %s selected target group %s", account_name, configured)
+                yield configured
+            return
+        _, scrollable = await _first_scrollable_friends_element(page, scrollable_selectors)
+        if not scrollable:
+            raise FriendListIncompleteError(
+                f"group_list_incomplete for {account_name}: could not confirm end of group list"
+            )
+        await page.evaluate(f"(element) => element.scrollTop += {config['scrollStepPx']}", scrollable)
+        await asyncio.sleep(config["scrollDelaySeconds"])
+
+    raise FriendListIncompleteError(
+        f"group_list_incomplete for {account_name}: scan timed out after {config['maxScanSeconds']}s"
+    )
 
 
 async def _reopen_friend_chat_page(page, account_name):
@@ -1560,7 +1744,54 @@ async def scroll_and_select_user(
     friend_scan_config=None,
     index_targets=None,
     uid_collector=None,
+    group_scan_errors=None,
 ):
+    # Keep the legacy string configuration intact: plain strings are friends;
+    # only the explicit ``群聊：`` prefix enters the group namespace.  Run that
+    # namespace separately so identical friend/group display names cannot cross
+    # select or share the friend identity index.
+    group_targets = _dedupe_group_target_aliases(
+        [target for target in targets if parse_chat_target(target)[0] == "group"]
+    )
+    if group_targets:
+        try:
+            async for target_name in scroll_and_select_group_targets(
+                page, account_name, group_targets, friend_scan_config
+            ):
+                yield target_name
+        except (FriendListUnavailableError, FriendListIncompleteError) as exc:
+            category = (
+                "friend_list_unavailable"
+                if isinstance(exc, FriendListUnavailableError)
+                else "friend_list_incomplete"
+            )
+            logger.warning(
+                "Account %s group target scan failed category=%s: %s; continuing friend scan",
+                account_name,
+                category,
+                exc,
+            )
+            if group_scan_errors is not None:
+                group_scan_errors.extend(
+                    {
+                        "target": target_name,
+                        "category": category,
+                        "reason": str(exc),
+                    }
+                    for target_name in group_targets
+                )
+    friend_targets = [target for target in targets if parse_chat_target(target)[0] == "friend"]
+    # Do not replace the legacy all-friend list: rename reconciliation below
+    # deliberately mutates that caller-owned list.  A mixed list gets an
+    # isolated friend-only working copy after its groups have been selected.
+    if group_targets:
+        targets = friend_targets
+    if index_targets is not None and group_targets:
+        index_targets = [
+            target for target in index_targets if parse_chat_target(target)[0] == "friend"
+        ]
+    if not friend_targets:
+        return
     friends_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
     target_selectors = (
         '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
@@ -3575,7 +3806,9 @@ async def _do_user_task_locked(
     allow_retry=False,
 ):
     cookies = user["cookies"]
-    targets = _ordered_targets_for_run(user["targets"], send_strategy)
+    targets = _dedupe_group_target_aliases(
+        _ordered_targets_for_run(user["targets"], send_strategy)
+    )
     start_delay = _random_delay_seconds(
         send_strategy,
         "accountStartDelaySecondsMin",
@@ -3616,6 +3849,8 @@ async def _do_user_task_locked(
                 pass
         raise
     yielded_targets = set()
+    group_scan_errors = []
+    persisted_group_error_targets = set()
     page = None
     uid_collector = None
 
@@ -3677,6 +3912,7 @@ async def _do_user_task_locked(
                 friend_scan_config,
                 index_targets=index_targets,
                 uid_collector=uid_collector,
+                group_scan_errors=group_scan_errors,
             ):
                 yielded_targets.add(target_name)
                 message = ""
@@ -3888,7 +4124,23 @@ async def _do_user_task_locked(
                     )
                     await _sleep_with_log(interval, "Delaying next browser message after failure", account_name)
         except Exception as exc:
-            remaining_targets = [target for target in targets if target not in yielded_targets]
+            for group_error in group_scan_errors:
+                target_name = group_error["target"]
+                if target_name in persisted_group_error_targets or target_name in yielded_targets:
+                    continue
+                _persist_browser_send_failure(
+                    user,
+                    target_name,
+                    "",
+                    group_error["category"],
+                    group_error["reason"],
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+                persisted_group_error_targets.add(target_name)
+            remaining_targets = [
+                target for target in targets
+                if target not in yielded_targets and target not in persisted_group_error_targets
+            ]
             attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             category = classify_browser_failure("friend_list", exc)
             reason = str(exc)
@@ -3904,7 +4156,23 @@ async def _do_user_task_locked(
                     _persist_browser_send_failure(user, target_name, "", category, reason, attempted_at)
             return
 
-        missing_targets = [target for target in targets if target not in yielded_targets]
+        for group_error in group_scan_errors:
+            target_name = group_error["target"]
+            if target_name in persisted_group_error_targets or target_name in yielded_targets:
+                continue
+            _persist_browser_send_failure(
+                user,
+                target_name,
+                "",
+                group_error["category"],
+                group_error["reason"],
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            )
+            persisted_group_error_targets.add(target_name)
+        missing_targets = [
+            target for target in targets
+            if target not in yielded_targets and target not in persisted_group_error_targets
+        ]
         if missing_targets:
             attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             for target_name in missing_targets:
