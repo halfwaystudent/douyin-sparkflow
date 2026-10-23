@@ -557,6 +557,10 @@ def apply_web_target_selection(account, previous_targets, now=None):
                 bindings.pop(name, None)
     bound, unbound = [], {}
     for name in current:
+        # Explicit group targets live outside the friend UID namespace.  Do not
+        # bind them, and do not report a misleading missing-friend UID.
+        if name.startswith(("群聊：", "群聊:")):
+            continue
         newly_selected = _key(name) not in previous_keys
         if not newly_selected and target_binding(account, name):
             continue

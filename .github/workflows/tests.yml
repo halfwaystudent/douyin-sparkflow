@@ -1,8 +1,8 @@
 name: Tests
 
 # Verification only: runs the Python and Node test suites on every push and pull
-# request. It never sends anything, never reads a secret and never starts a
-# browser, so a fork or a contributor PR can run the exact same checks.
+# request. It never sends anything and never reads a secret; offline browser
+# fixtures run against a locally installed Chromium with no account or network.
 on:
   push:
   pull_request:
@@ -36,6 +36,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Install offline Chromium fixture runtime
+        run: python -m playwright install --with-deps chromium
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: Byte-compile the application

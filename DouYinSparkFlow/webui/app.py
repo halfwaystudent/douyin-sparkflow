@@ -46,6 +46,7 @@ from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_
 from core.protocol_dispatch import run_protocol_tasks
 from core.tasks import (
     _append_streak_run_report,
+    target_match_key,
     record_friend_scan,
     run_browser_tasks,
     task_run_lock,
@@ -148,9 +149,14 @@ def _dedupe_targets(values):
     result = []
     for value in values:
         normalized = str(value).strip()
-        if not normalized or normalized in seen:
+        dedupe_key = (
+            target_match_key(normalized)
+            if normalized.startswith(("群聊：", "群聊:"))
+            else ("friend", normalized)
+        )
+        if not normalized or dedupe_key in seen:
             continue
-        seen.add(normalized)
+        seen.add(dedupe_key)
         result.append(normalized)
     return result
 

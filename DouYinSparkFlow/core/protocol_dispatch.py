@@ -61,6 +61,11 @@ def _build_protocol_target_identities(user, messages_by_target):
     identities = {}
     for target in (messages_by_target or {}):
         target_name = str(target).strip()
+        # Protocol dispatch only supports a resolved one-to-one peer. Explicit
+        # group targets are browser-only even if a stale cache happens to carry
+        # a matching display name.
+        if target_name.startswith(("群聊：", "群聊:")):
+            continue
         target_ref = streak_state.target_ref_for_stored_key(user, target_name)
         stable_matches = [
             entry

@@ -1,8 +1,14 @@
 import asyncio
+import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from core import tasks
+from core import friend_identity, protocol_dispatch, streak_state, tasks
+from utils import config
+from webui import app as web_app
 
 
 SCAN_CONFIG = {
@@ -26,6 +32,14 @@ class _Row:
     async def click(self):
         self.clicks += 1
 
+    def get_by_text(self, name, exact=False):
+        if name != self.name or not exact:
+            raise AssertionError((name, exact))
+        return self
+
+    async def count(self):
+        return 1
+
 
 class _Locator:
     def __init__(self, rows):
@@ -48,6 +62,271 @@ async def _collect(generator):
 
 
 class GroupChatTargetTests(unittest.TestCase):
+    def _run_group_send_until_press(
+        self,
+        press_side_effect,
+        update_side_effect=None,
+        update_handler=None,
+        readback_handler=None,
+    ):
+        """Exercise the production _do_user_task_locked send path through Enter."""
+        user = {
+            "username": "demo",
+            "unique_id": "1001",
+            "cookies": [],
+            "targets": ["群聊：目标群"],
+        }
+        page = Mock(goto=AsyncMock(), close=AsyncMock())
+        context = Mock(
+            new_page=AsyncMock(return_value=page),
+            add_cookies=AsyncMock(),
+            close=AsyncMock(),
+        )
+        browser = Mock(new_context=AsyncMock(return_value=context))
+        chat_input = Mock(type=AsyncMock(), press=AsyncMock(side_effect=press_side_effect))
+        collector = Mock()
+        collector.attach.return_value = collector
+
+        async def selected(*_args, **_kwargs):
+            yield "群聊：目标群"
+
+        def persist(mutate, **_kwargs):
+            if update_side_effect:
+                raise update_side_effect
+            if update_handler:
+                return update_handler(mutate, user, **_kwargs)
+            return mutate([user])[0]
+
+        with (
+            patch.object(tasks, "_sleep_with_log", new=AsyncMock()),
+            patch.object(tasks, "retry_operation", new=AsyncMock()),
+            patch.object(tasks, "ensure_not_login_required", new=AsyncMock()),
+            patch.object(tasks, "scroll_and_select_user", new=selected),
+            patch.object(tasks, "locate_chat_input", new=AsyncMock(return_value=(chat_input, "input"))),
+            patch.object(tasks, "build_message", return_value="hello"),
+            patch.object(tasks, "snapshot_last_own_message", new=AsyncMock(return_value=None)),
+            patch.object(tasks, "_mark_browser_target_in_flight", return_value=True),
+            patch.object(tasks, "save_debug_artifacts", new=AsyncMock()),
+            patch.object(tasks, "start_im_send_observer", new=AsyncMock()),
+            patch.object(tasks, "_detect_send_failure_indicator", new=AsyncMock(return_value=None)),
+            patch.object(tasks, "detect_message_already_sent", new=AsyncMock(return_value=(False, "not sent"))),
+            patch.object(tasks, "_page_has_login_required_prompt", new=AsyncMock(return_value=(False, ""))),
+            patch.object(tasks, "update_user_data", side_effect=persist),
+            patch.object(
+                tasks,
+                "get_userData",
+                side_effect=readback_handler or (lambda **_kwargs: [user]),
+            ),
+            patch.object(tasks.friend_identity, "UserDetailCollector", return_value=collector),
+        ):
+            try:
+                asyncio.run(
+                    tasks._do_user_task_locked(
+                        browser, user,
+                        {"shuffleTargets": False, "accountStartDelaySecondsMin": 0,
+                         "accountStartDelaySecondsMax": 0, "messageIntervalSecondsMin": 0,
+                         "messageIntervalSecondsMax": 0},
+                        {"enabled": False}, SCAN_CONFIG, "demo", "direct",
+                    )
+                )
+            except (asyncio.CancelledError, OSError):
+                pass
+        return user, chat_input
+
+    def test_enter_timeout_keeps_persisted_unknown_barrier(self):
+        user, chat_input = self._run_group_send_until_press(asyncio.TimeoutError("dispatched"))
+
+        self.assertEqual(1, chat_input.press.await_count)
+        self.assertEqual(
+            streak_state.STATE_SENT_UNVERIFIED,
+            streak_state.target_state(user, "群聊：目标群")["status"],
+        )
+
+    def test_enter_cancellation_keeps_persisted_unknown_barrier(self):
+        user, chat_input = self._run_group_send_until_press(asyncio.CancelledError())
+
+        self.assertEqual(1, chat_input.press.await_count)
+        self.assertEqual(
+            streak_state.STATE_SENT_UNVERIFIED,
+            streak_state.target_state(user, "群聊：目标群")["status"],
+        )
+
+    def test_storage_failure_prevents_enter_dispatch(self):
+        _user, chat_input = self._run_group_send_until_press(
+            None, OSError("ledger unavailable")
+        )
+
+        chat_input.press.assert_not_awaited()
+
+    def test_readback_missing_or_overwritten_barrier_prevents_enter_dispatch(self):
+        """A write result is not proof that the durable barrier still exists."""
+        for replacement in ([], [{"username": "demo", "unique_id": "1001", "targets": ["群聊：目标群"]}]):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "usersData.json"
+                wrote_initial = False
+
+                def persist_then_replace(mutate, user, **kwargs):
+                    nonlocal wrote_initial
+                    if not wrote_initial:
+                        path.write_text(
+                            json.dumps([copy.deepcopy(user)], ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                        wrote_initial = True
+                    result = config.update_user_data(mutate, **kwargs)
+                    self.assertEqual(
+                        streak_state.STATE_SENT_UNVERIFIED, result.get("status")
+                    )
+                    path.write_text(
+                        json.dumps(replacement, ensure_ascii=False), encoding="utf-8"
+                    )
+                    return result
+
+                with (
+                    patch.object(config, "users_data_path", return_value=path),
+                    patch.object(config, "userData", None),
+                ):
+                    _user, chat_input = self._run_group_send_until_press(
+                        None,
+                        update_handler=persist_then_replace,
+                        readback_handler=config.get_userData,
+                    )
+
+                chat_input.press.assert_not_awaited()
+
+    def test_unknown_barrier_has_zero_send_count_in_all_retry_planners(self):
+        now = tasks.datetime.now(tasks._schedule_timezone())
+        target = "群聊：目标群"
+        user = {"username": "demo", "unique_id": "1001", "targets": [target]}
+        streak_state.mark_sent_unverified(user, target, now=now, detail="pre_enter_outcome_unknown_barrier")
+        window = {"enabled": True, "startHour": 0, "endHour": 24, "scheduleIntervalMinutes": 20}
+
+        with (
+            patch.object(tasks, "_is_manual_run", return_value=False),
+            patch.object(tasks, "_is_fallback_run", return_value=False),
+        ):
+            regular_due, _, _, _ = tasks._select_due_targets(user, window, now)
+        with patch.object(tasks.streak_state, "schedule_phase", return_value="fallback"):
+            fallback_due, _, _, _ = tasks._select_due_targets(user, window, now)
+        failed_only = tasks._pending_failed_targets(user, now)
+        unsent_only, _skipped = tasks._pending_unsent_targets(user, now)
+
+        send_count = sum(map(len, (regular_due, fallback_due, failed_only, unsent_only)))
+        self.assertEqual(0, send_count)
+
+    def test_only_explicit_server_rejection_releases_unknown_barrier(self):
+        now = tasks.datetime.now(tasks._schedule_timezone())
+        target = "群聊：目标群"
+        user = {"username": "demo", "unique_id": "1001", "targets": [target]}
+        other = {"username": "other", "unique_id": "1002", "targets": [target]}
+        streak_state.mark_sent_unverified(user, target, now=now)
+
+        with patch.object(
+            tasks,
+            "update_user_data",
+            side_effect=lambda mutate, **_kwargs: mutate([user, other])[0],
+        ):
+            tasks._persist_browser_send_failure(
+                user, target, "hello", "unknown", "generic failure",
+                now.isoformat(timespec="seconds"),
+            )
+            self.assertEqual(
+                streak_state.STATE_SENT_UNVERIFIED,
+                streak_state.target_state(user, target, now)["status"],
+            )
+            tasks._persist_browser_send_failure(
+                user, target, "hello", "send_rejected", "server explicitly refused",
+                now.isoformat(timespec="seconds"),
+                override_sent_unverified=True,
+            )
+
+        self.assertEqual(
+            streak_state.STATE_FAILED_TERMINAL,
+            streak_state.target_state(user, target, now)["status"],
+        )
+        self.assertEqual("pending", streak_state.target_state(other, target, now)["status"])
+
+    def test_form_dedupes_group_prefix_aliases_but_keeps_same_named_friend(self):
+        self.assertEqual(
+            ["同名会话", "群聊：同名会话"],
+            web_app._split_target_entries(["同名会话\n群聊：同名会话\n群聊:同名会话"]),
+        )
+
+    def test_pre_enter_group_unknown_barrier_is_not_due_for_retry(self):
+        now = tasks.datetime(2026, 10, 23, 20, 0, tzinfo=tasks._schedule_timezone())
+        user = {"username": "demo", "targets": ["群聊：目标群"]}
+
+        with patch.object(
+            tasks,
+            "update_user_data",
+            side_effect=lambda mutate, **_kwargs: mutate([user])[0],
+        ), patch.object(tasks, "get_userData", return_value=[user]):
+            persisted = tasks._persist_browser_pre_enter_unknown(
+                user, "群聊：目标群", "hello", now.isoformat(timespec="seconds")
+            )
+        with (
+            patch.object(tasks, "_is_manual_run", return_value=False),
+            patch.object(tasks, "_is_fallback_run", return_value=False),
+        ):
+            due, already_sent, pending, failures = tasks._select_due_targets(
+                user,
+                {"enabled": True, "startHour": 9, "endHour": 21, "scheduleIntervalMinutes": 20},
+                now,
+            )
+
+        self.assertEqual([], due)
+        self.assertTrue(persisted)
+        self.assertEqual([], already_sent)
+        self.assertEqual(["群聊：目标群"], [target for target, _ in pending])
+        self.assertEqual([], failures)
+        self.assertEqual(
+            streak_state.STATE_SENT_UNVERIFIED,
+            streak_state.target_state(user, "群聊：目标群", now)["status"],
+        )
+
+    def test_protocol_mode_sends_only_friends_and_browser_gets_groups(self):
+        user = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["好友", "群聊：目标群", "群聊:目标群"],
+        }
+
+        protocol_users, browser_users = tasks._split_sender_modes(
+            {"useProtocolSender": True}, [user]
+        )
+
+        self.assertEqual([["好友"]], [item["targets"] for item in protocol_users])
+        self.assertEqual([["群聊：目标群"]], [item["targets"] for item in browser_users])
+        self.assertIsNot(protocol_users[0], user)
+        self.assertIsNot(browser_users[0], user)
+
+    def test_protocol_identity_builder_fail_closes_group_targets(self):
+        identities = protocol_dispatch._build_protocol_target_identities(
+            {
+                "protocol_targets_cache": [
+                    {"nickname": "群聊：目标群", "secUid": "wrong-peer", "peerUserId": "1001"}
+                ]
+            },
+            {"群聊：目标群": "hello"},
+        )
+
+        self.assertEqual({}, identities)
+
+    def test_web_friend_binding_skips_group_namespace(self):
+        account = {
+            "targets": ["好友", "群聊：目标群"],
+            "friend_uids": {
+                "1001": {"nickname": "好友", "secUid": "sec-friend"},
+                "2002": {"nickname": "群聊：目标群", "secUid": "sec-group"},
+            },
+        }
+
+        result = friend_identity.apply_web_target_selection(account, [])
+
+        self.assertEqual(["好友"], result["bound"])
+        self.assertNotIn("群聊：目标群", result["unbound"])
+        self.assertNotIn("群聊：目标群", account.get("friend_target_bindings", {}))
+
     def test_friend_tab_is_clicked_when_a_group_row_is_visible(self):
         page = Mock()
         page.locator.return_value = Mock()
@@ -144,7 +423,8 @@ class GroupChatTargetTests(unittest.TestCase):
             patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("grid", grid))),
             patch.object(tasks, "_first_non_empty_locator", new=AsyncMock(return_value=("rows", locator))),
             patch.object(tasks, "_extract_friend_record", side_effect=_record),
-            patch.object(tasks, "_selector_visible", new=AsyncMock(return_value="没有更多")),
+            patch.object(tasks, "_stable_single_screen_group_list", new=AsyncMock(return_value=("目标群",))),
+            patch.object(tasks, "_confirm_group_chat_header", new=AsyncMock(return_value=True)),
             patch.object(tasks.asyncio, "sleep", new=AsyncMock()),
         ):
             selected = asyncio.run(
@@ -152,9 +432,6 @@ class GroupChatTargetTests(unittest.TestCase):
             )
 
         self.assertEqual(["群聊：目标群"], selected)
-        page.evaluate.assert_awaited_once_with(
-            "(element) => { element.scrollTop = 0; return element.scrollTop === 0; }", grid
-        )
 
     def test_group_scan_does_not_select_when_grid_reset_fails(self):
         row = _Row("目标群")
@@ -170,7 +447,7 @@ class GroupChatTargetTests(unittest.TestCase):
             patch.object(tasks, "_extract_friend_record", side_effect=_record),
             patch.object(tasks, "_selector_visible", new=AsyncMock(return_value="没有更多")),
         ):
-            with self.assertRaisesRegex(tasks.FriendListIncompleteError, "reset"):
+            with self.assertRaisesRegex(tasks.FriendListIncompleteError, "single-screen"):
                 asyncio.run(
                     _collect(tasks.scroll_and_select_group_targets(page, "demo", ["群聊：目标群"], SCAN_CONFIG))
                 )
@@ -190,7 +467,7 @@ class GroupChatTargetTests(unittest.TestCase):
             patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("grid", object()))),
             patch.object(tasks, "_first_non_empty_locator", new=AsyncMock(return_value=("rows", locator))),
             patch.object(tasks, "_extract_friend_record", side_effect=_record),
-            patch.object(tasks, "_selector_visible", new=AsyncMock(return_value="没有更多")),
+            patch.object(tasks, "_stable_single_screen_group_list", new=AsyncMock(return_value=("目标群", "目标群"))),
         ):
             with self.assertRaisesRegex(tasks.FriendListIncompleteError, "ambiguous"):
                 asyncio.run(
@@ -211,7 +488,7 @@ class GroupChatTargetTests(unittest.TestCase):
             patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("grid", object()))),
             patch.object(tasks, "_first_non_empty_locator", new=AsyncMock(return_value=("rows", locator))),
             patch.object(tasks, "_extract_friend_record", side_effect=_record),
-            patch.object(tasks, "_selector_visible", new=AsyncMock(return_value="没有更多")),
+            patch.object(tasks, "_stable_single_screen_group_list", new=AsyncMock(return_value=())),
         ):
             selected = asyncio.run(
                 _collect(tasks.scroll_and_select_group_targets(page, "demo", ["群聊：目标群"], SCAN_CONFIG))
@@ -318,6 +595,40 @@ class GroupChatTargetTests(unittest.TestCase):
 
         self.assertEqual(["好友"], selected)
 
+    def test_mixed_same_name_targets_keep_separate_daily_ledgers_and_dedupe_group_aliases(self):
+        now = tasks.datetime(2026, 10, 23, 20, 0, tzinfo=tasks._schedule_timezone())
+        user = {
+            "username": "demo",
+            "unique_id": "1001",
+            "targets": ["同名会话", "群聊：同名会话", "群聊:同名会话"],
+            "message_history": {
+                "同名会话": {
+                    "sentAt": "2026-10-23T12:00:00+00:00",
+                    "status": "confirmed",
+                    "confirmationLevel": "strong",
+                    "needsVerification": False,
+                }
+            },
+        }
+        window = {"enabled": True, "startHour": 9, "endHour": 21, "scheduleIntervalMinutes": 20}
+
+        with (
+            patch.object(tasks, "_is_manual_run", return_value=False),
+            patch.object(tasks, "_is_fallback_run", return_value=False),
+        ):
+            due, already_sent, pending, queued_failures = tasks._select_due_targets(user, window, now)
+
+        self.assertEqual(["同名会话"], already_sent)
+        self.assertEqual(
+            ["群聊：同名会话"],
+            due + [target for target, _scheduled_at in pending],
+        )
+        self.assertEqual([], queued_failures)
+        self.assertEqual(
+            ["同名会话", "群聊：同名会话"],
+            tasks._dedupe_group_target_aliases(user["targets"]),
+        )
+
     def test_group_scan_failure_uses_group_ledger_without_friend_not_found_rewrite(self):
         page = Mock(goto=AsyncMock(), close=AsyncMock())
         context = Mock(
@@ -388,7 +699,8 @@ class GroupChatTargetTests(unittest.TestCase):
             patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("grid", object()))),
             patch.object(tasks, "_first_non_empty_locator", new=AsyncMock(return_value=("rows", locator))),
             patch.object(tasks, "_extract_friend_record", side_effect=_record),
-            patch.object(tasks, "_selector_visible", new=AsyncMock(return_value="没有更多")),
+            patch.object(tasks, "_stable_single_screen_group_list", new=AsyncMock(return_value=("目标群",))),
+            patch.object(tasks, "_confirm_group_chat_header", new=AsyncMock(return_value=True)),
         ):
             selected = asyncio.run(
                 _collect(tasks.scroll_and_select_group_targets(page, "demo", ["群聊：目标群", "群聊:目标群"], SCAN_CONFIG))

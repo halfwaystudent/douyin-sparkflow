@@ -1459,6 +1459,84 @@ async def _group_tab_is_active(page, account_name):
     return False
 
 
+_GROUP_HEADER_SELECTOR = '#sub-app div.box-header-bb4JnP'
+
+
+async def _stable_single_screen_group_list(page, scrollable):
+    """Return a stable visible group-list snapshot only when it fits one viewport.
+
+    Group rows do not expose an identity that survives React virtualisation, and
+    the observed UI does not reliably render an end marker.  A scrollable list
+    therefore has no trustworthy completion proof.  The only supported shape is
+    an already-rendered, non-overflowing list whose visible row names remain the
+    same for two animation frames.
+    """
+    snapshot_script = """async (element) => {
+        const visible = (node) => {
+            const style = window.getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+                && rect.width > 0 && rect.height > 0;
+        };
+        await new Promise((resolve) => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)
+        ));
+        const rows = Array.from(document.querySelectorAll(
+            '#sub-app li.semi-list-item'
+        )).filter(visible).map((row) => {
+            const name = row.querySelector('span[class*="item-header-name-"]');
+            return name ? name.textContent.trim() : '';
+        }).filter(Boolean);
+        return {
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+            scrollTop: element.scrollTop,
+            rows,
+        };
+    }"""
+    try:
+        first = await page.evaluate(
+            "(element) => { element.scrollTop = 0; return element.scrollTop === 0; }",
+            scrollable,
+        )
+        if first is not True:
+            return None
+        first = await page.evaluate(snapshot_script, scrollable)
+        second = await page.evaluate(snapshot_script, scrollable)
+    except Exception:
+        return None
+    if not isinstance(first, dict) or first != second:
+        return None
+    try:
+        client_height = int(first.get("clientHeight") or 0)
+        scroll_height = int(first.get("scrollHeight") or 0)
+        scroll_top = int(first.get("scrollTop") or 0)
+        rows = tuple(str(name).strip() for name in first.get("rows") or () if str(name).strip())
+    except (TypeError, ValueError):
+        return None
+    if client_height <= 0 or scroll_top != 0 or scroll_height > client_height:
+        return None
+    return rows
+
+
+async def _confirm_group_chat_header(page, expected_name):
+    """Require the selected chat header to name the exact configured group."""
+    try:
+        await page.wait_for_function(
+            """({ selector, expectedName }) => Array.from(document.querySelectorAll(selector))
+                .some((node) => {
+                    const style = window.getComputedStyle(node);
+                    return style.display !== 'none' && style.visibility !== 'hidden'
+                        && node.textContent.trim() === expectedName;
+                })""",
+            arg={"selector": _GROUP_HEADER_SELECTOR, "expectedName": expected_name},
+            timeout=3000,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def scroll_and_select_group_targets(page, account_name, targets, friend_scan_config=None):
     """Select groups from 群消息 without changing the friend UID/index state."""
     group_targets = {}
@@ -1474,16 +1552,12 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
     target_selectors = (
         '#sub-app li.semi-list-item:visible:has(span[class*="item-header-name-"])',
     )
-    no_more_selectors = (
-        'xpath=//div[contains(@class, "no-more-tip-ftdJnu")]',
-        'xpath=//*[@id="sub-app"]//*[contains(text(), "没有更多") or contains(text(), "暂无")]',
-    )
     scrollable_selectors = ('#sub-app [role="grid"]', '#sub-app .ReactVirtualized__Grid', 'xpath=//*[@id="sub-app"]//ul/div')
     config = friend_scan_config or _normalize_friend_list_scan_config({})
     await _open_groups_tab(page, account_name)
     try:
         active_selector, _ = await _wait_for_friend_list_ready(
-            page, account_name, target_selectors, no_more_selectors, (),
+            page, account_name, target_selectors, (), (),
             timeout_seconds=min(60, config["maxScanSeconds"]), empty_grace_seconds=0,
         )
     except FriendListUnavailableError:
@@ -1494,87 +1568,65 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
         raise FriendListIncompleteError(
             f"group_list_incomplete for {account_name}: could not reset group list to its start"
         )
-    try:
-        reset_confirmed = await page.evaluate(
-            "(element) => { element.scrollTop = 0; return element.scrollTop === 0; }",
-            initial_scrollable,
-        )
-    except Exception as exc:
+    snapshot = await _stable_single_screen_group_list(page, initial_scrollable)
+    if snapshot is None:
         raise FriendListIncompleteError(
-            f"group_list_incomplete for {account_name}: could not reset group list to its start: {exc}"
-        ) from exc
-    if reset_confirmed is not True:
-        raise FriendListIncompleteError(
-            f"group_list_incomplete for {account_name}: group list reset was not confirmed"
+            f"group_list_incomplete for {account_name}: group list is not a stable single-screen list"
         )
-    candidates = {}
-    ambiguous_names = set()
-    deadline = asyncio.get_running_loop().time() + config["maxScanSeconds"]
-    while asyncio.get_running_loop().time() < deadline:
-        await _dismiss_non_login_dialogs(page, account_name, "group_list_scan")
-        _, locator = await _first_non_empty_locator(page, (active_selector,) + target_selectors)
-        if locator:
-            for element in await locator.all():
-                try:
-                    if not await element.is_visible(timeout=800):
-                        continue
-                except Exception:
+    snapshot_keys = [_normalize_target_name(name) for name in snapshot]
+    for name_key, configured in group_targets.items():
+        if snapshot_keys.count(name_key) > 1:
+            raise FriendListIncompleteError(
+                f"group_list_incomplete for {account_name}: ambiguous group name={configured}"
+            )
+
+    # Re-read after the stability proof.  A virtualized row's Locator is not an
+    # identity: React may recycle it into a different conversation between the
+    # snapshot and the click.
+    second_snapshot = await _stable_single_screen_group_list(page, initial_scrollable)
+    if second_snapshot != snapshot:
+        raise FriendListIncompleteError(
+            f"group_list_incomplete for {account_name}: group list changed before selection"
+        )
+    _, locator = await _first_non_empty_locator(page, (active_selector,) + target_selectors)
+    elements = await locator.all() if locator else []
+    for name_key, configured in group_targets.items():
+        matching = []
+        for element in elements:
+            try:
+                if not await element.is_visible(timeout=800):
                     continue
                 record = await _extract_friend_record(element)
-                if not record:
-                    continue
-                name_key = record["normalizedName"]
-                if name_key not in group_targets:
-                    continue
-                previous = candidates.get(name_key)
-                if previous is not None and previous is not element:
-                    ambiguous_names.add(name_key)
-                else:
-                    candidates[name_key] = element
-        if await _selector_visible(page, no_more_selectors):
-            if ambiguous_names:
-                names = sorted(group_targets[name] for name in ambiguous_names)
-                raise FriendListIncompleteError(
-                    f"group_list_incomplete for {account_name}: ambiguous group names={names}"
-                )
-            # Completion must precede selection: group rows lack a stable DOM
-            # identity, so clicking during the scan could send before a later
-            # same-name row makes the target ambiguous.
-            for name_key, configured in group_targets.items():
-                element = candidates.get(name_key)
-                if element is None:
-                    continue
-                try:
-                    if not await element.is_visible(timeout=800):
-                        raise FriendListIncompleteError(
-                            f"group_list_incomplete for {account_name}: target {configured} is no longer visible after scan"
-                        )
-                    record = await _extract_friend_record(element)
-                except FriendListIncompleteError:
-                    raise
-                except Exception as exc:
-                    raise FriendListIncompleteError(
-                        f"group_list_incomplete for {account_name}: could not revalidate {configured}: {exc}"
-                    ) from exc
-                if not record or record.get("normalizedName") != name_key:
-                    raise FriendListIncompleteError(
-                        f"group_list_incomplete for {account_name}: target {configured} changed before selection"
-                    )
-                await element.click()
-                logger.info("Account %s selected target group %s", account_name, configured)
-                yield configured
-            return
-        _, scrollable = await _first_scrollable_friends_element(page, scrollable_selectors)
-        if not scrollable:
+            except Exception:
+                continue
+            if record and record.get("normalizedName") == name_key:
+                matching.append((element, record))
+        if len(matching) != snapshot_keys.count(name_key):
             raise FriendListIncompleteError(
-                f"group_list_incomplete for {account_name}: could not confirm end of group list"
+                f"group_list_incomplete for {account_name}: target {configured} changed before selection"
             )
-        await page.evaluate(f"(element) => element.scrollTop += {config['scrollStepPx']}", scrollable)
-        await asyncio.sleep(config["scrollDelaySeconds"])
-
-    raise FriendListIncompleteError(
-        f"group_list_incomplete for {account_name}: scan timed out after {config['maxScanSeconds']}s"
-    )
+        if not matching:
+            continue
+        element, record = matching[0]
+        name_locator = element.get_by_text(record["visibleName"], exact=True)
+        try:
+            if await name_locator.count() != 1 or not await name_locator.is_visible(timeout=800):
+                raise FriendListIncompleteError(
+                    f"group_list_incomplete for {account_name}: target {configured} name control changed before selection"
+                )
+            await name_locator.click()
+        except FriendListIncompleteError:
+            raise
+        except Exception as exc:
+            raise FriendListIncompleteError(
+                f"group_list_incomplete for {account_name}: could not click target {configured}: {exc}"
+            ) from exc
+        if not await _confirm_group_chat_header(page, record["visibleName"]):
+            raise FriendListIncompleteError(
+                f"group_list_incomplete for {account_name}: chat header did not confirm target {configured}"
+            )
+        logger.info("Account %s selected target group %s", account_name, configured)
+        yield configured
 
 
 async def _reopen_friend_chat_page(page, account_name):
@@ -2422,6 +2474,15 @@ def _target_has_non_retryable_failure_today(user, target_name, now):
     )
 
 
+def _target_has_pre_enter_unknown_barrier_today(user, target_name, now):
+    state = streak_state.target_state(user, target_name, now)
+    return bool(
+        streak_state.is_sent_unverified(user, target_name, now)
+        and str(state.get("lastEvidenceDetail") or "")
+        == "pre_enter_outcome_unknown_barrier"
+    )
+
+
 def _pending_failed_targets(user, now):
     targets = []
     account_failure = _account_failure_entry_today(user, now)
@@ -2452,6 +2513,10 @@ def _pending_failed_targets(user, now):
     for target_name in user.get("targets") or []:
         if _target_sent_today(user, target_name, now):
             continue
+        if _target_has_pre_enter_unknown_barrier_today(user, target_name, now):
+            # Enter may already have dispatched. Only an explicit server
+            # rejection may replace this barrier with a retryable state.
+            continue
         if streak_state.attempt_in_progress(user, target_name, now):
             continue
         if streak_state.fallback_attempted_today(user, target_name, now):
@@ -2475,6 +2540,9 @@ def _pending_unsent_targets(user, now):
     max_attempts = _unsent_retry_max_attempts()
     for target_name in user.get("targets") or []:
         if _target_sent_today(user, target_name, now):
+            continue
+        if _target_has_pre_enter_unknown_barrier_today(user, target_name, now):
+            skipped_targets.append(f"{target_name}(sent_unverified)")
             continue
         if streak_state.attempt_in_progress(user, target_name, now):
             skipped_targets.append(f"{target_name}(in_flight)")
@@ -2524,7 +2592,9 @@ def _window_boundary(now, hour):
 
 
 def _select_due_targets(user, send_window, now):
-    targets = list(user.get("targets") or [])
+    # Scheduler decisions must use the same group namespace/alias rules as the
+    # browser sender, otherwise 群聊：/群聊: aliases can each be scheduled.
+    targets = _dedupe_group_target_aliases(list(user.get("targets") or []))
     if not send_window.get("enabled") or (
         _is_manual_run() and not _is_fallback_run()
     ):
@@ -3011,7 +3081,7 @@ def _log_rejected_state_transition(action, user, target_name, state, now, *, req
     )
 
 
-def _persist_browser_send_failure(user, target_name, message, category, reason, attempted_at, server_receipt=None):
+def _persist_browser_send_failure(user, target_name, message, category, reason, attempted_at, server_receipt=None, override_sent_unverified=False):
     state_now = parse_sent_at(attempted_at, timezone.utc) or datetime.now(timezone.utc)
     rejected = {}
 
@@ -3027,6 +3097,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
             retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
             now=state_now,
             strategy="browser",
+            override_sent_unverified=override_sent_unverified,
         )
         if (
             state.get("status") not in streak_state.FAILED_STATES
@@ -3086,6 +3157,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
         now=state_now,
         strategy="browser",
+        override_sent_unverified=override_sent_unverified,
     )
     if (
         state.get("status") not in streak_state.FAILED_STATES
@@ -3105,6 +3177,88 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         category,
         reason,
     )
+
+
+def _persist_browser_pre_enter_unknown(user, target_name, message, attempted_at):
+    """Durably block a group resend before dispatching Enter.
+
+    This records a *potential* unknown send, not a claimed delivery.  If the
+    process dies after this write but before Enter is dispatched, the group may
+    require manual verification even though it was not sent.  That conservative
+    false positive is intentional: losing this durable barrier could resend a
+    message whose Enter dispatch actually reached the browser or server.
+    """
+    del message
+    state_now = parse_sent_at(attempted_at, timezone.utc) or datetime.now(timezone.utc)
+    expected_sent_at = state_now.isoformat(timespec="seconds")
+    expected_run_id = str(_ACTIVE_RUN_ID or "")
+
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        state = streak_state.mark_sent_unverified(
+            matched,
+            target_name,
+            strategy="browser",
+            run_id=expected_run_id,
+            now=state_now,
+            detail="pre_enter_outcome_unknown_barrier",
+        )
+        return dict(state), True
+
+    try:
+        update_user_data(mutate, force_reload=True)
+        # update_user_data returns a deepcopy of the mutator result, not an
+        # independent durable readback. It may therefore describe a write that
+        # was later overwritten before Enter can be dispatched.
+        persisted_accounts = get_userData(force_reload=True)
+        persisted_user = _find_matching_account(persisted_accounts, user)
+        persisted_ref = (
+            streak_state.resolve_target_ref(persisted_user, target_name)
+            if persisted_user is not None
+            else ""
+        )
+        persisted_states = (
+            persisted_user.get("target_states") if persisted_user is not None else None
+        )
+        persisted_state = (
+            dict(persisted_states.get(persisted_ref) or {})
+            if isinstance(persisted_states, dict) and persisted_ref
+            else {}
+        )
+    except Exception:
+        logger.exception(
+            "Could not persist/read pre-Enter unknown barrier for user=%s target=%s",
+            user.get("username", "unknown"),
+            target_name,
+        )
+        return False
+    if (
+        persisted_state.get("status") != streak_state.STATE_SENT_UNVERIFIED
+        or str(persisted_state.get("lastEvidenceDetail") or "")
+        != "pre_enter_outcome_unknown_barrier"
+        or str(persisted_state.get("sentAt") or "") != expected_sent_at
+        or str(persisted_state.get("targetRef") or "") != persisted_ref
+        or (
+            expected_run_id
+            and str(persisted_state.get("runId") or "") != expected_run_id
+        )
+    ):
+        logger.warning(
+            "Pre-Enter unknown barrier readback did not match for user=%s target=%s",
+            user.get("username", "unknown"),
+            target_name,
+        )
+        return False
+    streak_state.mark_sent_unverified(
+        user,
+        target_name,
+        strategy="browser",
+        now=state_now,
+        detail="pre_enter_outcome_unknown_barrier",
+    )
+    return True
 
 
 def _persist_browser_send_success(
@@ -3310,16 +3464,21 @@ def _split_sender_modes(active_config, runnable_user_data):
         for item in (active_config.get("browserSenderAccounts") or [])
         if str(item).strip()
     }
-    if not browser_sender_accounts:
-        return runnable_user_data, []
-
     protocol_users = []
     browser_users = []
     for user in runnable_user_data:
-        if _account_match_tokens(user) & browser_sender_accounts:
-            browser_users.append(user)
-        else:
-            protocol_users.append(user)
+        targets = _dedupe_group_target_aliases(list(user.get("targets") or []))
+        group_targets = [target for target in targets if parse_chat_target(target)[0] == "group"]
+        friend_targets = [target for target in targets if parse_chat_target(target)[0] == "friend"]
+        # Group chats have no peer identity contract for the protocol sender.
+        # Split mixed accounts so a group can never fall through to protocol.
+        if group_targets:
+            browser_users.append(dict(user, targets=group_targets))
+        if friend_targets:
+            if _account_match_tokens(user) & browser_sender_accounts:
+                browser_users.append(dict(user, targets=friend_targets))
+            else:
+                protocol_users.append(dict(user, targets=friend_targets))
     return protocol_users, browser_users
 
 
@@ -3973,6 +4132,22 @@ async def _do_user_task_locked(
                     # sitting in the input: anything on the page now predates
                     # this send and must not veto the confirmation below.
                     pre_send_indicator = await _detect_send_failure_indicator(page)
+                    if parse_chat_target(target_name)[0] == "group":
+                        if not _persist_browser_pre_enter_unknown(
+                            user,
+                            target_name,
+                            message,
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        ):
+                            # No Enter was dispatched, so do not turn a storage
+                            # outage into a retryable post-send outcome. Stop this
+                            # account until its durable ledger is available.
+                            logger.error(
+                                "Aborting account %s before Enter: group resend barrier could not be persisted for %s",
+                                account_name,
+                                target_name,
+                            )
+                            return
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
                     await chat_input.press("Enter")
 
@@ -4116,6 +4291,7 @@ async def _do_user_task_locked(
                         reason,
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         server_receipt=send_receipt,
+                        override_sent_unverified=isinstance(exc, BrowserSendRejected),
                     )
                     interval = _random_delay_seconds(
                         send_strategy,
