@@ -92,6 +92,7 @@ from webui.users import (
     remove_account_refs_from_users,
     update_web_user,
 )
+from webui.login_guard import LoginThrottle, password_problem
 from webui.login_lock import (
     begin_expiration as begin_login_expiration,
     begin_force_reset as begin_login_force_reset,
@@ -192,153 +193,18 @@ def extract_group_targets_from_form(form):
     return _dedupe_targets(normalized)
 
 
-def find_account(accounts, unique_id):
-    normalized = normalize_unique_id(unique_id)
-    for account in accounts:
-        if normalize_unique_id(account.get("unique_id")) == normalized:
-            return account
-    return None
-
-
-def is_account_enabled(account):
-    return bool(account.get("enabled", True))
-
-
-def coerce_int(value, default, minimum=0):
-    try:
-        return max(minimum, int(str(value).strip()))
-    except (TypeError, ValueError):
-        return max(minimum, int(default))
-
-
-def _schedule_timezone():
-    return timezone(timedelta(hours=8), name="Asia/Shanghai")
-
-
-def _parse_sent_at(raw_value):
-    return parse_sent_at(raw_value, _schedule_timezone())
-
-
-def _history_entry_strong_confirmed_today(entry):
-    return history_entry_is_strong_confirmed_today(
-        entry,
-        datetime.now(_schedule_timezone()),
-    )
-
-
-def _target_sent_today(account, target_name):
-    if streak_state.is_send_confirmed(account, target_name):
-        return True
-    entry = streak_state.history_entry(
-        account,
-        target_name,
-        _schedule_timezone(),
-    )
-    return _history_entry_strong_confirmed_today(entry)
-
-
-def _target_unconfirmed_today(account, target_name):
-    now = datetime.now(_schedule_timezone())
-    entry = streak_state.history_entry(account, target_name, now.tzinfo)
-    sent_at = _parse_sent_at(entry.get("sentAt"))
-    if (
-        sent_at
-        and sent_at.date() == now.date()
-        and not _history_entry_strong_confirmed_today(entry)
-        and not streak_state.is_send_confirmed(account, target_name, now)
-    ):
-        return True
-    failure_entry = streak_state.failure_entry(account, target_name, now.tzinfo)
-    last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"))
-    return bool(
-        last_attempt_at
-        and last_attempt_at.date() == now.date()
-        and str(failure_entry.get("category") or "") == "send_unconfirmed"
-    )
-
-
-def mark_target_unconfirmed(
-    account,
-    target_name,
-    *,
-    reason="manual_reset_possible_false_positive",
-    force=False,
-    now=None,
-):
-    now_dt = (now or datetime.now(_schedule_timezone())).replace(
-        microsecond=0,
-    )
-    now = now_dt.astimezone(timezone.utc).isoformat(timespec="seconds")
-    history = dict(account.get("message_history") or {})
-    existing = streak_state.history_entry(account, target_name, now_dt.tzinfo)
-    sent_at = _parse_sent_at(existing.get("sentAt"))
-    today = now_dt.date()
-    if existing and sent_at and sent_at.date() != today and not force:
-        return False
-
-    previous_status = existing.get("status") or ("legacy_sentAt_only" if existing else "missing_history")
-    message = str(existing.get("message") or "")
-    history_entry = {
-        **existing,
-        "message": message,
-        "sentAt": existing.get("sentAt") or now,
-        "status": "unconfirmed",
-        "confirmationLevel": existing.get("confirmationLevel") or "legacy",
-        "confirmationSource": existing.get("confirmationSource") or "manual_reset",
-        "confirmationDetail": existing.get("confirmationDetail") or "已手动标记为待核验/待补发。",
-        "needsVerification": True,
-        "resetAt": now,
-        "resetReason": reason,
-        "previousStatus": previous_status,
-    }
-
-    queue = dict(account.get("failure_queue") or {})
-    existing_failure = streak_state.failure_entry(
-        account,
-        target_name,
-        now_dt.tzinfo,
-    )
-    queue_entry = {
-        "category": "send_unconfirmed",
-        "reason": reason,
-        "message": message,
-        "firstAttemptAt": existing_failure.get("firstAttemptAt") or now,
-        "lastAttemptAt": now,
-        "attemptCount": int(existing_failure.get("attemptCount") or 0) + 1,
-        "lastRunMode": "manual_reset",
-        "confirmationLevel": history_entry.get("confirmationLevel"),
-        "confirmationSource": history_entry.get("confirmationSource"),
-    }
-    state = streak_state.mark_unconfirmed(
-        account,
-        target_name,
-        reason=reason,
-        now=now_dt,
-        detail=history_entry.get("confirmationDetail") or "",
-    )
-    if (
-        str(state.get("status") or "")
-        != streak_state.STATE_FAILED_RETRYABLE
-        or str(state.get("lastErrorCategory") or "") != "send_unconfirmed"
-        or streak_state._parse_time(state.get("resetAt")) != now_dt
-    ):
-        return False
-    history[target_name] = history_entry
-    queue[target_name] = queue_entry
-    account["message_history"] = history
-    account["failure_queue"] = queue
-    return True
-
-
-def manual_retry_config(config):
-    """Config for a single-target manual retry: one task, no anti-burst delay."""
-    retry_config = dict(config)
-    retry_config["taskCount"] = 1
-    strategy = dict(retry_config.get("sendStrategy") or {})
-    strategy["accountStartDelaySecondsMin"] = 0
-    strategy["accountStartDelaySecondsMax"] = 0
-    retry_config["sendStrategy"] = strategy
-    return retry_config
+from webui.app_helpers import (
+    _history_entry_strong_confirmed_today,
+    _parse_sent_at,
+    _schedule_timezone,
+    _target_sent_today,
+    _target_unconfirmed_today,
+    coerce_int,
+    find_account,
+    is_account_enabled,
+    manual_retry_config,
+    mark_target_unconfirmed,
+)  # noqa: F401
 
 
 def manual_retry_channel(config):
@@ -1410,6 +1276,9 @@ def create_app():
         "on",
     }
     app = FastAPI(title="DouYin Spark Flow Admin", lifespan=lifespan)
+    # Per app instance so each test client starts clean; production runs one.
+    login_throttle = LoginThrottle()
+    app.state.login_throttle = login_throttle
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings["session_secret"],
@@ -1606,6 +1475,10 @@ def create_app():
         if not password or password != confirm:
             flash(request, "Password setup failed. Please enter matching passwords.", "error")
             return redirect("/login")
+        problem = password_problem(password, username)
+        if problem:
+            flash(request, problem, "error")
+            return redirect("/login")
 
         bootstrap_admin_password(password, username=username)
         flash(request, "Admin credentials created. Please log in.", "success")
@@ -1622,10 +1495,20 @@ def create_app():
         password = str(form.get("password", ""))
         from webui.users import authenticate
 
+        client_ip = request.client.host if request.client else ""
+        wait = login_throttle.retry_after(client_ip, username)
+        if wait:
+            minutes = max(1, (wait + 59) // 60)
+            logger.warning("Web login locked for ip=%s user=%s retry_after=%ss", client_ip, username[:40], wait)
+            flash(request, f"登录失败次数过多，请 {minutes} 分钟后再试。", "error")
+            return redirect("/login")
         identity = authenticate(username, password)
         if not identity:
+            login_throttle.record_failure(client_ip, username)
+            logger.warning("Web login failed for ip=%s user=%s", client_ip, username[:40])
             flash(request, "Invalid username or password.", "error")
             return redirect("/login")
+        login_throttle.record_success(client_ip, username)
 
         issue_session(
             request,
@@ -1672,6 +1555,10 @@ def create_app():
         if not password or password != confirm:
             flash(request, "两次密码输入不一致。", "error")
             return redirect("/settings#password")
+        problem = password_problem(password, current["username"])
+        if problem:
+            flash(request, problem, "error")
+            return redirect("/settings#password")
         try:
             update_web_user(current["username"], password=password)
             flash(request, "密码已修改，请重新登录。", "success")
@@ -1690,6 +1577,10 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         refs = [value for value in form.getlist("account_refs")] if hasattr(form, "getlist") else []
+        problem = password_problem(str(form.get("password", "")), str(form.get("username", "")))
+        if problem:
+            flash(request, problem, "error")
+            return redirect("/settings#users")
         try:
             create_web_user(
                 str(form.get("username", "")),
@@ -1711,6 +1602,12 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         refs = [value for value in form.getlist("account_refs")] if hasattr(form, "getlist") else []
+        new_password = str(form.get("password", ""))
+        if new_password:
+            problem = password_problem(new_password, str(form.get("new_username", "")).strip() or username)
+            if problem:
+                flash(request, problem, "error")
+                return redirect("/settings#users")
         try:
             update_web_user(
                 username,
@@ -1759,6 +1656,56 @@ def create_app():
             context["web_users"] = get_web_users()
             context["all_accounts"] = get_userData(force_reload=True)
         return context
+
+    def filter_send_console(ops, query_params):
+        """Return a display-only narrowed copy of the send-detail snapshot."""
+        allowed_statuses = {"all", "confirmed", "pending", "attention"}
+        status = str(query_params.get("status", "all")).strip()
+        if status not in allowed_statuses:
+            status = "all"
+        query = str(query_params.get("q", "")).strip()[:120]
+        account = str(query_params.get("account", "")).strip()
+
+        filtered_ops = dict(ops)
+        console = dict(ops.get("send_console") or {})
+        source_accounts = list(console.get("accounts") or [])
+        account_ids = {str(item.get("unique_id") or "") for item in source_accounts}
+        if account not in account_ids:
+            account = ""
+        if account:
+            source_accounts = [item for item in source_accounts if str(item.get("unique_id") or "") == account]
+
+        status_fields = {
+            "confirmed": {"confirmed_targets"},
+            "pending": {"unconfirmed_targets"},
+            "attention": {"failed_targets", "account_blocked_targets"},
+        }
+        visible_fields = status_fields.get(status)
+        filtered_accounts = []
+        for source in source_accounts:
+            row = dict(source)
+            for field in (
+                "confirmed_targets", "page_echo_targets", "receipt_only_targets", "unconfirmed_targets",
+                "failed_targets", "account_blocked_targets", "pending_targets", "unprocessed_targets",
+            ):
+                items = list(source.get(field) or [])
+                if visible_fields is not None and field not in visible_fields:
+                    items = []
+                if query:
+                    needle = query.casefold()
+                    items = [item for item in items if needle in str(item.get("target") or "").casefold()]
+                row[field] = items
+            row["page_echo_count"] = len(row["page_echo_targets"])
+            row["receipt_only_count"] = len(row["receipt_only_targets"])
+            filtered_accounts.append(row)
+        console["accounts"] = filtered_accounts
+        filtered_ops["send_console"] = console
+        return filtered_ops, {
+            "status": status,
+            "account": account,
+            "query": query,
+            "accounts": list((ops.get("send_console") or {}).get("accounts") or []),
+        }
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request):
@@ -1815,12 +1762,14 @@ def create_app():
         if maybe_redirect:
             return maybe_redirect
 
+        ops, send_filters = filter_send_console(scoped_ops_snapshot(request), request.query_params)
         return render_template(
             request,
             "send_console.html",
             {
                 "flash": pop_flash(request),
-                "ops": scoped_ops_snapshot(request),
+                "ops": ops,
+                "send_filters": send_filters,
             },
         )
 
@@ -3038,6 +2987,10 @@ def create_app():
         if new_password:
             if new_password != confirm_password:
                 flash(request, "Admin password was not updated because the confirmation did not match.", "error")
+                return redirect("/settings#system")
+            problem = password_problem(new_password, settings.get("admin_username", "admin"))
+            if problem:
+                flash(request, f"管理员密码未修改：{problem}", "error")
                 return redirect("/settings#system")
             update_admin_password(new_password)
 

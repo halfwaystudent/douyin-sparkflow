@@ -1,1 +1,7 @@
+# Normalise text files to LF in the repository so a checkout or upload from
+# Windows cannot introduce CRLF and break byte-for-byte deploy checks.
+* text=auto eol=lf
 *.sh text eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

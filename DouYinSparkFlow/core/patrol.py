@@ -846,6 +846,8 @@ def patrol_view(account):
     for row in record.get("targets") or []:
         status = str(row.get("status") or "")
         label = TARGET_STATUS_LABELS.get(status, status or "未知")
+        if status == friend_identity.STATUS_UNBOUND and row.get("kind") == "group":
+            label = "群名重复"
         if status == friend_identity.STATUS_RENAMED:
             text = f"{row.get('oldName') or ''} → {row.get('newName') or row.get('target') or ''}（已自动跟随）"
         elif row.get("currentName"):

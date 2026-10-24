@@ -124,6 +124,25 @@
       </div>
     </div>
 
+    <form class="detail-filters" method="get" action="/ops/send-console" aria-label="筛选发送明细">
+      <label class="field"><span>状态</span>
+        <select name="status">
+          <option value="all" {% if send_filters.status == 'all' %}selected{% endif %}>全部</option>
+          <option value="confirmed" {% if send_filters.status == 'confirmed' %}selected{% endif %}>已确认</option>
+          <option value="pending" {% if send_filters.status == 'pending' %}selected{% endif %}>待核验</option>
+          <option value="attention" {% if send_filters.status == 'attention' %}selected{% endif %}>失败或被拒</option>
+        </select>
+      </label>
+      <label class="field"><span>账号</span>
+        <select name="account">
+          <option value="">全部账号</option>
+          {% for filter_account in send_filters.accounts %}<option value="{{ filter_account.unique_id }}" {% if send_filters.account == filter_account.unique_id|string %}selected{% endif %}>{{ filter_account.username }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field"><span>目标名称</span><input type="search" name="q" value="{{ send_filters.query }}" placeholder="搜索好友或群聊"></label>
+      <button class="button button-quiet button-sm" type="submit"><i data-lucide="filter"></i><span>筛选</span></button>
+    </form>
+
     <div>
       {% for account in send_console.accounts %}
       {% set exception_count = account.unconfirmed_targets|length + account.failed_targets|length + account.account_blocked_targets|length %}
