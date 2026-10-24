@@ -1,4 +1,4 @@
-﻿certifi==2025.11.12
+certifi==2025.11.12
 charset-normalizer==3.4.4
 colorama==0.4.6
 fastapi==0.141.1
@@ -23,4 +23,4 @@ urllib3==2.7.0
 uvicorn==0.52.4
 websockets==15.0.1
 starlette==1.6.0
-tzdata==2025.2
+tzdata==2026.5

@@ -5,4 +5,4 @@ Jinja2==3.1.6
 python-multipart==0.0.32
 uvicorn==0.52.4
 starlette==1.6.0
-tzdata==2025.2
+tzdata==2026.5
