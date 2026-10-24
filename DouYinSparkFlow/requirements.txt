@@ -1,4 +1,4 @@
-﻿certifi==2025.11.12
+certifi==2026.10.19
 charset-normalizer==3.4.4
 colorama==0.4.6
 fastapi==0.141.1
