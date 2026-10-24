@@ -1,8 +1,8 @@
-fastapi==0.141.1
-filelock==3.32.6
+fastapi==0.158.1
+filelock==4.2.4
 itsdangerous==2.2.0
 Jinja2==3.1.6
 python-multipart==0.0.32
-uvicorn==0.52.4
-starlette==1.6.0
-tzdata==2025.2
+uvicorn==0.54.0
+starlette==1.9.0
+tzdata==2026.5
