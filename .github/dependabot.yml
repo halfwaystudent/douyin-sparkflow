@@ -17,3 +17,13 @@ updates:
       # The Playwright Python package must match the Playwright Docker base
       # image tag (PLAYWRIGHT_BASE_IMAGE); bump both together by hand.
       - dependency-name: playwright
+      # pyee is pinned by playwright (pyee<14 for playwright 1.56); it moves
+      # together with playwright, by hand.
+      - dependency-name: pyee
+      # The server image runs Python 3.10; these releases need Python 3.11+.
+      - dependency-name: filelock
+        versions: [">=4.2"]
+      - dependency-name: starlette
+        versions: [">=1.8"]
+      - dependency-name: websockets
+        versions: [">=17"]
