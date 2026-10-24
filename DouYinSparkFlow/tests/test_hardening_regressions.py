@@ -1255,32 +1255,48 @@ class DependencyHardeningTests(unittest.TestCase):
         self.assertIn("./state/login-api:/run/login-api", compose)
 
     def test_requirements_pin_vulnerability_fix_versions(self):
+        # Each package must stay pinned at or above the release that fixed a
+        # known vulnerability; newer pins (e.g. from Dependabot) are fine.
         root = Path(__file__).resolve().parents[1]
-        main_requirements = (root / "requirements.txt").read_text(encoding="utf-8")
-        web_requirements = (root / "requirements-web.txt").read_text(encoding="utf-8")
 
-        for requirement in (
-            "fastapi==0.141.1",
-            "filelock==3.32.6",
-            "idna==3.19",
-            "Pygments==2.21.0",
-            "python-multipart==0.0.32",
-            "requests==2.34.2",
-            "starlette==1.6.0",
-            "urllib3==2.7.0",
-            "uvicorn==0.52.4",
-        ):
-            self.assertIn(requirement, main_requirements)
+        def pins(name):
+            result = {}
+            for line in (root / name).read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "==" in line:
+                    package, version = line.split("==", 1)
+                    result[package.strip().lower()] = version.strip()
+            return result
 
-        for requirement in (
-            "fastapi==0.141.1",
-            "filelock==3.32.6",
-            "python-multipart==0.0.32",
-            "starlette==1.6.0",
-            "uvicorn==0.52.4",
-        ):
-            self.assertIn(requirement, web_requirements)
+        def as_tuple(version):
+            return tuple(int(part) for part in version.split("."))
 
+        minimums = {
+            "requirements.txt": {
+                "fastapi": "0.141.1",
+                "filelock": "3.32.6",
+                "idna": "3.19",
+                "pygments": "2.21.0",
+                "python-multipart": "0.0.32",
+                "requests": "2.34.2",
+                "starlette": "1.6.0",
+                "urllib3": "2.7.0",
+                "uvicorn": "0.52.4",
+            },
+            "requirements-web.txt": {
+                "fastapi": "0.141.1",
+                "filelock": "3.32.6",
+                "python-multipart": "0.0.32",
+                "starlette": "1.6.0",
+                "uvicorn": "0.52.4",
+            },
+        }
+        for name, floors in minimums.items():
+            pinned = pins(name)
+            for package, floor in floors.items():
+                with self.subTest(file=name, package=package):
+                    self.assertIn(package, pinned)
+                    self.assertGreaterEqual(as_tuple(pinned[package]), as_tuple(floor))
 
 if __name__ == "__main__":
     unittest.main()
