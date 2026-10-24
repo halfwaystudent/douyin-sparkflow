@@ -1,5 +1,5 @@
 fastapi==0.158.1
-filelock==4.1.0
+filelock==4.1.2
 itsdangerous==2.2.0
 Jinja2==3.1.6
 python-multipart==0.0.32
