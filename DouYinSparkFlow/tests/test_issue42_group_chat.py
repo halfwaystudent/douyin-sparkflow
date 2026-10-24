@@ -229,6 +229,9 @@ class GroupChatTargetTests(unittest.TestCase):
             path = Path(temp_dir) / "usersData.json"
             path.write_text(json.dumps([user], ensure_ascii=False), encoding="utf-8")
             with (
+                # On GitHub Actions accounts come from $USER_DATA; this test
+                # needs the file-backed store it writes to.
+                patch.object(config, "get_environment", return_value=config.Environment.LOCAL),
                 patch.object(config, "users_data_path", return_value=path),
                 patch.object(config, "userData", None),
             ):
