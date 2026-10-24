@@ -2,7 +2,7 @@ certifi==2026.10.19
 charset-normalizer==3.5.2
 colorama==0.4.6
 fastapi==0.158.1
-filelock==4.2.4
+filelock==4.1.0
 greenlet==3.5.6
 httpx==0.28.1
 idna==3.20
@@ -21,6 +21,6 @@ rich==15.0.0
 typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.54.0
-websockets==17.3
-starlette==1.9.0
+websockets==16.1.1
+starlette==1.7.0
 tzdata==2026.5
