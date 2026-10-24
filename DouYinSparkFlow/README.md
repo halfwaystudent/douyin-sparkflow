@@ -19,6 +19,8 @@
 | `browser.py` | 浏览器控制和页面操作 | 6.9 KB |
 | `cookies.py` | Cookie 解析、校验与登录态判定 | 6.5 KB |
 | `friends.py` | 好友列表管理和刷新逻辑 | 29.0 KB |
+| `groups.py` | 群消息列表的只读刷新与会话编号采集 | 7.5 KB |
+| `im_receipt.py` | 严格解析协议发送回执，仅接受无歧义的成功 | 10.4 KB |
 | `login.py` | 登录流程控制 | 7.3 KB |
 | `msg_builder.py` | 消息内容构建（一言、祝福等） | 4.5 KB |
 | `protocol_dispatch.py` | 协议分发和路由 | 25.5 KB |
@@ -26,6 +28,7 @@
 | `send_state.py` | 统一判定强确认、待核验和当日发送状态 | 1.9 KB |
 | `streak_state.py` | 目标状态机、在途租约与失败分类 | 59.1 KB |
 | `tasks.py` | **任务调度核心**（定时任务、状态管理） | 144.3 KB |
+| `patrol.py` | 发送前的账号、好友和群聊目标只读巡查 | 约 35 KB |
 | `unicode_casefold.mjs` | 生成的大小写折叠表（供 `protocol_sender.mjs` 匹配昵称） | 约 0.96 MB |
 
 > 表中大小会随开发变化，仅作规模参考。
@@ -40,6 +43,7 @@
 |------|------|
 | `app.py` | FastAPI 主应用，路由定义 |
 | `auth.py` | 用户认证和会话管理 |
+| `login_guard.py` | 登录失败限流与新密码规则 |
 | `ops.py` | 操作接口（启动/停止任务、刷新好友等） |
 
 #### 前端资源
@@ -138,6 +142,17 @@ docker run -d \
   -p 8787:8787 \
   -v $(pwd):/app \
   douyin-sparkflow:local
+```
+
+---
+
+## 🧪 运行测试
+
+在源码目录中运行 Python 单元测试；`USER_DATA='[]'` 可避免读取本机账号数据。协议发送器的 Node 测试需单独执行：
+
+```bash
+cd DouYinSparkFlow && USER_DATA='[]' python -m unittest discover -s tests
+node --test tests/test_protocol_sender_helpers.mjs
 ```
 
 ---

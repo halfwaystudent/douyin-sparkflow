@@ -159,7 +159,7 @@
         <fieldset>
           <legend>修改管理员密码（留空表示不修改）</legend>
           <div class="form-grid">
-            <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password"></label>
+            <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种"></label>
             <label class="field"><span>确认新密码</span><input type="password" name="confirm_password" autocomplete="new-password"></label>
           </div>
         </fieldset>
@@ -261,7 +261,7 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="form-grid">
               <label class="field"><span>用户名</span><input type="text" name="username" pattern="[A-Za-z0-9_.-]+" required><small>字母、数字、下划线、点或短横线</small></label>
-              <label class="field"><span>初始密码</span><input type="password" name="password" autocomplete="new-password" required></label>
+              <label class="field"><span>初始密码</span><input type="password" name="password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种" required></label>
             </div>
             <label class="check"><input type="checkbox" name="enabled" checked><span>允许登录</span></label>
             <fieldset>
@@ -295,7 +295,7 @@
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <div class="form-grid">
                 <label class="field"><span>用户名</span><input type="text" name="new_username" value="{{ web_user.username }}" pattern="[A-Za-z0-9_.-]+" required></label>
-                <label class="field"><span>重置密码（留空不修改）</span><input type="password" name="password" autocomplete="new-password"></label>
+                <label class="field"><span>重置密码（留空不修改）</span><input type="password" name="password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种"></label>
               </div>
               <label class="check"><input type="checkbox" name="enabled" {% if web_user.enabled %}checked{% endif %}><span>允许登录</span></label>
               <fieldset>
@@ -331,7 +331,7 @@
   </div>
   <form method="post" action="/account/password" class="form-stack">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" required></label>
+    <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种" required></label>
     <label class="field"><span>确认新密码</span><input type="password" name="confirm_password" autocomplete="new-password" required></label>
     <div class="form-actions"><button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存密码</span></button></div>
   </form>

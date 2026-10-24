@@ -1118,7 +1118,9 @@ def _receipt_is_strong(receipt):
         bool(receipt.get("ok"))
         and 200 <= http_status < 300
         and call == "message_send"
-        and receipt.get("jsonOk") is True
+        # JSON receipt with zero codes, or the binary protobuf receipt the
+        # creator page gets today (core/im_receipt.py) read as accepted.
+        and (receipt.get("jsonOk") is True or receipt.get("protoOk") is True)
     )
 
 

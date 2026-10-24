@@ -19,6 +19,12 @@ jobs:
   python-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is what the Playwright Docker image (jammy) ships and what the
+        # server runs; 3.11 catches anything newer-only.
+        python-version: ["3.10", "3.11"]
     defaults:
       run:
         working-directory: DouYinSparkFlow
@@ -31,7 +37,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

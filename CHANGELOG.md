@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-24
+
+- Added group-chat targets bound to conversation IDs (PR #45): the picker shows `name（full id）`; duplicate names, incomplete scans, missing bindings, or a changed target fail closed instead of sending. Group-list refresh is read-only and patrol now checks group targets by their bound IDs.
+- Added favicon support and a redirect from the legacy send-console anchor.
+- Added strict protobuf `message_send` receipt parsing. A send is confirmed only for an unambiguous exact success; repeated decision fields, unknown fields, non-zero integer check codes at any JSON depth, malformed or oversized checks, and every other uncertain response stay unverified and are never automatically resent.
+- Added Web-console login protection: five failures per IP-and-username in 15 minutes lock that pair for 15 minutes; after ten failures for one username across IPs, attempts slow to one per 30 seconds. Tracking is bounded, with no IP-wide lock. New passwords require at least 10 characters, two character classes, and no username; existing passwords remain valid.
+- Added `deploy/release-files.sh` for drift-checked, backed-up, hash-verified releases with automatic rollback and a recorded release version.
+- Normalized tracked text files to LF with `.gitattributes`, added Python 3.10 and 3.11 CI coverage, Dependabot configuration, and load-independent cross-process lock tests.
+
 ## 2026-10-13
 
 - Added run-result push notifications (Telegram, DingTalk with signing, WeCom, generic JSON webhook): immediate failure notices merged per run and deduplicated per account/target/category per day, plus a once-per-day summary. Configured by admins in the settings page; secrets are shown masked and never logged.

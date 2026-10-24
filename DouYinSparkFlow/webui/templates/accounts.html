@@ -22,7 +22,15 @@
 
 <div>
   {% set duplicates = duplicate_display_names(accounts) %}
-  {% for account in accounts %}
+  {% set enabled_accounts = accounts|rejectattr('enabled', 'equalto', false)|list %}
+  {% set disabled_accounts = accounts|selectattr('enabled', 'equalto', false)|list %}
+  {% if accounts %}
+  {% for account in enabled_accounts + disabled_accounts %}
+  {% if loop.index0 == enabled_accounts|length and disabled_accounts %}
+  <details class="disabled-accounts fold">
+    <summary>已停用账号（{{ disabled_accounts|length }}）<i class="fold-chevron" data-lucide="chevron-down"></i></summary>
+    <div class="disabled-accounts-list">
+  {% endif %}
   {% set duplicate_count = duplicates.get(account.username, 0) %}
   {% set enabled = account.enabled|default(true) %}
   <details class="fold" id="account-{{ account.unique_id }}">
@@ -47,7 +55,7 @@
         {% set ident = identity_view(account) %}
         <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
         {% set patrol = patrol_view(account) %}
-        {% if patrol.has and patrol.conclusion != 'ok' %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">巡查：{{ patrol.conclusionLabel }}</span>{% endif %}
+        {% if patrol.has %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">{% if patrol.conclusion == 'ok' %}巡查正常{% else %}巡查：{{ patrol.conclusionLabel }}{% endif %}</span>{% endif %}
         <span class="pill {% if enabled %}success{% else %}warning{% endif %}">{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>
@@ -206,10 +214,15 @@
       </div>
     </div>
   </details>
+  {% if loop.last and disabled_accounts %}
+    </div>
+  </details>
+  {% endif %}
+  {% endfor %}
   {% else %}
   <div class="empty-state">
     还没有账号。<a href="/login-workspace">去登录页扫码添加</a>第一个抖音账号。
   </div>
-  {% endfor %}
+  {% endif %}
 </div>
 {% endblock %}

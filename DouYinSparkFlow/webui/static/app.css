@@ -366,6 +366,8 @@ dialog .button-danger, .button-danger.solid { background: var(--bad); color: #ff
 .fold-chevron { color: var(--ink-3); transition: transform .2s; }
 .fold[open] > summary .fold-chevron { transform: rotate(180deg); }
 .fold-body { padding: 4px 20px 20px; display: grid; gap: 16px; border-top: 1px solid var(--line); padding-top: 18px; }
+.disabled-accounts { margin-top: 12px; }
+.disabled-accounts-list { display: grid; gap: 12px; padding: 0 12px 12px; }
 .summary-metrics { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .fold.state-attention > summary .account-avatar,
 .fold.state-paused > summary .account-avatar { background: var(--bad-soft); color: var(--bad); }
@@ -414,6 +416,7 @@ input::placeholder, textarea::placeholder { color: var(--ink-3); }
 .check { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; color: var(--ink); min-height: 32px; }
 .check input { width: 18px; height: 18px; accent-color: var(--flame); flex: none; margin: 0; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.detail-filters { display: grid; grid-template-columns: minmax(140px, .7fr) minmax(160px, 1fr) minmax(180px, 1.3fr) auto; gap: 10px; align-items: end; margin: 0 0 14px; padding: 14px; border-radius: var(--radius-sm); background: var(--surface-sunk); }
 .form-stack { display: grid; gap: 16px; }
 .form-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 fieldset { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 16px; margin: 0; display: grid; gap: 4px; }
@@ -599,7 +602,8 @@ fieldset > legend { padding: 0 6px; }
   .account-row .row-stats { justify-content: flex-start; order: 2; }
   .account-row .progress-line { order: 3; }
   .account-row .row-chevron { display: none; }
-  .grid-2, .form-grid { grid-template-columns: 1fr; }
+  .grid-2, .form-grid, .detail-filters { grid-template-columns: 1fr; }
+  .detail-filters .button { width: 100%; }
   .card { padding: 18px; }
   .fold > summary { padding: 14px 16px; flex-wrap: wrap; }
   .fold > summary .summary-metrics { order: 3; width: 100%; justify-content: flex-start; padding-left: 50px; }

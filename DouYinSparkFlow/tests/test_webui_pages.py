@@ -178,6 +178,78 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertNotIn("login-desktop-controls", page)
         self.assertNotIn("login-desktop-controls", self._get("/").text)
 
+    def test_accounts_page_shows_a_normal_patrol_pill_and_every_group_row(self):
+        self._as(ADMIN)
+        original = ACCOUNTS[0].get("patrol")
+        ACCOUNTS[0]["patrol"] = {
+            "checkedAt": "2026-10-24T09:30:00+00:00",
+            "trigger": "scheduled",
+            "completed": True,
+            "conclusion": "ok",
+            "login": {"ok": True},
+            "targets": [
+                {"target": "群聊：已找到", "status": "found"},
+                {"target": "群聊：改名", "status": "renamed", "oldName": "群聊：改名", "newName": "新群名"},
+                {"target": "群聊：缺失", "status": "missing"},
+                {"target": "群聊：未核对", "status": "unchecked"},
+                {"target": "群聊：重名", "status": "unbound", "kind": "group"},
+            ],
+        }
+        self.addCleanup(lambda: ACCOUNTS[0].__setitem__("patrol", original))
+
+        page = self._get("/accounts").text
+
+        self.assertIn('data-patrol-pill="ok">巡查正常</span>', page)
+        for label in ("群聊：已找到", "新群名", "群聊：缺失", "群聊：未核对", "群聊：重名"):
+            with self.subTest(label=label):
+                self.assertIn(label, page)
+
+    def test_accounts_page_collapses_disabled_accounts_after_enabled_ones(self):
+        self._as(ADMIN)
+        page = self._get("/accounts").text
+
+        self.assertIn('<details class="disabled-accounts fold">', page)
+        self.assertIn("已停用账号（1）", page)
+        disabled_section = page[page.index('<details class="disabled-accounts fold">'):]
+        self.assertIn('id="account-1002"', disabled_section)
+        self.assertNotIn('id="account-1001"', disabled_section)
+        self.assertLess(page.index('id="account-1001"'), page.index('<details class="disabled-accounts fold">'))
+
+    def test_send_console_filters_by_status_account_and_target_name(self):
+        self._as(ADMIN)
+        original_row = _snapshot()["send_console"]["accounts"][0]
+        filtered_row = dict(original_row)
+        filtered_row.update({
+            "confirmed_targets": [{"target": "已确认好友", "confirmationLabel": "服务端回执", "message": "hi"}],
+            "unconfirmed_targets": [{"target": "待核验好友", "categoryLabel": "待核验", "attemptCount": 1}],
+            "failed_targets": [{"target": "失败好友", "categoryLabel": "发送失败", "attemptCount": 1}],
+            "pending_targets": [{"target": "等待好友", "status": "pending", "friendIndex": {}}],
+            "unprocessed_targets": [],
+        })
+        snapshot = _snapshot()
+        snapshot["send_console"]["accounts"] = [filtered_row]
+        with patch.object(app_module, "get_ops_snapshot", return_value=snapshot):
+            confirmed = self._get("/ops/send-console?status=confirmed&account=1001&q=%E5%B7%B2%E7%A1%AE%E8%AE%A4").text
+            attention = self._get("/ops/send-console?status=attention").text
+            pending = self._get("/ops/send-console?status=pending").text
+
+        self.assertIn("已确认好友", confirmed)
+        self.assertNotIn("待核验好友", confirmed)
+        self.assertNotIn("待核验好友", attention)
+        self.assertIn("失败好友", attention)
+        self.assertNotIn("已确认好友", attention)
+        self.assertIn("待核验好友", pending)
+        self.assertNotIn("失败好友", pending)
+
+    def test_send_console_ignores_invalid_filters_and_escapes_query(self):
+        self._as(ADMIN)
+        response = self._get('/ops/send-console?status=bad&account=missing&q=%3Cscript%3Ealert(1)%3C%2Fscript%3E')
+
+        self.assertEqual(200, response.status_code)
+        self.assertNotIn("<script>alert(1)</script>", response.text)
+        self.assertNotIn("阿杰", response.text)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", response.text)
+
     def test_accounts_page_separates_manual_group_targets_from_friends(self):
         self._as(ADMIN)
         original = list(ACCOUNTS[0]["targets"])

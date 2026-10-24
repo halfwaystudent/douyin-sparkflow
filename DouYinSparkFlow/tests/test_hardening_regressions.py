@@ -698,22 +698,30 @@ class RuntimeHardeningTests(unittest.TestCase):
             lock_path.write_text("99999999\n", encoding="utf-8")
             context = multiprocessing.get_context("spawn")
             start_event = context.Event()
+            release_event = context.Event()
+            ready_queue = context.Queue()
             queue = context.Queue()
             processes = [
                 context.Process(
                     target=_try_task_lock_worker,
-                    args=(str(lock_path), start_event, queue),
+                    args=(str(lock_path), ready_queue, start_event, release_event, queue),
                 )
                 for _ in range(2)
             ]
             for process in processes:
                 process.start()
-            start_event.set()
-            for process in processes:
-                process.join(timeout=10)
+            try:
+                for _ in processes:
+                    ready_queue.get(timeout=60)
+                start_event.set()
+                outcomes = sorted(queue.get(timeout=30) for _ in processes)
+            finally:
+                start_event.set()
+                release_event.set()
+                for process in processes:
+                    process.join(timeout=30)
 
             self.assertEqual([0, 0], [process.exitcode for process in processes])
-            outcomes = sorted(queue.get(timeout=2) for _ in processes)
 
         self.assertEqual(["acquired", "blocked"], outcomes)
 
@@ -1115,12 +1123,17 @@ def _create_web_user_worker(path, username, delay):
         users.create_web_user(username, "password")
 
 
-def _try_task_lock_worker(path, start_event, queue):
-    start_event.wait()
+def _try_task_lock_worker(path, ready_queue, start_event, release_event, queue):
+    # Report readiness only after the heavy imports are done, so the race starts
+    # when both processes can actually reach the lock. The holder keeps the lock
+    # until the test has collected both outcomes instead of a fixed sleep, which
+    # a slow second process could outlast on a busy machine.
+    ready_queue.put(True)
+    start_event.wait(30)
     try:
         with tasks.task_run_lock(Path(path)):
             queue.put("acquired")
-            time.sleep(0.4)
+            release_event.wait(30)
     except tasks.TaskRunAlreadyInProgress:
         queue.put("blocked")
 
@@ -1165,8 +1178,8 @@ class StateLockingHardeningTests(unittest.TestCase):
             first.start()
             time.sleep(0.05)
             second.start()
-            first.join(timeout=10)
-            second.join(timeout=10)
+            first.join(timeout=60)
+            second.join(timeout=60)
 
             self.assertEqual(0, first.exitcode)
             self.assertEqual(0, second.exitcode)
@@ -1191,8 +1204,8 @@ class StateLockingHardeningTests(unittest.TestCase):
             first.start()
             time.sleep(0.05)
             second.start()
-            first.join(timeout=10)
-            second.join(timeout=10)
+            first.join(timeout=60)
+            second.join(timeout=60)
 
             self.assertEqual(0, first.exitcode)
             self.assertEqual(0, second.exitcode)
@@ -1217,8 +1230,8 @@ class StateLockingHardeningTests(unittest.TestCase):
             first.start()
             time.sleep(0.05)
             second.start()
-            first.join(timeout=10)
-            second.join(timeout=10)
+            first.join(timeout=60)
+            second.join(timeout=60)
 
             self.assertEqual(0, first.exitcode)
             self.assertEqual(0, second.exitcode)

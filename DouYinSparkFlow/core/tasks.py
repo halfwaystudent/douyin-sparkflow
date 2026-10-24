@@ -26,6 +26,7 @@ from core.browser import (
     release_browser_account_lock,
     select_douyin_network_mode,
 )
+from core.im_receipt import parse_send_response
 from core.msg_builder import build_message, build_message_candidates
 from core.protocol_dispatch import run_protocol_tasks
 from core import friend_identity, notifications, streak_state
@@ -60,16 +61,15 @@ async def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
                 raise
 
 
-def _safe_name(value):
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)[:80]
-
-
-def _normalize_target_name(value):
-    raw = unicodedata.normalize("NFKC", str(value or ""))
-    for token in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        raw = raw.replace(token, "")
-    raw = raw.replace("\xa0", " ")
-    return " ".join(raw.split()).strip().casefold()
+from core.task_normalization import (
+    _coerce_non_negative_int,
+    _coerce_positive_float,
+    _coerce_positive_int,
+    _normalize_friend_list_scan_config,
+    _normalize_send_strategy,
+    _normalize_target_name,
+    _safe_name,
+)  # noqa: F401
 
 
 def _current_run_mode():
@@ -78,61 +78,6 @@ def _current_run_mode():
     if _manual_run_failed_only():
         return "manual_failed_only"
     return "manual" if _is_manual_run() else "scheduled"
-
-
-def _coerce_non_negative_int(value, default):
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return max(0, int(default))
-
-
-def _coerce_positive_int(value, default):
-    try:
-        return max(1, int(value))
-    except (TypeError, ValueError):
-        return max(1, int(default))
-
-
-def _coerce_positive_float(value, default):
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        parsed = float(default)
-    if parsed <= 0:
-        parsed = float(default)
-    return parsed
-
-
-def _normalize_friend_list_scan_config(active_config):
-    raw = active_config.get("friendListScan", {}) or {}
-    return {
-        "maxScanSeconds": _coerce_positive_int(raw.get("maxScanSeconds", 300), 300),
-        "idleScanSeconds": _coerce_positive_int(raw.get("idleScanSeconds", 120), 120),
-        "scrollStepPx": _coerce_positive_int(raw.get("scrollStepPx", 400), 400),
-        "scrollDelaySeconds": _coerce_positive_float(raw.get("scrollDelaySeconds", 1.5), 1.5),
-    }
-
-
-def _normalize_send_strategy(active_config):
-    raw = active_config.get("sendStrategy", {}) or {}
-    start_min = _coerce_non_negative_int(raw.get("accountStartDelaySecondsMin", 0), 0)
-    start_max = _coerce_non_negative_int(raw.get("accountStartDelaySecondsMax", start_min), start_min)
-    if start_max < start_min:
-        start_max = start_min
-
-    message_min = _coerce_non_negative_int(raw.get("messageIntervalSecondsMin", 0), 0)
-    message_max = _coerce_non_negative_int(raw.get("messageIntervalSecondsMax", message_min), message_min)
-    if message_max < message_min:
-        message_max = message_min
-
-    return {
-        "shuffleTargets": bool(raw.get("shuffleTargets", True)),
-        "accountStartDelaySecondsMin": start_min,
-        "accountStartDelaySecondsMax": start_max,
-        "messageIntervalSecondsMin": message_min,
-        "messageIntervalSecondsMax": message_max,
-    }
 
 
 def _ordered_targets_for_run(targets, send_strategy):
@@ -548,6 +493,16 @@ async def start_im_send_observer(page, account_name, target_name):
                 return ""
         return raw
 
+    def _body_bytes(body):
+        """Exact response bytes; text bodies are re-encoded (lossless for UTF-8)."""
+        raw = body.get("body") or ""
+        if body.get("base64Encoded"):
+            try:
+                return base64.b64decode(raw)
+            except Exception:
+                return b""
+        return raw.encode("utf-8", errors="surrogateescape") if isinstance(raw, str) else bytes(raw)
+
     def _parse_json_body(text):
         try:
             return json.loads(text)
@@ -667,6 +622,20 @@ async def start_im_send_observer(page, account_name, target_name):
             if json_ok is not None:
                 receipt["jsonOk"] = bool(json_ok)
             if item.get("is_send_post"):
+                if data is None:
+                    # The creator page gets a binary protobuf receipt; read the
+                    # accept/refuse codes from it instead of giving up.
+                    receipt["bodyBase64"] = bool(body.get("base64Encoded"))
+                    proto = parse_send_response(_body_bytes(body))
+                    if proto is not None:
+                        receipt["protoParsed"] = True
+                        receipt["protoOk"] = bool(proto["ok"])
+                        receipt["protoStatusCode"] = proto["statusCode"]
+                        receipt["protoSendStatus"] = proto["sendStatus"]
+                        receipt["protoCheckCode"] = proto["checkCode"]
+                        if proto["checkCodes"]:
+                            receipt["protoCheckCodes"] = dict(proto["checkCodes"])
+                        receipt["ok"] = bool(http_ok and proto["ok"])
                 # A refusal code is the server's answer even when the envelope
                 # is not JSON, so it has to reach the sender as a refusal
                 # instead of an unreadable receipt.
@@ -674,6 +643,8 @@ async def start_im_send_observer(page, account_name, target_name):
                 if rejection:
                     receipt["rejection"] = rejection
                     receipt["ok"] = False
+                    if receipt.get("protoParsed"):
+                        receipt["protoOk"] = False
             if not receipt["ok"]:
                 reason_text = _extract_error_text(data, body_text)
                 rejection = _receipt_rejection(receipt)
@@ -685,7 +656,7 @@ async def start_im_send_observer(page, account_name, target_name):
                 receipt["reason"] = _trim(reason_text, 300)
             if item.get("is_send_post"):
                 state["send_receipt"] = receipt
-                _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"], "jsonParsed": receipt["jsonParsed"], "logid": receipt.get("logid", ""), "reason": receipt.get("reason", "")})
+                _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"], "jsonParsed": receipt["jsonParsed"], "protoParsed": bool(receipt.get("protoParsed")), "protoOk": receipt.get("protoOk"), "bodyBase64": receipt.get("bodyBase64"), "logid": receipt.get("logid", ""), "reason": receipt.get("reason", "")})
             elif kind == "mark_read":
                 state["mark_read_calls"].append(receipt)
                 _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"]})
@@ -974,161 +945,18 @@ async def find_visible_spark_message_candidate(page, chat_input=None, candidates
     return ""
 
 
-def _json_body_success(data):
-    if not isinstance(data, dict):
-        return None
-
-    candidates = []
-    pending = [data]
-    while pending:
-        candidate = pending.pop(0)
-        if isinstance(candidate, dict):
-            candidates.append(candidate)
-            for value in candidate.values():
-                if isinstance(value, (dict, list)):
-                    pending.append(value)
-        elif isinstance(candidate, list):
-            pending.extend(
-                value
-                for value in candidate
-                if isinstance(value, (dict, list))
-            )
-
-    code_seen = False
-    code_success = True
-    error_seen = False
-    for candidate in candidates:
-        for key in ("status_code", "err_no", "errno", "error_code", "code"):
-            if key in candidate:
-                code_seen = True
-                if candidate.get(key) not in (0, "0"):
-                    code_success = False
-        message = str(
-            candidate.get("message")
-            or candidate.get("status_msg")
-            or ""
-        ).lower()
-        if message and message not in ("success", "ok"):
-            error_seen = True
-        for key in ("error", "error_msg", "err_msg"):
-            if candidate.get(key):
-                error_seen = True
-
-    if code_seen:
-        return code_success and not error_seen
-    if error_seen:
-        return False
-    return None
-
-
-# Response keys whose non-zero value means the server refused this message.
-# Deliberately narrow: generic metadata such as ``msg_type`` and free-form
-# fields such as ``decision_type`` are not refusal evidence, and neither is the
-# message text the operator asked us to send.
-SEND_REJECTION_CODE_KEYS = (
-    "status_code",
-    "err_no",
-    "errno",
-    "error_code",
-    "check_code",
-    "raw_check_code",
-)
-
-_SEND_REJECTION_PATTERNS = tuple(
-    (key, re.compile(rf'"{re.escape(key)}"\s*:\s*(-?\d+)'))
-    for key in SEND_REJECTION_CODE_KEYS
-)
-
-
-def _coerce_rejection_code(value):
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
-        return int(value.strip())
-    return None
-
-
-def _rejection_from_json(data):
-    """First non-zero refusal code inside a parsed response body."""
-    pending = [data]
-    while pending:
-        candidate = pending.pop(0)
-        if isinstance(candidate, dict):
-            for key in SEND_REJECTION_CODE_KEYS:
-                if key not in candidate:
-                    continue
-                code = _coerce_rejection_code(candidate.get(key))
-                if code:
-                    return {"key": key, "value": code, "source": "json"}
-            pending.extend(
-                value
-                for value in candidate.values()
-                if isinstance(value, (dict, list))
-            )
-        elif isinstance(candidate, list):
-            pending.extend(
-                value for value in candidate if isinstance(value, (dict, list))
-            )
-    return None
-
-
-def _rejection_from_raw_text(body_text):
-    """First non-zero refusal code inside a body we could not parse as JSON.
-
-    Douyin answers ``message_send`` with protobuf-wrapped JSON, so the refusal
-    code is visible in the raw bytes long before any JSON parser sees it. Only
-    the quoted JSON form counts: free text that happens to mention a code, such
-    as the message we just tried to send, is not refusal evidence.
-    """
-    text = str(body_text or "")
-    if not text:
-        return None
-    for key, pattern in _SEND_REJECTION_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        code = _coerce_rejection_code(match.group(1))
-        if code:
-            return {"key": key, "value": code, "source": "raw"}
-    return None
-
-
-def _extract_send_rejection(data, body_text):
-    """Refusal evidence from a ``message_send`` response, or ``None``.
-
-    Only a non-zero value on a known code field counts. A response we cannot
-    parse and that carries no such field stays unknown: it is neither evidence
-    of a refusal nor evidence of acceptance.
-    """
-    if isinstance(data, dict):
-        # A body we could parse is authoritative: read its fields, never scan
-        # its text, so a string value cannot masquerade as a refusal code.
-        return _rejection_from_json(data)
-    return _rejection_from_raw_text(body_text)
-
-
-def _receipt_rejection(receipt):
-    """Refusal recorded on a send receipt, if the observer found one."""
-    if not isinstance(receipt, dict):
-        return None
-    rejection = receipt.get("rejection")
-    return dict(rejection) if isinstance(rejection, dict) else None
-
-
-def _should_persist_recovered_browser_evidence(sent_ok, error):
-    """Whether the page bubble may stand in for the server's answer.
-
-    A refusal is an explicit answer, so the page must not rewrite it as sent.
-    An unreadable or unknown response keeps the existing fallback: the bubble
-    is the only evidence available and the attempt is recorded as unverified.
-    """
-    if isinstance(error, BrowserSendRejected) or _receipt_rejection(
-        getattr(error, "receipt", None)
-    ):
-        return False
-    return bool(sent_ok)
+from core.task_rejections import (
+    BrowserSendRejected,
+    SEND_REJECTION_CODE_KEYS,
+    _SEND_REJECTION_PATTERNS,
+    _coerce_rejection_code,
+    _extract_send_rejection,
+    _json_body_success,
+    _receipt_rejection,
+    _rejection_from_json,
+    _rejection_from_raw_text,
+    _should_persist_recovered_browser_evidence,
+)  # noqa: F401
 
 
 async def detect_message_already_sent(page, chat_input, message, before_snapshot=None):
@@ -1205,16 +1033,6 @@ class GroupTargetSelectionError(FriendListUnavailableError):
         super().__init__("one or more bound group targets could not be selected")
 
 
-class BrowserSendRejected(RuntimeError):
-    """``message_send`` answered with an explicit refusal code.
-
-    Carries the code so the failure record and the run report show which field
-    refused the message instead of a generic "receipt rejected".
-    """
-
-    def __init__(self, message, rejection=None):
-        super().__init__(message)
-        self.rejection = dict(rejection or {})
 
 
 ACCOUNT_LEVEL_FAILURE_CATEGORIES = {

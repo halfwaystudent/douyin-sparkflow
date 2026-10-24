@@ -1,0 +1,34 @@
+version: 2
+# Weekly dependency update PRs. Only opens PRs; nothing is merged or deployed
+# automatically, and the test workflow runs on each PR.
+updates:
+  - package-ecosystem: pip
+    directory: /DouYinSparkFlow
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # The Playwright Python package must match the Playwright Docker base
+      # image tag (PLAYWRIGHT_BASE_IMAGE); bump both together by hand.
+      - dependency-name: playwright
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker
+    directory: /DouYinSparkFlow
+    schedule:
+      interval: monthly
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: mcr.microsoft.com/playwright/python
