@@ -370,13 +370,92 @@ async def _inspect_once(user, network_mode, profile_config):
         await login_watch.drain(timeout=UID_DRAIN_TIMEOUT_SECONDS)
         friends.uid_entries = uid_collector.entries()
         friends.uid_summary = uid_collector.summary()
-        return {"friends": friends, "loginUid": login_watch.uid}
+        groups, group_error = await _collect_patrol_groups(page, user)
+        return {
+            "friends": friends,
+            "loginUid": login_watch.uid,
+            "groups": groups,
+            "groupError": group_error,
+        }
     finally:
         if uid_collector is not None:
             uid_collector.detach()
         if login_watch is not None:
             login_watch.detach()
         await _close_session(playwright, browser, context, page)
+
+
+def _group_targets(user):
+    from core.tasks import parse_chat_target
+
+    return [
+        str(target) for target in user.get("targets") or []
+        if parse_chat_target(target)[0] == "group"
+    ]
+
+
+async def _collect_patrol_groups(page, user):
+    """Read the group list on the already-open chat page: (rows, error).
+
+    Only switches the list tab and scrolls it, never opens a conversation, so
+    nothing is marked read or sent. A failure only affects the group rows.
+    """
+    if not _group_targets(user):
+        return None, ""
+    from core.groups import _activate_group_tab, collect_group_rows
+
+    previous = ""
+    try:
+        previous = await _activate_group_tab(page)
+        return await collect_group_rows(page), ""
+    except Exception as exc:  # noqa: BLE001 - group check must not fail the patrol
+        logger.warning("Patrol group list read failed for %s: %s", _account_name(user), _short(str(exc)))
+        return None, _short(str(exc)) or type(exc).__name__
+    finally:
+        if previous:
+            try:
+                await page.get_by_role("tab", name=previous, exact=True).click()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _group_target_rows(user, groups, group_error=""):
+    """Judge group targets against the group list, the same way the sender finds them."""
+    from core.tasks import _normalize_target_name, get_bound_group_conversation_id, parse_chat_target
+
+    rows = []
+    targets = _group_targets(user)
+    if not targets:
+        return rows
+    by_id = {str(item.get("conversationId")): str(item.get("name") or "") for item in groups or []}
+    for target in targets:
+        _kind, visible = parse_chat_target(target)
+        row = {"target": target, "status": friend_identity.STATUS_UNCHECKED, "reason": "", "kind": "group"}
+        if groups is None:
+            row["reason"] = f"群列表读取失败：{group_error}" if group_error else "群列表读取失败"
+            rows.append(row)
+            continue
+        bound_id = get_bound_group_conversation_id(user, target)
+        if bound_id:
+            current = by_id.get(str(bound_id))
+            if current is None:
+                row.update(status=friend_identity.STATUS_MISSING, reason="群列表里没有这个群（可能已退群或群被解散）")
+            else:
+                row["status"] = friend_identity.STATUS_FOUND
+                if _normalize_target_name(current) != _normalize_target_name(visible):
+                    row["currentName"] = current
+            rows.append(row)
+            continue
+        wanted = _normalize_target_name(visible)
+        matches = [name for name in by_id.values() if _normalize_target_name(name) == wanted]
+        if len(matches) == 1:
+            row["status"] = friend_identity.STATUS_FOUND
+        elif matches:
+            row.update(status=friend_identity.STATUS_UNBOUND, reason="有多个同名群，发送会跳过；请在群列表里勾选绑定")
+        else:
+            row.update(status=friend_identity.STATUS_MISSING, reason="群列表里没有这个群名")
+        rows.append(row)
+    return rows
 
 
 async def _inspect_account(user, profile_config):
@@ -639,6 +718,10 @@ async def patrol_account(user, *, now=None, trigger="scheduled", lock_wait=None,
             record["completed"] = bool(complete and identity_result is not None)
             if identity_result:
                 record["targets"] = _target_rows(identity_result)
+            record["targets"] = list(record.get("targets") or []) + _group_target_rows(
+                user, inspection.get("groups"), inspection.get("groupError")
+            )
+            if identity_result:
                 record["uidDataTrusted"] = bool(identity_result.get("uidDataTrusted"))
                 if identity_result.get("trustReason") and not record["uidDataTrusted"]:
                     record["uidTrustReason"] = str(identity_result["trustReason"])
@@ -765,6 +848,8 @@ def patrol_view(account):
         label = TARGET_STATUS_LABELS.get(status, status or "未知")
         if status == friend_identity.STATUS_RENAMED:
             text = f"{row.get('oldName') or ''} → {row.get('newName') or row.get('target') or ''}（已自动跟随）"
+        elif row.get("currentName"):
+            text = f"{row.get('target') or ''}（群现名：{row['currentName']}，按编号照常发送）"
         else:
             text = str(row.get("target") or "")
         targets.append(

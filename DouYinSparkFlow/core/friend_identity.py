@@ -518,6 +518,10 @@ def uids_for_nickname(account, nickname):
     return matches
 
 
+def _is_group_target_name(name):
+    return str(name or "").strip().startswith(("群聊：", "群聊:"))
+
+
 def _target_names(account):
     names = []
     for target in account.get("targets") or []:
@@ -557,6 +561,10 @@ def apply_web_target_selection(account, previous_targets, now=None):
                 bindings.pop(name, None)
     bound, unbound = [], {}
     for name in current:
+        # Explicit group targets live outside the friend UID namespace.  Do not
+        # bind them, and do not report a misleading missing-friend UID.
+        if _is_group_target_name(name):
+            continue
         newly_selected = _key(name) not in previous_keys
         if not newly_selected and target_binding(account, name):
             continue
@@ -835,6 +843,10 @@ def reconcile_targets(
         return event
 
     for name in list(_target_names(account)):
+        if _is_group_target_name(name):
+            # Groups are never in the friend list: judging them here would
+            # report every group as a missing friend.
+            continue
         key = _key(name)
         binding = target_binding(account, name)
         current_owners = by_name.get(key) or []

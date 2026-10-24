@@ -29,6 +29,7 @@ from core.cookies import (
     parse_cookie_input,
     require_auth_cookies,
 )
+from core.groups import fetch_account_groups
 from core.friends import (
     CATEGORY_EMPTY_RESULT,
     CATEGORY_INCOMPLETE_SCAN,
@@ -45,7 +46,10 @@ from core import patrol as account_patrol
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
 from core.protocol_dispatch import run_protocol_tasks
 from core.tasks import (
+    _normalize_target_name,
     _append_streak_run_report,
+    parse_chat_target,
+    target_match_key,
     record_friend_scan,
     run_browser_tasks,
     task_run_lock,
@@ -148,9 +152,14 @@ def _dedupe_targets(values):
     result = []
     for value in values:
         normalized = str(value).strip()
-        if not normalized or normalized in seen:
+        dedupe_key = (
+            target_match_key(normalized)
+            if normalized.startswith(("群聊：", "群聊:"))
+            else ("friend", normalized)
+        )
+        if not normalized or dedupe_key in seen:
             continue
-        seen.add(normalized)
+        seen.add(dedupe_key)
         result.append(normalized)
     return result
 
@@ -170,6 +179,17 @@ def extract_targets_from_form(form):
             return checkbox_targets
     raw_targets = str(form.get("targets", ""))
     return _split_target_entries([raw_targets])
+
+
+def extract_group_targets_from_form(form):
+    """Return manual group targets in the canonical, separate namespace."""
+    values = form.getlist("group_targets") if hasattr(form, "getlist") else [form.get("group_targets", "")]
+    normalized = []
+    for value in _split_target_entries(values):
+        name = value.removeprefix("群聊：").removeprefix("群聊:").strip()
+        if name:
+            normalized.append(f"群聊：{name}")
+    return _dedupe_targets(normalized)
 
 
 def find_account(accounts, unique_id):
@@ -490,6 +510,7 @@ LOGIN_VERIFICATION_MAX_WAIT_SECONDS = 2 * 3600
 LOGIN_VERIFICATION_TIMEOUT_SECONDS = 300
 LOGIN_VERIFICATION_RESTART_DELAY_SECONDS = 30
 _friend_refresh_active = set()
+_group_refresh_active = set()
 # Accounts with a Web-triggered patrol in flight (one uvicorn process).
 _patrol_active = set()
 _background_tasks = set()
@@ -510,6 +531,8 @@ def friend_refresh_conflict(unique_id):
         return "该账号已有好友刷新正在进行，请稍后重试"
     if normalize_unique_id(unique_id) in _patrol_active:
         return "该账号正在巡查，请稍后重试"
+    if normalize_unique_id(unique_id) in _group_refresh_active:
+        return "该账号正在刷新群列表，请稍后重试"
     active = get_login_lock()
     if active:
         return "登录工作区正在被使用，请等扫码登录结束后再刷新好友"
@@ -1445,6 +1468,26 @@ def create_app():
             return redirect("/login")
         return redirect("/settings?_anchor=notify")
 
+    @app.get("/ops/send-console#account-{unique_id}", include_in_schema=False)
+    async def legacy_send_console_fragment(request: Request, unique_id: str):
+        # Some phone browsers send the dashboard's account link with "#" encoded.
+        if not (unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32):
+            return Response(status_code=404)
+        if not principal(request):
+            return redirect("/login")
+        return redirect(f"/ops/send-console?_anchor=account-{unique_id}")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return Response(
+            content=(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+                '<path fill="#f97316" d="M18 2 6 18h8l-2 12 14-18h-9z"/></svg>'
+            ),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     @app.get("/accounts#account-{unique_id}", include_in_schema=False)
     async def legacy_account_fragment(request: Request, unique_id: str):
         if not (unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32):
@@ -1792,13 +1835,66 @@ def create_app():
             return Response("Invalid CSRF token", status_code=403)
 
         username = str(form.get("username", "")).strip()
-        targets = extract_targets_from_form(form)
+        targets = _dedupe_targets(
+            [*extract_targets_from_form(form), *extract_group_targets_from_form(form)]
+        )
 
         def mutate(account, accounts):
             del accounts
             previous_targets = list(account.get("targets") or [])
             account["username"] = username or account.get("username", "")
-            account["targets"] = targets
+            picked_ids = sorted({str(value) for value in form.getlist('group_bind')})
+            cache = {
+                str(item.get('conversationId')): str(item.get('name') or '').strip()
+                for item in account.get('group_cache', [])
+                if isinstance(item, dict) and str(item.get('conversationId') or '').strip()
+            }
+            previous_bindings = {
+                str(target): str(conversation_id)
+                for target, conversation_id in dict(account.get('group_target_bindings') or {}).items()
+                if str(target).strip() and str(conversation_id).strip()
+            }
+            old_target_by_id = {}
+            for target, conversation_id in previous_bindings.items():
+                old_target_by_id.setdefault(conversation_id, target)
+            bindings = {}
+            bound_targets = []
+            # Bound targets are daily-send ledger keys.  Reusing them by stable
+            # conversation id prevents a refresh/name change from making the
+            # sender treat the same group as a new target today.
+            for conversation_id in picked_ids:
+                target = old_target_by_id.get(conversation_id)
+                if target:
+                    bindings[target] = conversation_id
+                    bound_targets.append(target)
+            existing_targets = set(previous_bindings)
+            existing_visible_names = {
+                target.removeprefix('群聊：').removeprefix('群聊:')
+                for target in previous_bindings
+            }
+            cached_name_counts = {}
+            for name in cache.values():
+                if name:
+                    cached_name_counts[name] = cached_name_counts.get(name, 0) + 1
+            for conversation_id in picked_ids:
+                if conversation_id in old_target_by_id:
+                    continue
+                name = cache.get(conversation_id)
+                if not name:
+                    continue
+                collides = cached_name_counts.get(name, 0) > 1 or name in existing_visible_names
+                target = f'群聊：{name}{f"#{conversation_id[-4:]}" if collides else ""}'
+                if target in existing_targets or target in bindings:
+                    target = f'{target}#{conversation_id[-4:]}'
+                bindings[target] = conversation_id
+                bound_targets.append(target)
+            bound_target_set = set(bound_targets)
+            manual_groups = [
+                item for item in extract_group_targets_from_form(form)
+                if item not in bound_target_set
+            ]
+            account["targets"] = _dedupe_targets([*extract_targets_from_form(form), *manual_groups, *bound_targets])
+            account['group_target_bindings'] = bindings
             account["enabled"] = str(form.get("enabled", "")) == "on"
             # Selecting a friend as a target binds it to that friend's uid; a
             # target that stays selected keeps its existing binding.
@@ -2280,6 +2376,69 @@ def create_app():
                 }
             )
         return JSONResponse(dict(job))
+
+    group_refresh_jobs: dict[str, dict] = {}
+
+    async def _run_group_refresh_job(normalized_id, account):
+        try:
+            groups = await asyncio.wait_for(fetch_account_groups(account), timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS)
+            if not groups:
+                raise RuntimeError('未读到群列表')
+            updated_at = datetime.now().isoformat(timespec="seconds")
+            def mutate(accounts):
+                target = account_by_unique_id(accounts, normalized_id)
+                if not target: return None, False
+                target['group_cache'] = list(groups); target['group_cache_updated_at'] = updated_at
+                names = {item['conversationId']: item['name'] for item in groups}
+                notices = dict(target.get('group_target_notices') or {})
+                statuses = []
+                for target_name, cid in dict(target.get('group_target_bindings') or {}).items():
+                    name = names.get(str(cid))
+                    if name is None: statuses.append({'target':target_name,'status':'missing'}); notices[target_name]={'kind':'missing','at':updated_at}
+                    else:
+                        _, configured_name = parse_chat_target(target_name)
+                        suffix = f'#{str(cid)[-4:]}'
+                        if configured_name.endswith(suffix):
+                            configured_name = configured_name[:-len(suffix)]
+                        if _normalize_target_name(name) != _normalize_target_name(configured_name):
+                            statuses.append({'target':target_name,'status':'renamed','name':name}); notices[target_name]={'kind':'renamed','currentName':name,'at':updated_at}
+                        else:
+                            statuses.append({'target':target_name,'status':'ok'}); notices.pop(target_name, None)
+                target['group_target_notices'] = notices
+                return statuses, True
+            statuses = await asyncio.to_thread(update_user_data, mutate, force_reload=True)
+            group_refresh_jobs[normalized_id].update(state='done', stage='done', groups=groups, updatedAt=updated_at, targets=statuses or [], message=f'已刷新 {len(groups)} 个群聊')
+        except Exception as exc:
+            group_refresh_jobs[normalized_id].update(state='failed', stage='failed', error=str(exc))
+        finally: _group_refresh_active.discard(normalized_id)
+
+    @app.post('/accounts/{unique_id}/groups/refresh/async')
+    async def refresh_groups_async(request: Request, unique_id: str):
+        if require_user(request): return JSONResponse({'error':'Unauthorized'}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get('csrf_token',''))): return JSONResponse({'error':'Invalid CSRF token'}, status_code=403)
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error: return JSONResponse({'error':'Forbidden'}, status_code=access_error.status_code)
+        normalized_id = normalize_unique_id(unique_id)
+        conflict = '该账号正在发送任务中，请稍后重试' if task_run_lock_status().get('running') else ''
+        if not conflict and normalized_id in _group_refresh_active:
+            conflict = '该账号已有群列表刷新正在进行，请稍后重试'
+        if not conflict:
+            # Same shared check friend refresh and patrol use (friend refresh,
+            # patrol, login workspace): all of them drive this account's browser.
+            conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            return JSONResponse({'error': conflict, 'category': 'busy'}, status_code=409)
+        _group_refresh_active.add(normalized_id); group_refresh_jobs[normalized_id]={'state':'running','stage':'starting','previousUpdatedAt':account.get('group_cache_updated_at','')}
+        _start_background(_run_group_refresh_job(normalized_id, dict(account)))
+        return JSONResponse({'ok':True,'state':'running'}, status_code=202)
+
+    @app.get('/accounts/{unique_id}/groups/refresh/status')
+    async def refresh_groups_status(request: Request, unique_id: str):
+        if require_user(request): return JSONResponse({'error':'Unauthorized'}, status_code=401)
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error: return JSONResponse({'error':'Forbidden'}, status_code=access_error.status_code)
+        return JSONResponse(dict(group_refresh_jobs.get(normalize_unique_id(unique_id), {'state':'idle','previousUpdatedAt':account.get('group_cache_updated_at','')})))
 
     # "Immediate patrol" for one account. Same permission and CSRF checks as
     # the friend refresh; the patrol itself runs in the background and shares

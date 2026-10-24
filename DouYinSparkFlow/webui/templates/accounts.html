@@ -89,9 +89,37 @@
           <script type="application/json" id="selected-targets-{{ account.unique_id }}">{{ account.targets|default([], true)|tojson }}</script>
         </div>
         <label class="field">
-          <span>目标好友（每行一个，和上面的选择同步）</span>
-          <textarea class="targets-textarea" name="targets" rows="4">{{ account.targets|default([], true)|join('\n') }}</textarea>
+          <span>手动补充好友</span>
+          <textarea class="targets-textarea" name="targets" rows="3" placeholder="每行一个好友昵称；也可在上面的列表中勾选">{% for target in account.targets|default([], true) %}{% if not target.startswith(('群聊：', '群聊:')) %}{{ target }}
+{% endif %}{% endfor %}</textarea>
         </label>
+        <section class="group-target-editor" data-group-targets="true" aria-labelledby="group-targets-{{ account.unique_id }}">
+          <div class="group-target-editor-heading">
+            <div>
+              <strong id="group-targets-{{ account.unique_id }}">群聊目标</strong>
+              <p class="friend-picker-status" data-group-status>{% if account.group_cache_updated_at %}上次刷新：{{ account.group_cache_updated_at }}{% else %}尚未读取群列表{% endif %}</p>
+            </div>
+            <button class="button button-quiet button-sm group-refresh-button" type="button">刷新群列表</button>
+          </div>
+          <div class="group-picker" data-account-id="{{ account.unique_id }}" data-refresh-url="/accounts/{{ account.unique_id }}/groups/refresh" data-csrf-token="{{ csrf_token }}">
+            <div class="group-picker-notices">{% for target, notice in (account.group_target_notices|default({}, true)).items() %}<span class="pill {% if notice.kind == 'missing' %}danger{% else %}warning{% endif %}">{{ '未找到此群' if notice.kind == 'missing' else '已改名为 ' ~ notice.currentName }}</span>{% endfor %}</div>
+            <div class="group-picker-list"></div>
+            <script type="application/json" id="groups-cache-{{ account.unique_id }}">{{ account.group_cache|default([], true)|tojson }}</script>
+            <script type="application/json" id="group-bindings-{{ account.unique_id }}">{{ account.group_target_bindings|default({}, true)|tojson }}</script>
+          </div>
+          <div class="group-target-editor-heading">
+            <div>
+              <strong>手动填写群名（未绑定编号，仅支持一屏内的群）</strong>
+              <p>群名重复时会拒绝发送，不会猜测选择。</p>
+            </div>
+          </div>
+          <label class="field">
+            <span class="sr-only">群聊名称</span>
+            <textarea class="group-targets-textarea" name="group_targets" rows="3" placeholder="每行一个群名称，例如：同名会话">{% for target in account.targets|default([], true) %}{% if target.startswith(('群聊：', '群聊:')) and target not in (account.group_target_bindings|default({}, true)) %}{{ target.removeprefix('群聊：').removeprefix('群聊:') }}
+{% endif %}{% endfor %}</textarea>
+          </label>
+          <p class="group-target-editor-note">保存时会统一为“群聊：群名称”。同名好友与群聊可以同时保留；刷新好友列表不会修改这里的群聊目标。消息发送不代表群火花已成功，仍以发送明细中的结果为准。</p>
+        </section>
         <div class="form-actions">
           <button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存</span></button>
           <a class="button button-quiet" href="/login-workspace?relogin={{ account.unique_id|urlencode }}">

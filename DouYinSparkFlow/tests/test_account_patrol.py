@@ -486,6 +486,74 @@ class ReadOnlyPatrolTests(unittest.TestCase):
         self.assertEqual(0, harness.sent.call_count)
         self.assertIs(True, stored(path)["account_health"]["healthy"])
 
+    GROUP_ID = "7691234567890123401"
+
+    def _group_patrol(self, groups, error="", targets=("Bob", "群聊：111"), bindings=None):
+        path = isolate_account_data(
+            self,
+            [bound_identity(base_account(
+                targets=list(targets),
+                target_uid_bindings={},
+                group_target_bindings={"群聊：111": self.GROUP_ID} if bindings is None else bindings,
+            ))],
+        )
+        harness = PatrolHarness(self, names=("Bob",), detail=((UID_BOB, "Bob"),))
+        reader = AsyncMock(return_value=(groups, error))
+        with patch.object(patrol, "_collect_patrol_groups", reader):
+            result = harness.run()
+        rows = {row["target"]: row for row in stored(path)["patrol"]["targets"]}
+        return result, rows, reader, harness, path
+
+    def test_bound_group_present_by_id_is_reported_found(self):
+        result, rows, reader, harness, path = self._group_patrol(
+            [{"name": "111", "conversationId": self.GROUP_ID}])
+
+        self.assertEqual("ok", result["accounts"][0]["conclusion"])
+        self.assertEqual("found", rows["Bob"]["status"])
+        self.assertEqual("found", rows["群聊：111"]["status"])
+        self.assertEqual("group", rows["群聊：111"]["kind"])
+        self.assertEqual(1, reader.await_count)
+        self.assertEqual(0, harness.sent.call_count)
+        # Patrol itself never opens a chat or sends.
+        self.assertEqual([], harness.page.actions)
+        view = patrol.patrol_view(stored(path))
+        self.assertIn(("找到", "群聊：111"), [(t["label"], t["text"]) for t in view["targets"]])
+
+    def test_bound_group_renamed_is_found_and_shows_the_current_name(self):
+        result, rows, *_ = self._group_patrol([{"name": "新名字", "conversationId": self.GROUP_ID}])
+
+        self.assertEqual("ok", result["accounts"][0]["conclusion"])
+        self.assertEqual("found", rows["群聊：111"]["status"])
+        self.assertEqual("新名字", rows["群聊：111"]["currentName"])
+
+    def test_bound_group_gone_is_missing_even_if_a_same_named_group_exists(self):
+        result, rows, *_ = self._group_patrol([{"name": "111", "conversationId": "7691234567890123402"}])
+
+        self.assertEqual("problems", result["accounts"][0]["conclusion"])
+        self.assertEqual("missing", rows["群聊：111"]["status"])
+
+    def test_group_list_read_failure_marks_only_groups_unchecked(self):
+        result, rows, *_ = self._group_patrol(None, error="群消息标签未激活")
+
+        self.assertEqual("found", rows["Bob"]["status"])
+        self.assertEqual("unchecked", rows["群聊：111"]["status"])
+        self.assertIn("群消息标签未激活", rows["群聊：111"]["reason"])
+
+    def test_unbound_group_by_unique_name_found_and_duplicates_flagged(self):
+        _r, rows, *_ = self._group_patrol(
+            [{"name": "111", "conversationId": self.GROUP_ID}], bindings={})
+        self.assertEqual("found", rows["群聊：111"]["status"])
+        _r, rows, *_ = self._group_patrol(
+            [{"name": "111", "conversationId": self.GROUP_ID},
+             {"name": "111", "conversationId": "7691234567890123402"}], bindings={})
+        self.assertEqual("unbound", rows["群聊：111"]["status"])
+
+    def test_no_group_targets_means_group_list_is_not_touched(self):
+        result, rows, reader, *_ = self._group_patrol(None, targets=("Bob",), bindings={})
+
+        self.assertEqual("ok", result["accounts"][0]["conclusion"])
+        self.assertEqual(["Bob"], list(rows))
+
     def test_page_failure_is_incomplete_and_not_a_login_verdict(self):
         harness = PatrolHarness(
             self, read_error=FriendRefreshError("chat page did not load within timeout", category="structure_changed")

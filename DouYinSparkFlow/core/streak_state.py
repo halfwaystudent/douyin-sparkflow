@@ -1213,11 +1213,11 @@ def _state_for_write(account, target_name, now):
     return state
 
 
-def _store_preferred_state(account, target_name, now, candidate):
+def _store_preferred_state(account, target_name, now, candidate, *, force=False):
     target_ref = resolve_target_ref(account, target_name)
     states = _state_bucket(account)
     existing = states.get(target_ref)
-    if not isinstance(existing, dict) or _prefer_state(candidate, existing):
+    if force or not isinstance(existing, dict) or _prefer_state(candidate, existing):
         candidate["targetRef"] = target_ref
         candidate["displayName"] = normalize_target_name(target_name)
         states[target_ref] = candidate
@@ -1413,6 +1413,7 @@ def mark_failed(
     now=None,
     run_id="",
     strategy="",
+    override_sent_unverified=False,
 ):
     now = _now(now)
     state = _state_for_write(account, target_name, now)
@@ -1425,6 +1426,7 @@ def mark_failed(
         return deepcopy(state)
     if (
         state.get("status") == STATE_SENT_UNVERIFIED
+        and not override_sent_unverified
         and event_time
         and _is_schedule_today(event_time, now)
     ):
@@ -1459,7 +1461,18 @@ def mark_failed(
         # it onto today's failure would make the failure look like it needs
         # manual handling and push it mid-day instead of at the final point.
         candidate["needsVerification"] = False
-    return _store_preferred_state(account, target_name, now, candidate)
+    return _store_preferred_state(
+        account,
+        target_name,
+        now,
+        candidate,
+        force=bool(
+            override_sent_unverified
+            and state.get("status") == STATE_SENT_UNVERIFIED
+            and event_time
+            and _is_schedule_today(event_time, now)
+        ),
+    )
 
 
 def mark_unconfirmed(
