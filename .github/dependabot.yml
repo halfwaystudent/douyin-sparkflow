@@ -22,7 +22,7 @@ updates:
       - dependency-name: pyee
       # The server image runs Python 3.10; these releases need Python 3.11+.
       - dependency-name: filelock
-        versions: [">=4.2"]
+        versions: [">=4.1.1"]
       - dependency-name: starlette
         versions: [">=1.8"]
       - dependency-name: websockets
