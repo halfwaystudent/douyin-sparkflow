@@ -1,8 +1,8 @@
-﻿certifi==2025.11.12
+certifi==2025.11.12
 charset-normalizer==3.4.4
 colorama==0.4.6
 fastapi==0.141.1
-filelock==3.32.6
+filelock==4.2.4
 greenlet==3.2.4
 httpx==0.28.1
 idna==3.19
