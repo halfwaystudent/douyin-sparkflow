@@ -430,6 +430,10 @@ fieldset > legend { padding: 0 6px; }
 .friend-picker-last-refresh { color: var(--ink-3); }
 .friend-picker-summary { font-size: 13px; font-weight: 600; color: var(--flame-deep); }
 .friend-picker-list { display: flex; flex-wrap: wrap; gap: 8px; max-height: 260px; overflow-y: auto; padding: 2px; }
+.group-picker-list { display: grid; gap: 8px; margin: 10px 0; }
+.group-picker-list label { display: flex; align-items: center; gap: 8px; }
+.group-picker-notices { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+
 .friend-option {
   display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px; cursor: pointer;
   border: 1px solid var(--line-strong); background: var(--surface); font-size: 14px; max-width: 100%;
@@ -438,6 +442,11 @@ fieldset > legend { padding: 0 6px; }
 .friend-option input { width: 16px; height: 16px; margin: 0; accent-color: var(--flame); flex: none; }
 .friend-option.selected { border-color: transparent; background: var(--spark-soft); color: var(--flame-deep); font-weight: 600; }
 .friend-picker-empty { color: var(--ink-3); font-size: 13px; padding: 6px 2px; }
+.group-target-editor { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px; display: grid; gap: 10px; background: var(--surface); }
+.group-target-editor-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.group-target-editor-heading p, .group-target-editor-note { color: var(--ink-3); font-size: 13px; line-height: 1.55; margin-top: 3px; }
+.group-target-editor-note { margin: 0; }
+.group-targets-textarea { min-height: 82px; }
 
 /* ---------- login workspace ---------- */
 .login-layout { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 18px; align-items: start; }

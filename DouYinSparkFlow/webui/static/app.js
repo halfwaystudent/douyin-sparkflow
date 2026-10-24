@@ -1441,7 +1441,8 @@
     const summary = picker.querySelector(".friend-picker-summary");
     const status = picker.querySelector(".friend-picker-status");
     let friends = parseJson(`friends-cache-${accountId}`);
-    let selected = new Set(parseJson(`selected-targets-${accountId}`));
+    const isGroupTarget = (value) => String(value || "").trim().startsWith("群聊：") || String(value || "").trim().startsWith("群聊:");
+    let selected = new Set(parseJson(`selected-targets-${accountId}`).filter((target) => !isGroupTarget(target)));
 
     const parseTargets = (value) =>
       [...new Set(
@@ -1494,9 +1495,11 @@
     };
 
     textarea?.addEventListener("input", () => {
-      selected = new Set(parseTargets(textarea.value));
+      selected = new Set(parseTargets(textarea.value).filter((target) => !isGroupTarget(target)));
       render();
     });
+    // Group targets live in their own textarea and are normalized by the server
+    // on save. Rewriting the value while typing would drop new lines and spaces.
     search?.addEventListener("input", render);
     // This element is the only place the last successful refresh time is shown,
     // so remember its initial text and keep it visible while reporting failures.
@@ -1634,6 +1637,22 @@
       batchButton.disabled = false;
     }
     renderBatchSummary(results);
+  });
+})();
+
+(() => {
+  const parse = (id) => { try { return JSON.parse(document.getElementById(id)?.textContent || '[]'); } catch { return []; } };
+  document.querySelectorAll('.group-picker').forEach((picker) => {
+    const id = picker.dataset.accountId, list = picker.querySelector('.group-picker-list');
+    const button = picker.closest('.group-target-editor')?.querySelector('.group-refresh-button');
+    const status = picker.closest('.group-target-editor')?.querySelector('[data-group-status]');
+    let groups = parse(`groups-cache-${id}`), bindings = parse(`group-bindings-${id}`);
+    const notices = picker.querySelector('.group-picker-notices');
+    const renderNotices = (targets = []) => { if (!notices) return; notices.textContent = ''; targets.filter((target) => target.status !== 'ok').forEach((target) => { const pill = document.createElement('span'); pill.className = `pill ${target.status === 'missing' ? 'danger' : 'warning'}`; pill.textContent = target.status === 'missing' ? '未找到此群' : `已改名为 ${target.name || ''}`; notices.appendChild(pill); }); };
+    const render = () => { list.textContent = ''; const selected = new Set(Object.values(bindings)); groups.forEach((group) => { const label=document.createElement('label'), box=document.createElement('input'), text=document.createElement('span'); box.type='checkbox'; box.name='group_bind'; box.value=group.conversationId; box.checked=selected.has(group.conversationId); text.textContent=`${group.name}（${String(group.conversationId)}）`; label.append(box,text); list.append(label); }); };
+    const poll = async () => { for(let i=0;i<200;i+=1) { await new Promise(r=>setTimeout(r,1000)); const job=await fetch(`${picker.dataset.refreshUrl}/status`,{credentials:'same-origin'}).then(r=>r.json()); if(job.state==='running') continue; return job; } return {state:'failed',error:'刷新超时'}; };
+    button?.addEventListener('click', async () => { button.disabled=true; if(status) status.textContent='正在刷新群列表…'; try { const body=new FormData(); body.set('csrf_token',picker.dataset.csrfToken); const response=await fetch(`${picker.dataset.refreshUrl}/async`,{method:'POST',body,credentials:'same-origin'}); if(!response.ok) throw new Error((await response.json()).error || '刷新失败'); const job=await poll(); if(job.state!=='done') throw new Error(job.error || '刷新失败'); groups=job.groups || []; renderNotices(job.targets || []); if(status) status.textContent=job.message || '群列表已刷新'; render(); } catch(error) { if(status) status.textContent=`刷新失败：${error.message}`; } finally { button.disabled=false; } });
+    render();
   });
 })();
 

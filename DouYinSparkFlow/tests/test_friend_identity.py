@@ -317,6 +317,30 @@ class UserDetailCollectorTests(unittest.TestCase):
 
 
 class ReconcileTargetsTests(unittest.TestCase):
+    def test_group_targets_are_not_judged_against_the_friend_list(self):
+        """A group is never in the friend list; patrol must not flag it missing."""
+        account = {
+            "username": "demo",
+            "targets": ["Bob", "群聊：111", "群聊:旧写法群"],
+            "friend_index": {"bob": {"stableKeys": []}},
+        }
+
+        result = friend_identity.reconcile_targets(
+            account,
+            entries((UID_BOB, "Bob", "sec-bob")),
+            scan_complete=True,
+            scanned_names=["Bob"],
+            now=NOW,
+        )
+
+        self.assertEqual(["Bob"], [row["target"] for row in result["targets"]])
+        self.assertEqual("found", result["targets"][0]["status"])
+        self.assertEqual([], result.get("events") or [])
+        self.assertNotIn("群聊：111", account.get("target_uid_bindings") or {})
+        self.assertFalse(any(
+            "111" in str(event) for event in account.get(friend_identity.EVENTS_KEY) or []
+        ))
+
     def test_unique_nickname_auto_binds_unbound_target(self):
         account = {"username": "demo", "targets": ["Bob"], "friend_index": {"bob": {"stableKeys": []}}}
 
@@ -795,7 +819,15 @@ class WebSelectionBindingTests(unittest.TestCase):
             "session_id": "s",
         }
 
-    def _save(self, targets):
+    def _save(self, targets, group_targets=None):
+        data = {
+            "csrf_token": "t",
+            "username": "Tester",
+            "targets": targets,
+            "enabled": "on",
+        }
+        if group_targets is not None:
+            data["group_targets"] = group_targets
         with (
             patch.object(app_module, "current_user", return_value="admin"),
             patch.object(app_module, "current_principal", return_value=self.principal),
@@ -803,12 +835,7 @@ class WebSelectionBindingTests(unittest.TestCase):
         ):
             return self.client.post(
                 f"/accounts/{ACCOUNT_ID}/update",
-                data={
-                    "csrf_token": "t",
-                    "username": "Tester",
-                    "targets": targets,
-                    "enabled": "on",
-                },
+                data=data,
                 follow_redirects=False,
             )
 
@@ -835,6 +862,15 @@ class WebSelectionBindingTests(unittest.TestCase):
 
         stored = stored_accounts(self.path)[0]
         self.assertEqual(UID_MATCHA, stored["target_uid_bindings"]["Alice"]["uid"])
+
+    def test_manual_group_target_is_canonical_and_keeps_same_named_friend(self):
+        response = self._save(["Alice"], group_targets=["Alice", "群聊:Alice"])
+
+        self.assertEqual(303, response.status_code)
+        stored = stored_accounts(self.path)[0]
+        self.assertEqual(["Alice", "群聊：Alice"], stored["targets"])
+        self.assertEqual(UID_OTHER, stored["target_uid_bindings"]["Alice"]["uid"])
+        self.assertNotIn("群聊：Alice", stored.get("target_uid_bindings") or {})
 
 
 class WebFriendRefreshUidTests(unittest.TestCase):

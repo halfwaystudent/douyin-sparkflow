@@ -68,6 +68,8 @@ class GroupChatTargetTests(unittest.TestCase):
         update_side_effect=None,
         update_handler=None,
         readback_handler=None,
+        bound_id=None,
+        verify_side_effect=None,
     ):
         """Exercise the production _do_user_task_locked send path through Enter."""
         user = {
@@ -76,6 +78,9 @@ class GroupChatTargetTests(unittest.TestCase):
             "cookies": [],
             "targets": ["群聊：目标群"],
         }
+        if bound_id:
+            user["group_target_bindings"] = {"群聊：目标群": bound_id}
+        self.verify = AsyncMock(side_effect=verify_side_effect or (lambda *_a, **_k: (True, "")))
         page = Mock(goto=AsyncMock(), close=AsyncMock())
         context = Mock(
             new_page=AsyncMock(return_value=page),
@@ -118,6 +123,7 @@ class GroupChatTargetTests(unittest.TestCase):
                 side_effect=readback_handler or (lambda **_kwargs: [user]),
             ),
             patch.object(tasks.friend_identity, "UserDetailCollector", return_value=collector),
+            patch.object(tasks, "_verify_open_group_conversation", new=self.verify),
         ):
             try:
                 asyncio.run(
@@ -151,12 +157,94 @@ class GroupChatTargetTests(unittest.TestCase):
             streak_state.target_state(user, "群聊：目标群")["status"],
         )
 
+    def test_bound_group_switched_away_before_enter_is_never_sent(self):
+        """Typing and barrier writes are awaits: the open chat can change under us."""
+        outcomes = iter([(True, ""), (False, "active row id mismatch")])
+        user, chat_input = self._run_group_send_until_press(
+            None,
+            bound_id="7691234567890123490",
+            verify_side_effect=lambda *_a, **_k: next(outcomes),
+        )
+
+        chat_input.press.assert_not_awaited()
+        self.assertEqual(2, self.verify.await_count)
+        # The barrier was already durable when the switch was detected: it stays
+        # a non-resendable unknown, never a retryable failure.
+        state = streak_state.target_state(user, "群聊：目标群")
+        self.assertEqual(streak_state.STATE_SENT_UNVERIFIED, state["status"])
+        self.assertFalse(streak_state.fallback_eligible(user, "群聊：目标群"))
+
+    def test_bound_group_mismatch_before_barrier_writes_nothing_and_sends_nothing(self):
+        user, chat_input = self._run_group_send_until_press(
+            None,
+            bound_id="7691234567890123490",
+            verify_side_effect=lambda *_a, **_k: (False, "header name mismatch"),
+        )
+
+        chat_input.press.assert_not_awaited()
+        self.assertEqual(1, self.verify.await_count)
+        self.assertNotEqual(
+            streak_state.STATE_SENT_UNVERIFIED,
+            (streak_state.target_state(user, "群聊：目标群") or {}).get("status"),
+        )
+
+    def test_bound_group_verifies_after_barrier_and_immediately_before_enter(self):
+        order = []
+        real_persist = tasks._persist_browser_pre_enter_unknown
+
+        def persist_barrier(*args, **kwargs):
+            order.append("barrier")
+            return real_persist(*args, **kwargs)
+
+        def verify(*_a, **_k):
+            order.append("verify")
+            return (True, "")
+
+        with patch.object(tasks, "_persist_browser_pre_enter_unknown", side_effect=persist_barrier):
+            _user, chat_input = self._run_group_send_until_press(
+                lambda *_a, **_k: order.append("enter"),
+                bound_id="7691234567890123490",
+                verify_side_effect=verify,
+            )
+
+        self.assertEqual(["verify", "barrier", "verify", "enter"], order)
+        self.assertEqual(1, chat_input.press.await_count)
+
+    def test_unbound_group_send_path_does_not_require_identity_verifier(self):
+        _user, chat_input = self._run_group_send_until_press(None)
+
+        self.assertEqual(0, self.verify.await_count)
+        self.assertEqual(1, chat_input.press.await_count)
+
     def test_storage_failure_prevents_enter_dispatch(self):
         _user, chat_input = self._run_group_send_until_press(
             None, OSError("ledger unavailable")
         )
 
         chat_input.press.assert_not_awaited()
+
+    def test_group_rename_notice_is_persisted_and_cleared_in_users_data(self):
+        user = {"username": "demo", "unique_id": "1001", "targets": ["群聊：旧群"]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "usersData.json"
+            path.write_text(json.dumps([user], ensure_ascii=False), encoding="utf-8")
+            with (
+                patch.object(config, "users_data_path", return_value=path),
+                patch.object(config, "userData", None),
+            ):
+                tasks._persist_group_target_rename_notice(user, "群聊：旧群", "新群")
+                persisted = config.get_userData()[0]
+                self.assertEqual("renamed", persisted["group_target_notices"]["群聊：旧群"]["kind"])
+                self.assertEqual("新群", persisted["group_target_notices"]["群聊：旧群"]["currentName"])
+
+                tasks._persist_group_target_rename_notice(user, "群聊：旧群", "旧群")
+                self.assertNotIn("group_target_notices", config.get_userData()[0])
+
+    def test_group_rename_notice_persistence_failure_does_not_raise(self):
+        with patch.object(tasks, "update_user_data", side_effect=OSError("disk unavailable")):
+            tasks._persist_group_target_rename_notice(
+                {"username": "demo", "unique_id": "1001"}, "群聊：旧群", "新群"
+            )
 
     def test_readback_missing_or_overwritten_barrier_prevents_enter_dispatch(self):
         """A write result is not proof that the durable barrier still exists."""
@@ -354,6 +442,18 @@ class GroupChatTargetTests(unittest.TestCase):
             tasks.target_match_key("同名会话"),
         )
 
+    def test_group_target_binding_lookup_resolves_ascii_and_fullwidth_aliases(self):
+        account = {
+            "group_target_bindings": {
+                "群聊：目标群": "7691234567890123490",
+            }
+        }
+        self.assertEqual(
+            "7691234567890123490",
+            tasks.get_bound_group_conversation_id(account, "群聊:目标群"),
+        )
+        self.assertIsNone(tasks.get_bound_group_conversation_id(account, "目标群"))
+
     def test_group_tab_refuses_to_scan_when_selected_attribute_is_not_true(self):
         class Tab:
             async def is_visible(self, timeout=None):
@@ -502,8 +602,8 @@ class GroupChatTargetTests(unittest.TestCase):
         locator = _Locator([friend])
         group_calls = []
 
-        async def select_group(page, account_name, targets, friend_scan_config):
-            del page, account_name, friend_scan_config
+        async def select_group(page, account_name, targets, friend_scan_config, account=None):
+            del page, account_name, friend_scan_config, account
             group_calls.append(list(targets))
             yield targets[0]
 
@@ -594,6 +694,80 @@ class GroupChatTargetTests(unittest.TestCase):
             )
 
         self.assertEqual(["好友"], selected)
+
+    def test_bound_group_failure_keeps_later_group_and_friend_selection(self):
+        friend = _Row("好友")
+        locator = _Locator([friend])
+        group_errors = []
+
+        async def select_groups(*_args, errors=None, **_kwargs):
+            errors.append({"target": "群聊：缺失A", "category": "group_not_found", "reason": "missing"})
+            yield "群聊：存在B"
+
+        with (
+            patch.object(tasks, "scroll_and_select_group_targets", new=select_groups),
+            patch.object(tasks, "_open_friends_tab", new=AsyncMock()),
+            patch.object(tasks, "_wait_for_friend_list_ready", new=AsyncMock(return_value=("rows", locator))),
+            patch.object(tasks, "_dismiss_non_login_dialogs", new=AsyncMock(return_value=0)),
+            patch.object(tasks, "_first_non_empty_locator", new=AsyncMock(return_value=("rows", locator))),
+            patch.object(tasks, "_extract_friend_record", side_effect=_record),
+            patch.object(tasks, "_persist_friend_index"),
+            patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("", None))),
+            patch.object(tasks.asyncio, "sleep", new=AsyncMock()),
+        ):
+            async def select_two():
+                generator = tasks.scroll_and_select_user(
+                    Mock(evaluate=AsyncMock()), {"username": "demo", "unique_id": "1001"}, "demo",
+                    ["群聊：缺失A", "群聊：存在B", "好友"], SCAN_CONFIG,
+                    group_scan_errors=group_errors,
+                )
+                try:
+                    return [await anext(generator), await anext(generator)]
+                finally:
+                    await generator.aclose()
+
+            selected = asyncio.run(select_two())
+
+        self.assertEqual(["群聊：存在B", "好友"], selected)
+        self.assertEqual(
+            [{"target": "群聊：缺失A", "category": "group_not_found", "reason": "missing"}], group_errors,
+        )
+
+    def test_group_failure_after_yield_only_records_unyielded_group_targets(self):
+        friend = _Row("好友")
+        locator = _Locator([friend])
+        group_errors = []
+
+        async def select_groups(*_args, **_kwargs):
+            yield "群聊：已选群"
+            raise tasks.FriendListIncompleteError("group list changed")
+
+        with (
+            patch.object(tasks, "scroll_and_select_group_targets", new=select_groups),
+            patch.object(tasks, "_open_friends_tab", new=AsyncMock()),
+            patch.object(tasks, "_wait_for_friend_list_ready", new=AsyncMock(return_value=("rows", locator))),
+            patch.object(tasks, "_dismiss_non_login_dialogs", new=AsyncMock(return_value=0)),
+            patch.object(tasks, "_first_non_empty_locator", new=AsyncMock(return_value=("rows", locator))),
+            patch.object(tasks, "_extract_friend_record", side_effect=_record),
+            patch.object(tasks, "_persist_friend_index"),
+            patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("", None))),
+            patch.object(tasks.asyncio, "sleep", new=AsyncMock()),
+        ):
+            selected = asyncio.run(
+                _collect(
+                    tasks.scroll_and_select_user(
+                        Mock(evaluate=AsyncMock()), {"username": "demo"}, "demo",
+                        ["好友", "群聊：已选群", "群聊：未选群"], SCAN_CONFIG,
+                        group_scan_errors=group_errors,
+                    )
+                )
+            )
+
+        self.assertEqual(["群聊：已选群", "好友"], selected)
+        self.assertEqual(
+            [{"target": "群聊：未选群", "category": "friend_list_incomplete", "reason": "group list changed"}],
+            group_errors,
+        )
 
     def test_mixed_same_name_targets_keep_separate_daily_ledgers_and_dedupe_group_aliases(self):
         now = tasks.datetime(2026, 10, 23, 20, 0, tzinfo=tasks._schedule_timezone())

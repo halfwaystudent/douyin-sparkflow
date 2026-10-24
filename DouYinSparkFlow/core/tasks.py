@@ -1156,6 +1156,10 @@ def classify_browser_failure(stage, exc):
     detail = str(exc or "")
     lowered = detail.lower()
 
+    if "group_not_found" in lowered:
+        return "group_not_found"
+    if "group_identity_unavailable" in lowered:
+        return "group_identity_unavailable"
     if "friend_list_unavailable" in lowered:
         return "friend_list_unavailable"
     if "friend_list_incomplete" in lowered:
@@ -1193,6 +1197,12 @@ class FriendListUnavailableError(RuntimeError):
 
 class FriendListIncompleteError(RuntimeError):
     pass
+
+
+class GroupTargetSelectionError(FriendListUnavailableError):
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__("one or more bound group targets could not be selected")
 
 
 class BrowserSendRejected(RuntimeError):
@@ -1409,6 +1419,21 @@ def target_match_key(target_name):
     return kind, _normalize_target_name(visible_name)
 
 
+def get_bound_group_conversation_id(account, target):
+    """Return the durable group conversation binding for either accepted prefix."""
+    if target_match_key(target)[0] != "group":
+        return None
+    bindings = account.get("group_target_bindings", {}) if isinstance(account, dict) else {}
+    if not isinstance(bindings, dict):
+        return None
+    wanted = target_match_key(target)
+    for configured, conversation_id in bindings.items():
+        if target_match_key(configured) == wanted:
+            value = str(conversation_id or "")
+            return value if value.isdigit() and 10 <= len(value) <= 25 else None
+    return None
+
+
 def _dedupe_group_target_aliases(targets):
     """Keep one configured spelling for each explicit group target."""
     result = []
@@ -1459,7 +1484,27 @@ async def _group_tab_is_active(page, account_name):
     return False
 
 
-_GROUP_HEADER_SELECTOR = '#sub-app div.box-header-bb4JnP'
+_GROUP_HEADER_SELECTOR = '#sub-app div[class*="box-header-"]'
+
+
+async def _read_group_row_conversation_id(row_locator):
+    """Read the numeric conversation identity exposed by a group row's React fiber."""
+    script = """(element) => {
+        const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
+        let fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
+        let fiber = fiberKey && element[fiberKey];
+        for (let level = 0; fiber && level <= 3; level += 1, fiber = fiber.return) {
+            const conversation = fiber.memoizedProps?.header?.props?.conversation;
+            const value = conversation?.id ?? conversation?.shortId;
+            if (valid(value)) return value;
+        }
+        return null;
+    }"""
+    try:
+        value = await row_locator.evaluate(script)
+    except Exception:
+        return None
+    return value if isinstance(value, str) and value.isdigit() and 10 <= len(value) <= 25 else None
 
 
 async def _stable_single_screen_group_list(page, scrollable):
@@ -1537,7 +1582,170 @@ async def _confirm_group_chat_header(page, expected_name):
         return False
 
 
-async def scroll_and_select_group_targets(page, account_name, targets, friend_scan_config=None):
+async def _verify_open_group_conversation(page, chat_input, bound_id):
+    """Atomically prove a bound group is still the opened conversation.
+
+    Context membership is corroborating evidence only: its list order does not
+    identify the active conversation, but a present context must include the id.
+    """
+    try:
+        anchor = await chat_input.element_handle() if chat_input is not None else None
+        if anchor is None:
+            for header in await page.locator(_GROUP_HEADER_SELECTOR).all():
+                if await header.is_visible(timeout=800):
+                    anchor = await header.element_handle()
+                    break
+        result = await page.evaluate("""({ anchor, boundId, headerSelector }) => {
+          const valid = value => typeof value === 'string' && /^\\d{10,25}$/.test(value);
+          const visible = node => { const s = getComputedStyle(node), r = node.getBoundingClientRect();
+            return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; };
+          const fiberId = (node, levels) => { let key = Object.keys(node || {}).find(k => k.startsWith('__reactFiber'));
+            let fiber = key && node[key]; for (let i=0; fiber && i <= levels; i++, fiber=fiber.return) {
+              const c=fiber.memoizedProps?.header?.props?.conversation; const id=c?.id ?? c?.shortId; if(valid(id)) return id; } return null; };
+          const rows = Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
+          const active = rows.filter(row => Array.from(row.classList).some(name => name.startsWith('active-')));
+          if (active.length !== 1) return {ok:false, reason:'active row count='+active.length};
+          const row=active[0], rowId=fiberId(row, 3);
+          if (rowId !== boundId) return {ok:false, reason:'active row id mismatch'};
+          const name=row.querySelector('span[class*="item-header-name-"]')?.textContent?.trim();
+          const headers=Array.from(document.querySelectorAll(headerSelector)).filter(visible);
+          if (!name || !headers.some(header => header.textContent.trim() === name)) return {ok:false, reason:'header name mismatch'};
+          let key=Object.keys(anchor || {}).find(k => k.startsWith('__reactFiber')), fiber=key && anchor[key], contextFound=false;
+          for(let i=0; fiber && i < 20; i++, fiber=fiber.return) { const list=fiber.memoizedProps?.value?.checkboxState?.allList;
+            if(Array.isArray(list)) { contextFound=true; const present=list.some(item => (item?.id === boundId || item?.shortId === boundId));
+              return present ? {ok:true, reason:''} : {ok:false, reason:'context lacks bound id'}; } }
+          return {ok:true, reason: contextFound ? '' : 'context unavailable'};
+        }""", {"anchor": anchor, "boundId": str(bound_id), "headerSelector": _GROUP_HEADER_SELECTOR})
+        return bool(result.get("ok")), str(result.get("reason") or "")
+    except Exception as exc:
+        return False, f"identity verification unavailable: {exc}"
+
+
+async def _read_group_header_conversation_id(page, bound_id=None):
+    """Read an opened header identity, or confirm bound-id context membership.
+
+    ``allList`` is never indexed: when a bound id is supplied, it only proves
+    that exact id is represented in the header's React context.
+    """
+    script = """({ element, boundId }) => { const valid = value => typeof value === 'string' && /^\\d{10,25}$/.test(value);
+        let key = Object.keys(element || {}).find(key => key.startsWith('__reactFiber'));
+        let fiber = key && element[key];
+        for (let level = 0; fiber && level < 20; level += 1, fiber = fiber.return) {
+          const props = fiber.memoizedProps || {};
+          const c = props.conversation || props.header?.props?.conversation;
+          const value = c?.id ?? c?.shortId; if (valid(value)) return value;
+          const list = props.value?.checkboxState?.allList;
+          if (Array.isArray(list) && boundId && list.some(item => item?.id === boundId || item?.shortId === boundId)) return boundId;
+        } return null; }"""
+    try:
+        for header in await page.locator(_GROUP_HEADER_SELECTOR).all():
+            if await header.is_visible(timeout=800):
+                value = await page.evaluate(script, {"element": await header.element_handle(), "boundId": bound_id})
+                if isinstance(value, str) and value.isdigit() and 10 <= len(value) <= 25:
+                    return value
+    except Exception:
+        pass
+    return None
+
+
+async def _scan_bound_group_rows(page, scrollable, selector, account_name, config):
+    """Exhaust a virtual group grid, retaining facts rather than recycled locators."""
+    found = []
+    seen_ids = set()
+    deadline = asyncio.get_running_loop().time() + float(config["maxScanSeconds"])
+    bottom_without_new = False
+    while not bottom_without_new:
+        if asyncio.get_running_loop().time() > deadline:
+            raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: group scan timed out")
+        locator = page.locator(selector)
+        rows = await locator.all()
+        added = 0
+        for row in rows:
+            try:
+                if not await row.is_visible(timeout=800):
+                    continue
+                conversation_id = await _read_group_row_conversation_id(row)
+                if not conversation_id:
+                    raise FriendListIncompleteError(
+                        f"group_identity_unavailable for {account_name}: visible group row has no conversation id"
+                    )
+                if conversation_id not in seen_ids:
+                    seen_ids.add(conversation_id)
+                    found.append((conversation_id, await _extract_friend_display_name(row)))
+                    added += 1
+            except FriendListIncompleteError:
+                raise
+            except Exception as exc:
+                raise FriendListIncompleteError(
+                    f"group_identity_unavailable for {account_name}: {exc}"
+                ) from exc
+        state = await page.evaluate("""async (element) => { element.scrollTop += Math.max(1, element.clientHeight);
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            return {top:element.scrollTop, client:element.clientHeight, height:element.scrollHeight}; }""", scrollable)
+        await asyncio.sleep(float(config.get("scrollDelaySeconds", 0)))
+        bottom_without_new = bool(isinstance(state, dict) and state.get("top", 0) + state.get("client", 0) >= state.get("height", 0) - 1 and added == 0)
+    return found
+
+
+async def _click_bound_group_row_atomically(row_locator, bound_id):
+    """Re-verify the row's conversation id and click its exact name span in one
+    synchronous page task. No await separates the check from the click, so a
+    React virtual list cannot recycle the row in between.
+
+    Returns "clicked", or a short reason why nothing was clicked.
+    """
+    script = """(element, boundId) => {
+        const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
+        const fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
+        let fiber = fiberKey && element[fiberKey];
+        let current = null;
+        for (let level = 0; fiber && level <= 3; level += 1, fiber = fiber.return) {
+            const conversation = fiber.memoizedProps?.header?.props?.conversation;
+            const value = conversation?.id ?? conversation?.shortId;
+            if (valid(value)) { current = value; break; }
+        }
+        if (current === null) return 'id unreadable';
+        if (current !== boundId) return 'row recycled';
+        const names = element.querySelectorAll('span[class*="item-header-name-"]');
+        if (names.length !== 1) return 'name control changed';
+        const name = names[0];
+        const box = name.getBoundingClientRect();
+        const style = window.getComputedStyle(name);
+        if (box.width <= 0 || box.height <= 0 || style.visibility === 'hidden' || style.display === 'none') {
+            return 'name control hidden';
+        }
+        name.click();
+        return 'clicked';
+    }"""
+    try:
+        result = await row_locator.evaluate(script, bound_id)
+    except Exception as exc:
+        return f"click failed: {type(exc).__name__}"
+    return result if isinstance(result, str) else "click failed"
+
+
+async def _locate_bound_group_row(page, scrollable, selector, bound_id, account_name, config):
+    """Reset and find the id on its current rendered screen, not by an old locator."""
+    reset = await page.evaluate("""async (element) => { element.scrollTop = 0;
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return element.scrollTop === 0; }""", scrollable)
+    if reset is not True:
+        raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: could not reset group list")
+    deadline = asyncio.get_running_loop().time() + float(config["maxScanSeconds"])
+    while asyncio.get_running_loop().time() <= deadline:
+        for row in await page.locator('#sub-app li.semi-list-item').all():
+            if await row.is_visible(timeout=800) and await _read_group_row_conversation_id(row) == bound_id:
+                return row
+        state = await page.evaluate("""async (element) => { element.scrollTop += Math.max(1, element.clientHeight);
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            return {top:element.scrollTop, client:element.clientHeight, height:element.scrollHeight}; }""", scrollable)
+        await asyncio.sleep(float(config.get("scrollDelaySeconds", 0)))
+        if isinstance(state, dict) and state.get("top", 0) + state.get("client", 0) >= state.get("height", 0) - 1:
+            break
+    raise FriendListUnavailableError(f"group_not_found for {account_name}: {bound_id}")
+
+
+async def scroll_and_select_group_targets(page, account_name, targets, friend_scan_config=None, account=None, errors=None):
     """Select groups from 群消息 without changing the friend UID/index state."""
     group_targets = {}
     for original in targets:
@@ -1568,6 +1776,82 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
         raise FriendListIncompleteError(
             f"group_list_incomplete for {account_name}: could not reset group list to its start"
         )
+    bound_targets = {
+        configured: get_bound_group_conversation_id(account or {}, configured)
+        for configured in group_targets.values()
+    }
+    bound_targets = {target: value for target, value in bound_targets.items() if value}
+    if bound_targets:
+        try:
+            reset = await page.evaluate("(element) => { element.scrollTop = 0; return element.scrollTop === 0; }", initial_scrollable)
+        except Exception:
+            reset = False
+        if reset is not True:
+            raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: could not reset group list")
+        rows = await _scan_bound_group_rows(page, initial_scrollable, active_selector, account_name, config)
+        scan_by_id = {row_id: name for row_id, name in rows}
+        for configured, bound_id in bound_targets.items():
+            current_name = scan_by_id.get(bound_id)
+            if current_name is None:
+                if errors is not None:
+                    errors.append({
+                        "target": configured,
+                        "category": "group_not_found",
+                        "reason": f"group_not_found for {account_name}: {configured}",
+                    })
+                    continue
+                raise FriendListUnavailableError(f"group_not_found for {account_name}: {configured}")
+            try:
+                row = await _locate_bound_group_row(page, initial_scrollable, active_selector, bound_id, account_name, config)
+            except FriendListUnavailableError as exc:
+                # Seen during the identity scan but gone when relocating: the
+                # list changed under us. Fail only this target.
+                if errors is not None:
+                    errors.append({"target": configured, "category": "group_not_found", "reason": str(exc)})
+                    continue
+                raise
+            if await _read_group_row_conversation_id(row) != bound_id:
+                if errors is not None:
+                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: row changed"})
+                    continue
+                raise FriendListIncompleteError(f"group_identity_unavailable for {account_name}: row changed")
+            # Virtual lists recycle rows between any two awaits, so the final id
+            # check and the click happen in one synchronous page-side step.
+            click_result = await _click_bound_group_row_atomically(row, bound_id)
+            if click_result != "clicked":
+                reason = f"group_identity_unavailable for {account_name}: {click_result} before click"
+                if errors is not None:
+                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": reason})
+                    continue
+                raise FriendListIncompleteError(reason)
+            if not await _confirm_group_chat_header(page, current_name):
+                if errors is not None:
+                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: chat header did not confirm target {configured}"})
+                    continue
+                raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: chat header did not confirm target {configured}")
+            header_id = await _read_group_header_conversation_id(page, bound_id)
+            if header_id is not None and header_id != bound_id:
+                if errors is not None:
+                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: opened chat id changed"})
+                    continue
+                raise FriendListIncompleteError(f"group_identity_unavailable for {account_name}: opened chat id changed")
+            verified, verify_reason = await _verify_open_group_conversation(page, None, bound_id)
+            if not verified:
+                reason = f"group_identity_unavailable for {account_name}: {verify_reason}"
+                if errors is not None:
+                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": reason})
+                    continue
+                raise FriendListIncompleteError(reason)
+            _persist_group_target_rename_notice(account or {}, configured, current_name)
+            yield configured
+        # Unbound targets below retain their legacy, single-screen behavior.
+        group_targets = {key: value for key, value in group_targets.items() if value not in bound_targets}
+        if not group_targets:
+            return
+        try:
+            await page.evaluate("(element) => { element.scrollTop = 0; return element.scrollTop === 0; }", initial_scrollable)
+        except Exception:
+            pass
     snapshot = await _stable_single_screen_group_list(page, initial_scrollable)
     if snapshot is None:
         raise FriendListIncompleteError(
@@ -1806,10 +2090,15 @@ async def scroll_and_select_user(
         [target for target in targets if parse_chat_target(target)[0] == "group"]
     )
     if group_targets:
+        group_args = (page, account_name, group_targets, friend_scan_config, user)
+        yielded_group_targets = set()
         try:
-            async for target_name in scroll_and_select_group_targets(
-                page, account_name, group_targets, friend_scan_config
-            ):
+            group_generator = scroll_and_select_group_targets(
+                *group_args,
+                **({"errors": group_scan_errors} if group_scan_errors is not None else {}),
+            )
+            async for target_name in group_generator:
+                yielded_group_targets.add(target_name)
                 yield target_name
         except (FriendListUnavailableError, FriendListIncompleteError) as exc:
             category = (
@@ -1831,6 +2120,7 @@ async def scroll_and_select_user(
                         "reason": str(exc),
                     }
                     for target_name in group_targets
+                    if target_name not in yielded_group_targets
                 )
     friend_targets = [target for target in targets if parse_chat_target(target)[0] == "friend"]
     # Do not replace the legacy all-friend list: rename reconciliation below
@@ -2876,6 +3166,49 @@ def _find_matching_account(accounts, user):
         if target_username and account_username == target_username:
             return account
     return None
+
+
+def _persist_group_target_rename_notice(user, configured, current_name):
+    """Persist a bound group's current display name without affecting delivery."""
+    configured_name = parse_chat_target(configured)[1]
+    renamed = _normalize_target_name(current_name) != _normalize_target_name(configured_name)
+
+    def mutate(accounts):
+        matched = _find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        notices = dict(matched.get("group_target_notices") or {})
+        if renamed:
+            notices[configured] = {
+                "kind": "renamed",
+                "currentName": current_name,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            notices.pop(configured, None)
+        if notices:
+            matched["group_target_notices"] = notices
+        else:
+            matched.pop("group_target_notices", None)
+        return dict(matched), True
+
+    try:
+        persisted = update_user_data(mutate, force_reload=True)
+    except Exception as exc:
+        logger.warning("Could not persist group rename notice for user=%s target=%s: %s", user.get("username", "unknown"), configured, exc)
+        return
+    if persisted is None:
+        logger.warning("Could not find account to persist group rename notice for user=%s target=%s", user.get("username", "unknown"), configured)
+        return
+    if renamed:
+        user.setdefault("group_target_notices", {})[configured] = dict(persisted["group_target_notices"][configured])
+    else:
+        notices = dict(user.get("group_target_notices") or {})
+        notices.pop(configured, None)
+        if notices:
+            user["group_target_notices"] = notices
+        else:
+            user.pop("group_target_notices", None)
 
 
 def _coerce_attempt_count(entry):
@@ -4133,6 +4466,15 @@ async def _do_user_task_locked(
                     # this send and must not veto the confirmation below.
                     pre_send_indicator = await _detect_send_failure_indicator(page)
                     if parse_chat_target(target_name)[0] == "group":
+                        bound_id = get_bound_group_conversation_id(user, target_name)
+                        if bound_id:
+                            verified, verify_reason = await _verify_open_group_conversation(page, chat_input, bound_id)
+                            if not verified:
+                                try:
+                                    await chat_input.fill("")
+                                except Exception:
+                                    pass
+                                raise RuntimeError(f"group_identity_unavailable before barrier: {verify_reason}")
                         if not _persist_browser_pre_enter_unknown(
                             user,
                             target_name,
@@ -4148,6 +4490,14 @@ async def _do_user_task_locked(
                                 target_name,
                             )
                             return
+                        if bound_id:
+                            verified, verify_reason = await _verify_open_group_conversation(page, chat_input, bound_id)
+                            if not verified:
+                                try:
+                                    await chat_input.fill("")
+                                except Exception:
+                                    pass
+                                raise RuntimeError(f"group_identity_unavailable before Enter: {verify_reason}")
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
                     await chat_input.press("Enter")
 

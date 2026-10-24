@@ -75,6 +75,8 @@ FAILURE_CATEGORY_LABELS = {
     "structure_changed": "页面结构变化",
     "empty_result": "未读到好友",
     "friend_not_found": "未找到好友",
+    "group_not_found": "未找到群聊",
+    "group_identity_unavailable": "群聊身份无法确认",
     "friend_list_unavailable": "好友列表不可用",
     "timeout": "执行超时",
     "navigation": "页面访问失败",

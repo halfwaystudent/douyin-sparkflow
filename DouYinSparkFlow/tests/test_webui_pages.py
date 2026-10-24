@@ -178,6 +178,38 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertNotIn("login-desktop-controls", page)
         self.assertNotIn("login-desktop-controls", self._get("/").text)
 
+    def test_accounts_page_separates_manual_group_targets_from_friends(self):
+        self._as(ADMIN)
+        original = list(ACCOUNTS[0]["targets"])
+        original_bindings = ACCOUNTS[0].get("group_target_bindings")
+        original_cache = ACCOUNTS[0].get("group_cache")
+        ACCOUNTS[0]["targets"] = ["阿杰", "群聊：同名会话", "群聊：已绑定群"]
+        ACCOUNTS[0]["group_target_bindings"] = {"群聊：已绑定群": "1234"}
+        ACCOUNTS[0]["group_cache"] = [{"name": '<img src=x onerror=alert(1)>', "conversationId": "1234"}]
+        self.addCleanup(lambda: ACCOUNTS[0].__setitem__("targets", original))
+        self.addCleanup(lambda: ACCOUNTS[0].__setitem__("group_target_bindings", original_bindings))
+        self.addCleanup(lambda: ACCOUNTS[0].__setitem__("group_cache", original_cache))
+
+        page = self._get("/accounts").text
+        script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("选择目标好友", page)
+        self.assertIn("群聊目标", page)
+        self.assertNotIn("群聊目标（手动添加）", page)
+        self.assertNotIn("已绑定群\n", page)
+        self.assertIn('\\u003cimg src=x onerror=alert(1)\\u003e', page)
+        self.assertNotIn('<img src=x onerror=alert(1)>', page)
+        self.assertIn('name="group_targets"', page)
+        self.assertIn('data-group-targets="true"', page)
+        self.assertIn("同名会话", page)
+        self.assertIn("保存时会统一为“群聊：群名称”", page)
+        self.assertIn("同名好友与群聊可以同时保留", page)
+        self.assertIn("不代表群火花已成功", page)
+        self.assertIn("const isGroupTarget", script)
+        # Typing in the group box must not be rewritten mid-input (it used to
+        # drop newlines); the server normalizes group targets on save.
+        self.assertNotIn("groupTextarea.value =", script)
+
     def test_old_single_page_anchors_redirect_to_the_new_pages(self):
         base = (Path(app_module.TEMPLATES_DIR) / "base.html").read_text(encoding="utf-8")
         for anchor, target in (
@@ -197,11 +229,18 @@ class RedesignedPagesTests(unittest.TestCase):
         for path, location in (
             ("/settings%23notify", "/settings?_anchor=notify"),
             ("/accounts%23account-1001", "/accounts?_anchor=account-1001"),
+            ("/ops/send-console%23account-1001", "/ops/send-console?_anchor=account-1001"),
         ):
             response = self._get(path + "?next=https%3A%2F%2Fevil.test")
             self.assertEqual(303, response.status_code)
             self.assertEqual(location, response.headers["location"])
         self.assertEqual(404, self._get("/accounts%23account-invalid").status_code)
+        self.assertEqual(404, self._get("/ops/send-console%23account-invalid").status_code)
+
+    def test_favicon_is_served(self):
+        response = self._get("/favicon.ico")
+        self.assertEqual(200, response.status_code)
+        self.assertIn("svg", response.headers["content-type"])
 
     def test_form_posts_return_to_the_page_they_came_from(self):
         self._as(ADMIN)
@@ -296,3 +335,11 @@ class RedesignedPagesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class GroupPickerLabelTests(unittest.TestCase):
+    def test_group_picker_shows_name_with_full_id_in_brackets(self):
+        js = (Path(__file__).resolve().parents[1] / 'webui' / 'static' / 'app.js').read_text(encoding='utf-8')
+        self.assertIn("text.textContent=`${group.name}（${String(group.conversationId)}）`;", js)
+        self.assertNotIn('· …', js)
