@@ -29,14 +29,14 @@
 
 <div align="center">
   <img src="DouYinSparkFlow/docs/images/screenshot-dark.png" alt="主界面预览 - 暗色模式" width="800"/>
-  <p><i>Web 管理控制台 - 仪表盘视图（暗色主题）</i></p>
+  <p><i>Web 管理控制台 - 今日概览（暗色主题，演示数据）</i></p>
 </div>
 
 ### ☀️ 亮色模式
 
 <div align="center">
   <img src="DouYinSparkFlow/docs/images/screenshot-light.png" alt="主界面预览 - 亮色模式" width="800"/>
-  <p><i>Web 管理控制台 - 仪表盘视图（亮色主题）</i></p>
+  <p><i>Web 管理控制台 - 今日概览（亮色主题，演示数据）</i></p>
 </div>
 
 ---
