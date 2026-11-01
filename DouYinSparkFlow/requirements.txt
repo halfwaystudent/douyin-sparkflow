@@ -1,7 +1,7 @@
-certifi==2026.10.19
+certifi==2026.10.23
 charset-normalizer==3.5.2
 colorama==0.4.6
-fastapi==0.158.2
+fastapi==0.162.0
 filelock==4.1.0
 greenlet==3.5.6
 httpx==0.28.1
@@ -23,4 +23,4 @@ urllib3==2.8.0
 uvicorn==0.54.0
 websockets==16.1.1
 starlette==1.7.0
-tzdata==2026.5
+tzdata==2026.6
