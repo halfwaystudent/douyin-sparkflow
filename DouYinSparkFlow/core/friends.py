@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 from core.browser import (
     account_profile_name,
@@ -12,7 +13,14 @@ from core.browser import (
     release_browser_account_lock,
 )
 from core.friend_identity import UserDetailCollector
-from core.login import collect_login_result
+from core.identity import (
+    CATEGORY_IDENTITY_CONFLICT,
+    CATEGORY_IDENTITY_UNVERIFIED,
+    IdentityUnavailable,
+    account_uid,
+    fetch_trusted_identity,
+)
+from core.login import CARD_NOT_READY_MESSAGE, collect_login_result
 from core.streak_state import AUTH_COOKIE_NAMES
 from utils.config import get_config, normalize_unique_id
 from utils.logger import setup_logger
@@ -477,6 +485,7 @@ async def _fetch_account_friends_once(
             # redirect away from it is itself proof that the session is invalid.
             await page.goto(CREATOR_HOME_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
             identity = None
+            verify_browser_identity = False
             last_identity_error = None
             for attempt in range(IDENTITY_READ_ATTEMPTS):
                 # The first attempt gets the full render budget; the retry starts
@@ -509,6 +518,18 @@ async def _fetch_account_friends_once(
                     if classify_refresh_error(exc) == CATEGORY_LOGIN_REQUIRED:
                         # A visible login form is a real answer, not a slow page.
                         raise _with_category(exc, CATEGORY_LOGIN_REQUIRED) from exc
+                    if str(exc) == CARD_NOT_READY_MESSAGE and account_uid(account):
+                        # A missing home-page card is not an identity proof.
+                        # Existing bound accounts can instead prove the browser
+                        # session's UID after the private-message page loads.
+                        identity = {
+                            "unique_id": account_uid(account),
+                            "display_id": str(account.get("display_id") or ""),
+                            "username": account_name,
+                        }
+                        verify_browser_identity = True
+                        logger.info("Creator card unavailable; checking bound browser identity on the chat page")
+                        break
                     # Only a failure that came back quickly can be a transient
                     # blank render; a full-budget timeout means the card needs
                     # longer than the budget, and a shorter retry cannot fix that.
@@ -544,6 +565,36 @@ async def _fetch_account_friends_once(
             # session that cannot reach the friend list is not reported healthy.
             await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
             await _wait_for_chat_or_login(page)
+            if verify_browser_identity:
+                try:
+                    chat_url = urlsplit(page.url)
+                    chat_is_current = (
+                        chat_url.scheme == "https"
+                        and chat_url.hostname == "creator.douyin.com"
+                        and chat_url.port in {None, 443}
+                        and not chat_url.username and not chat_url.password
+                        and chat_url.path.rstrip("/") == urlsplit(CHAT_PAGE_URL).path
+                    )
+                except ValueError:
+                    chat_is_current = False
+                if not chat_is_current:
+                    raise FriendRefreshError("私信页跳转到其他页面，无法确认登录状态")
+                browser_cookies = await context.cookies([
+                    "https://creator.douyin.com/", "https://www.douyin.com/",
+                ])
+                try:
+                    trusted = await asyncio.to_thread(fetch_trusted_identity, browser_cookies)
+                except IdentityUnavailable as exc:
+                    raise FriendRefreshError(str(exc), category=CATEGORY_IDENTITY_UNVERIFIED) from exc
+                if trusted["uid"] != account_uid(account):
+                    raise FriendRefreshError(
+                        "登录浏览器身份与已绑定账号不一致，已停止验证",
+                        category=CATEGORY_IDENTITY_CONFLICT,
+                    )
+                # An SPA shell alone is not a usable chat view. Read friend
+                # readiness only after proving whose browser session it is.
+                await _click_friends_tab(page)
+                await _wait_for_friend_rows_or_empty(page)
             return {
                 # Page text only (handle or UID); not an identity proof.
                 "unique_id": normalize_unique_id(identity.get("unique_id")),
