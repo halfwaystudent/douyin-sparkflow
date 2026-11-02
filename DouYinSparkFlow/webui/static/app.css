@@ -401,7 +401,7 @@ form { margin: 0; }
 .field { display: grid; gap: 6px; min-width: 0; }
 .field > span, fieldset > legend { font-size: 13px; font-weight: 600; color: var(--ink-2); }
 .field small { color: var(--ink-3); }
-input[type="text"], input[type="password"], input[type="number"], input[type="search"], select, textarea {
+input[type="text"], input[type="password"], input[type="number"], input[type="search"], input[type="time"], select, textarea {
   width: 100%; min-height: 44px; padding: 10px 14px;
   border-radius: 12px; border: 1px solid var(--line-strong);
   background: var(--surface); color: var(--ink);
@@ -409,7 +409,7 @@ input[type="text"], input[type="password"], input[type="number"], input[type="se
   transition: border-color .15s, box-shadow .15s;
 }
 textarea { min-height: 96px; resize: vertical; line-height: 1.5; }
-input[type="text"], input[type="password"], input[type="number"], input[type="search"], select { height: 44px; line-height: 1.2; }
+input[type="text"], input[type="password"], input[type="number"], input[type="search"], input[type="time"], select { height: 44px; line-height: 1.2; }
 select { appearance: none; padding-right: 36px; background-image: linear-gradient(45deg, transparent 50%, var(--ink-3) 50%), linear-gradient(135deg, var(--ink-3) 50%, transparent 50%); background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%; background-size: 5px 5px; background-repeat: no-repeat; }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--flame); box-shadow: var(--focus); }
 input::placeholder, textarea::placeholder { color: var(--ink-3); }
@@ -624,7 +624,7 @@ fieldset > legend { padding: 0 6px; }
   .check-grid { grid-template-columns: minmax(0, 1fr); }
   .check, .friend-option { min-height: 44px; }
   .check span, .group-picker-list label, .flash, .callout p { overflow-wrap: anywhere; min-width: 0; }
-  input[type="text"], input[type="password"], input[type="number"], input[type="search"], select, textarea { font-size: 16px; min-width: 0; }
+  input[type="text"], input[type="password"], input[type="number"], input[type="search"], input[type="time"], select, textarea { font-size: 16px; min-width: 0; }
   .form-actions > form, .form-actions > .button { max-width: 100%; }
   .button { white-space: normal; overflow-wrap: anywhere; }
   .fold > summary { padding: 14px 16px; flex-wrap: wrap; }
@@ -689,3 +689,9 @@ fieldset > legend { padding: 0 6px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+.login-interaction { min-width: 0; align-self: start; }
+.login-interaction > summary { cursor: pointer; font-weight: 650; padding: 8px 0; }
+.interaction-viewport { overflow: hidden; margin: 12px 0; border-radius: 10px; background: #eef1f5; }
+.interaction-viewport img { display: block; width: 100%; height: auto; touch-action: none; user-select: none; }
+.interaction-viewport img[hidden] { display: none; }
+.login-interaction.interaction-expanded { position: fixed; inset: 8px; z-index: 120; overflow: auto; box-shadow: 0 0 0 100vmax #0009; }

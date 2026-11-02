@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hmac
 import logging
 import os
@@ -15,6 +16,7 @@ import uvicorn
 from playwright.async_api import async_playwright
 
 from core.login import collect_login_result
+from core.login_interaction import LoginInteraction, InteractionError
 
 
 logger = logging.getLogger(__name__)
@@ -199,6 +201,7 @@ class LoginDesktopManager:
     def __init__(self):
         self._lock = asyncio.Lock()
         self._page_operation_lock = asyncio.Lock()
+        self.interaction = LoginInteraction()
         self.playwright = None
         self.context = None
         self.page = None
@@ -385,6 +388,8 @@ class LoginDesktopManager:
                 )
             launch_options = {
                 "headless": False,
+                "service_workers": "block",
+                "accept_downloads": False,
                 "viewport": {"width": 1600, "height": 1000},
                 "args": launch_args,
             }
@@ -396,6 +401,11 @@ class LoginDesktopManager:
                 str(PROFILE_DIR),
                 **launch_options,
             )
+            def login_popup(page):
+                if self.interaction.token and page.context is self.interaction.context:
+                    self.page = page
+
+            self.context.on("page", login_popup)
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
             try:
                 # Fewer animations means the 2-core host renders the QR sooner.
@@ -424,6 +434,7 @@ class LoginDesktopManager:
         return self.page
 
     async def stop(self, clear_profile=False):
+        self.interaction.clear()
         async with self._lock:
             if self.page:
                 try:
@@ -565,14 +576,20 @@ class LoginDesktopManager:
         self._status_checked_at = now
         return dict(payload)
 
-    async def open_login(self):
+    async def open_login(self, *, interaction_key=""):
         self.mark_activity()
         try:
             await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("login page is busy; retry shortly") from exc
         try:
+            if interaction_key and self.interaction.owns(interaction_key) and self.context and self.page and not self.page.is_closed():
+                return {"ok": True, "url": self.page.url, "state": "interactive", "reset": False, "logged_in": False}
+            if interaction_key and self.context:
+                await self.stop(clear_profile=False)
             result = await self._ensure_login_form_locked()
+            if interaction_key:
+                await self.interaction.bind(self.context, interaction_key)
             return {
                 "ok": True,
                 "url": result["url"],
@@ -581,6 +598,24 @@ class LoginDesktopManager:
                 "logged_in": result["logged_in"],
                 "network": self._network_payload(),
             }
+        finally:
+            self._page_operation_lock.release()
+
+    async def interact(self, token, action=None):
+        try:
+            await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=1)
+        except asyncio.TimeoutError as exc:
+            raise InteractionError("登录页正在处理上一个操作", 503) from exc
+        try:
+            page = self.page
+            if page and page.is_closed() and self.context:
+                page = next((candidate for candidate in self.context.pages if not candidate.is_closed()), None)
+                self.page = page
+            if action is not None:
+                await asyncio.wait_for(self.interaction.act(token, page, action), timeout=5)
+                return {"ok": True}
+            data = await self.interaction.screenshot(token, page)
+            return {"ok": True, "image": base64.b64encode(data).decode("ascii")}
         finally:
             self._page_operation_lock.release()
 
@@ -986,9 +1021,16 @@ async def status():
 
 
 @app.post("/open-login")
-async def open_login():
+async def open_login(request: Request):
     try:
-        return await manager.open_login()
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        key = payload.get("interaction_key", "") if isinstance(payload, dict) else ""
+        return await manager.open_login(interaction_key=key) if key else await manager.open_login()
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
@@ -999,6 +1041,26 @@ async def open_login():
         # instead of letting it surface as an internal server error.
         code, message = QR_ERROR_SPECS["qr_page_busy"]
         return _qr_error(code, "qr_page_busy", message, retry_after=2)
+
+
+@app.post("/interaction")
+async def login_page_interaction(request: Request):
+    try:
+        raw = await request.body()
+        if len(raw) > 16384:
+            return JSONResponse({"ok": False, "error": "请求过大"}, status_code=413)
+        import json
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) - {"ticket", "action"}:
+            raise InteractionError("登录操作格式无效")
+        return await manager.interact(payload.get("ticket", ""), payload.get("action"))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "登录操作格式无效"}, status_code=400)
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
+    except Exception as exc:
+        logger.warning("Login interaction unavailable: %s", type(exc).__name__)
+        return JSONResponse({"ok": False, "error": "登录窗口暂时不可用，请稍后重试"}, status_code=503)
 
 
 @app.post("/reset")

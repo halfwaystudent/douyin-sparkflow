@@ -27,7 +27,8 @@ from core.browser import (
     select_douyin_network_mode,
 )
 from core.im_receipt import parse_send_response
-from core.msg_builder import build_message, build_message_candidates
+from core.msg_builder import build_message, build_message_candidates, using_message_config, current_message_config
+from core import personal_streak
 from core.protocol_dispatch import run_protocol_tasks
 from core import friend_identity, notifications, streak_state
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
@@ -2361,9 +2362,11 @@ def _is_fallback_run():
     return os.getenv("SPARKFLOW_FALLBACK_PHASE") == "1"
 
 
-def _schedule_timezone():
+def _schedule_timezone(config=None):
+    scoped_config = config or current_message_config() or {}
     timezone_name = (
-        str(os.getenv("SPARKFLOW_TIMEZONE") or "").strip()
+        str(scoped_config.get("scheduleTimezone") or "").strip()
+        or str(os.getenv("SPARKFLOW_TIMEZONE") or "").strip()
         or str(os.getenv("TZ") or "").strip()
         or "Asia/Shanghai"
     )
@@ -2385,6 +2388,9 @@ def _normalize_send_window(config):
         "endHour": int(raw.get("endHour", 18)),
         "scheduleIntervalMinutes": max(1, int(raw.get("scheduleIntervalMinutes", 10))),
     }
+    exact_time = str(raw.get("exactTime") or "")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", exact_time):
+        normalized["exactTime"] = exact_time
     if normalized["startHour"] < 0 or normalized["startHour"] > 23:
         normalized["enabled"] = False
     if normalized["endHour"] < 1 or normalized["endHour"] > 24:
@@ -2670,6 +2676,9 @@ def _pending_unsent_targets(user, now):
 
 
 def _scheduled_send_time(user, target_name, send_window, now):
+    if send_window.get("exactTime"):
+        hour, minute = map(int, send_window["exactTime"].split(":"))
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     window_minutes = (send_window["endHour"] - send_window["startHour"]) * 60
     start_of_window = now.replace(
         hour=send_window["startHour"],
@@ -2833,7 +2842,7 @@ def _select_due_targets(user, send_window, now):
 
 
 def _prepare_active_users_for_run(active_config, active_user_data):
-    schedule_tz = _schedule_timezone()
+    schedule_tz = _schedule_timezone(active_config)
     now = datetime.now(schedule_tz)
 
     if not _is_manual_run() or _is_fallback_run():
@@ -3759,7 +3768,10 @@ def _prepare_protocol_fallback_users(active_config, protocol_users):
                     continue
                 targets.append(target_name)
             if targets:
-                fallback_users.append(dict(matched, targets=targets))
+                fallback = dict(matched, targets=targets)
+                if "_personal_scope" in user:
+                    fallback["_personal_scope"] = dict(user["_personal_scope"])
+                fallback_users.append(fallback)
         return fallback_users, bool(fallback_users)
 
     return update_user_data(mutate, force_reload=True) or []
@@ -3950,6 +3962,19 @@ def _browser_account_timeout_seconds(friend_scan_config, target_count):
 
 
 async def run_browser_tasks(
+    active_config, browser_user_data, *, run_id="", fallback=False, allow_retry=False,
+):
+    if browser_user_data and not all("_personal_scope" in user for user in browser_user_data):
+        groups = personal_streak.account_groups(active_config, browser_user_data, manual=True)
+        if not groups or any("_personal_scope" in user for _, accounts in groups for user in accounts):
+            for config, accounts in groups:
+                await run_browser_tasks(config, accounts, run_id=run_id, fallback=fallback, allow_retry=allow_retry)
+            return
+    with using_message_config(active_config):
+        return await _run_browser_tasks(active_config, browser_user_data, run_id=run_id, fallback=fallback, allow_retry=allow_retry)
+
+
+async def _run_browser_tasks(
     active_config,
     browser_user_data,
     *,
@@ -4044,6 +4069,9 @@ async def do_user_task(
     allow_retry=False,
 ):
     async with semaphore:
+        if not personal_streak.authorized(user):
+            logger.info("Skipping account because its personal sending authorization changed")
+            return
         account_name = user.get("username", "unknown")
         account_lock_handle = None
         account_lock_path = None
@@ -4224,6 +4252,9 @@ async def _do_user_task_locked(
                 uid_collector=uid_collector,
                 group_scan_errors=group_scan_errors,
             ):
+                if not personal_streak.authorized(user):
+                    logger.info("Stopping account because its personal sending authorization changed")
+                    return
                 yielded_targets.add(target_name)
                 message = ""
                 chat_input = None
@@ -4316,6 +4347,10 @@ async def _do_user_task_locked(
                                 except Exception:
                                     pass
                                 raise RuntimeError(f"group_identity_unavailable before Enter: {verify_reason}")
+                    if not personal_streak.authorized(user):
+                        await chat_input.fill("")
+                        logger.info("Stopping before send because personal authorization changed")
+                        return
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
                     await chat_input.press("Enter")
 
@@ -4581,49 +4616,35 @@ async def runTasks():
         if not active_user_data:
             run_status = "skipped_no_enabled_accounts"
             logger.warning("No enabled accounts are available for the task run")
-            return
+            return run_status
 
-        runnable_user_data = _prepare_active_users_for_run(
-            active_config,
-            active_user_data,
+        groups = personal_streak.account_groups(
+            active_config, active_user_data, manual=_is_manual_run() and not _is_fallback_run(),
+            profile_key=os.getenv("SPARKFLOW_PERSONAL_USER_ID", ""),
+            revision=os.getenv("SPARKFLOW_PERSONAL_REVISION", ""),
+            claim=os.getenv("SPARKFLOW_PERSONAL_CLAIM", ""),
         )
+        runnable_groups = [(config, _prepare_active_users_for_run(config, accounts)) for config, accounts in groups]
+        runnable_user_data = [user for _, accounts in runnable_groups for user in accounts]
         if not runnable_user_data:
             run_status = "skipped_no_runnable_accounts"
-            return
+            return run_status
 
         for user in runnable_user_data:
             streak_state.reconcile_account(user, started_at)
 
         with task_run_lock():
-            protocol_user_data, browser_user_data = _split_sender_modes(active_config, runnable_user_data)
-            if protocol_user_data:
-                try:
-                    await run_protocol_tasks(
-                        active_config,
-                        protocol_user_data,
-                        build_message,
-                        run_id=run_id,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Protocol sender run failed before fallback selection: %s",
-                        exc,
-                    )
-                fallback_users = _prepare_protocol_fallback_users(
-                    active_config,
-                    protocol_user_data,
-                )
-                if fallback_users:
-                    logger.info(
-                        "Running browser fallback for %s protocol-failed targets",
-                        sum(len(user.get("targets") or []) for user in fallback_users),
-                    )
-                    await run_browser_tasks(
-                        active_config,
-                        fallback_users,
-                        fallback=True,
-                    )
-            await run_browser_tasks(active_config, browser_user_data)
+            for group_config, group_accounts in runnable_groups:
+                protocol_user_data, browser_user_data = _split_sender_modes(group_config, group_accounts)
+                if protocol_user_data:
+                    try:
+                        await run_protocol_tasks(group_config, protocol_user_data, build_message, run_id=run_id)
+                    except Exception as exc:
+                        logger.error("Protocol sender run failed before fallback selection: %s", exc)
+                    fallback_users = _prepare_protocol_fallback_users(group_config, protocol_user_data)
+                    if fallback_users:
+                        await run_browser_tasks(group_config, fallback_users, fallback=True)
+                await run_browser_tasks(group_config, browser_user_data)
     except TaskRunAlreadyInProgress:
         run_status = "skipped_task_in_progress"
         logger.warning("Skipping task run because another task run is already in progress")
@@ -4655,6 +4676,7 @@ async def runTasks():
                 logger.warning("run notification hook failed: %s", type(exc).__name__)
         finally:
             _ACTIVE_RUN_ID = ""
+    return run_status
 
 
 class TaskRunAlreadyInProgress(RuntimeError):

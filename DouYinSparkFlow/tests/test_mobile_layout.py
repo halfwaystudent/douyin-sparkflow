@@ -57,7 +57,7 @@ class MobileLayoutTests(unittest.TestCase):
                         route.fulfill(status=response.status_code, headers=headers, body=response.content)
 
                     page.route("**/*", lambda route: respond(route) if route.request.url.startswith("http://sparkflow.test/") else route.abort())
-                    paths = ("/", "/accounts", "/settings", "/login-workspace", "/ops/send-console", "/setup?step=1", "/setup?step=2", "/setup?step=3", "/setup?step=4") if principal else ("/login", "/register")
+                    paths = ("/", "/accounts", "/settings", "/preferences/streak", "/login-workspace", "/ops/send-console", "/setup?step=1", "/setup?step=2", "/setup?step=3", "/setup?step=4") if principal else ("/login", "/register")
                     if principal and principal["role"] == "admin":
                         paths += ("/settings?_anchor=users", "/settings?_anchor=system", "/settings?_anchor=notify", "/settings?_anchor=registration")
                     for width, height in ((320, 740), (360, 800), (390, 844), (430, 932), (768, 1024), (1280, 800), (844, 390)):

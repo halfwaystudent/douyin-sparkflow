@@ -30,11 +30,8 @@
     {% if has_targets %}<p>已保存发送目标，可以继续。</p>{% endif %}
     {% elif step == 3 %}
     <h2>确认发送安排</h2>
-    {% if window.enabled %}<p>发送窗口：{{ window.startHour }}:00–{{ window.endHour }}:00，每天在窗口内分批发送。</p>{% else %}<p>当前未启用发送窗口，具体安排由管理员设置。</p>{% endif %}
-    {% if is_admin %}
-    <p class="muted">先设置消息内容，再确认每天的发送时间。保存后返回这里继续。</p>
-    <div class="form-actions"><a class="button button-quiet" href="/settings?_anchor=messages">设置消息内容</a><a class="button button-quiet" href="/settings?_anchor=schedule">设置发送时间</a></div>
-    {% else %}<p class="muted">消息内容和发送时间由管理员统一设置；如需调整，请联系管理员。</p>{% endif %}
+    <p class="muted">在“我的续火花”中填写自己的消息、每天开始时间和时区。保存后返回这里继续。</p>
+    <a class="button button-primary" href="/preferences/streak">设置我的时间和内容</a>
     {% else %}
     <h2>设置完成</h2>
     <p>已保存 {{ setup_account.username }} 的账号和目标。可以在“今日”查看进度，在“明细”核对发送结果。</p>

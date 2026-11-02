@@ -2122,13 +2122,20 @@ def _cached(key, producer, ttl=CACHE_TTL_SECONDS):
     return value
 
 
-def get_ops_snapshot(account_refs=None):
+def get_ops_snapshot(account_refs=None, *, include_host_data=True):
     """Collect operational metrics for the dashboard.
 
     Every external call is individually guarded so the dashboard always
     renders, even when Docker or crontab are not available.
     """
     send_console = get_send_console_snapshot(account_refs=account_refs)
+    if account_refs is not None or not include_host_data:
+        return {
+            "send_console": send_console, "task_lock": task_run_lock_status(),
+            "schedule": get_schedule_snapshot(), "daily_schedule": current_daily_schedule(),
+            "compose_root": "", "compose_file": "", "containers": [], "task_containers": [],
+            "schedule_alignment": {}, "recent_triggers": [], "crontab": "", "log_tail": [], "image_present": False,
+        }
     triggers = _cached("recent-triggers", recent_trigger_lines)
     return {
         "compose_root": str(compose_root()),

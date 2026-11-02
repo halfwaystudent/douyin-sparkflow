@@ -614,6 +614,14 @@ def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
 
 
 async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, allow_retry=False):
+    from core import personal_streak
+    if accounts and not all("_personal_scope" in account for account in accounts):
+        groups = personal_streak.account_groups(config, accounts, manual=True)
+        if not groups or any("_personal_scope" in account for _, group in groups for account in group):
+            results = []
+            for effective, group in groups:
+                results.extend(await run_protocol_tasks(effective, group, message_builder, run_id, allow_retry=allow_retry))
+            return results
     del message_builder
 
     dry_run = bool(config.get("protocolDryRun", False))
@@ -624,6 +632,8 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, al
 
     async def _worker(user):
         async with semaphore:
+            if not personal_streak.authorized(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "ownership-changed"}
             start_delay = random.randint(
                 send_strategy["accountStartDelaySecondsMin"],
                 send_strategy["accountStartDelaySecondsMax"],
@@ -684,6 +694,8 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, al
                 send_strategy["messageIntervalSecondsMax"],
                 os.getenv("SPARKFLOW_MANUAL_RUN") == "1",
             )
+            if not personal_streak.authorized(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "ownership-changed"}
             result = await asyncio.to_thread(
                 _run_protocol_for_user,
                 user,

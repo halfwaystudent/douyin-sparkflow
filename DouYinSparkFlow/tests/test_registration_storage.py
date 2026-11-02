@@ -188,9 +188,9 @@ class RegistrationTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertEqual(403, client.post(f"/accounts/111/{action}", data={"csrf_token": token}, follow_redirects=False).status_code)
         with patch("webui.app.run_task_now", return_value=123) as run:
-            client.post("/ops/run-now", data={"csrf_token": token}, follow_redirects=False)
-            self.assertEqual([], run.call_args.kwargs["account_refs"])
-            self.assertFalse(run.call_args.kwargs["force_all"])
+            response = client.post("/ops/run-now", data={"csrf_token": token}, follow_redirects=False)
+            self.assertEqual("/preferences/streak", response.headers["location"])
+            run.assert_not_called()
 
     def test_logout_revokes_a_stolen_cookie_without_logging_out_other_users(self):
         alice = self.fixture.login()

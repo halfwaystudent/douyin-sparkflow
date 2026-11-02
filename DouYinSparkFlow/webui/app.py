@@ -17,7 +17,6 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -102,6 +101,10 @@ from utils.secure_storage import StorageError
 from utils.secure_storage import require_encrypted_files
 from webui import registration
 from webui.registration_routes import register_routes as register_registration_routes
+from webui.login_interaction import register_routes as register_login_interaction_routes
+from webui.personal_streak import register_routes as register_personal_streak_routes
+from webui.personal_streak import schedule_for as personal_schedule_for
+from webui.static_assets import public_assets
 from webui.passkeys import PasskeyStore, login_identity as passkey_identity
 from webui.passkey_routes import register_passkey_routes
 from webui.login_lock import (
@@ -302,7 +305,7 @@ def fetch_login_desktop_asset(asset_path: str, query: str = ""):
         raise RuntimeError(f"login-desktop noVNC proxy failed: {exc}") from exc
 
 
-def call_login_desktop_json(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20):
+def call_login_desktop_json(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20, max_bytes=None):
     """Call the login-desktop API and keep the upstream status and body."""
     url = f"{login_desktop_api_url()}{path}"
     data = None
@@ -313,10 +316,16 @@ def call_login_desktop_json(path: str, *, method: str = "GET", payload: dict | N
     request = urllib.request.Request(url, method=method, data=data, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            raw_body = response.read(max_bytes + 1) if max_bytes else response.read()
+            if max_bytes and len(raw_body) > max_bytes:
+                raise RuntimeError("login-desktop response exceeded its limit")
+            body = raw_body.decode("utf-8", errors="replace")
             status = int(getattr(response, "status", 200))
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        raw_body = exc.read(max_bytes + 1) if max_bytes else exc.read()
+        if max_bytes and len(raw_body) > max_bytes:
+            raise RuntimeError("login-desktop response exceeded its limit")
+        body = raw_body.decode("utf-8", errors="replace")
         status = int(exc.code)
     except (urllib.error.URLError, TimeoutError) as exc:
         reason = getattr(exc, "reason", exc)
@@ -1320,7 +1329,7 @@ def create_app():
     if allowed_hosts:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts, www_redirect=False)
     app.add_middleware(SecurityMiddleware, shared=shared, public_scheme="https" if secure_cookie else None)
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.mount("/static", public_assets(STATIC_DIR), name="static")
     DEBUG_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
     @app.exception_handler(Exception)
@@ -1475,9 +1484,23 @@ def create_app():
             return None
         return list(current.get("account_refs", []))
 
+    async def require_personal_messages(request):
+        current = principal(request)
+        if current.get("role") == "admin":
+            return None
+        from core.personal_streak import preferences
+        profile = await asyncio.to_thread(preferences, current)
+        if not profile.get("messages"):
+            flash(request, "先保存自己的发送内容，再启动发送。", "warning")
+            return redirect("/preferences/streak")
+        return None
+
     def scoped_ops_snapshot(request):
         refs = principal_account_refs(request)
-        snapshot = get_ops_snapshot(account_refs=refs)
+        snapshot = get_ops_snapshot(account_refs=refs, include_host_data=request.url.path in {"/", "/settings"})
+        schedule = personal_schedule_for(principal(request))
+        if schedule:
+            snapshot["schedule"] = schedule
         if refs is not None:
             # Do not place host/container state or global log tails into a
             # normal user's rendered context.
@@ -1491,7 +1514,11 @@ def create_app():
         return snapshot
 
     def scoped_overview_snapshot(request):
-        return get_overview_snapshot(account_refs=principal_account_refs(request))
+        snapshot = get_overview_snapshot(account_refs=principal_account_refs(request))
+        schedule = personal_schedule_for(principal(request))
+        if schedule:
+            snapshot["schedule"] = schedule
+        return snapshot
 
     def flash(request, message, level="info"):
         request.session["flash"] = {"message": message, "level": level}
@@ -1621,7 +1648,7 @@ def create_app():
                 headers={"Cache-Control": "no-store"},
             )
         return JSONResponse(
-            scoped_overview_snapshot(request),
+            await asyncio.to_thread(scoped_overview_snapshot, request),
             headers={"Cache-Control": "no-store"},
         )
 
@@ -1858,21 +1885,21 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
-        return render_template(request, "dashboard.html", console_context(request))
+        return render_template(request, "dashboard.html", await asyncio.to_thread(console_context, request))
 
     @app.get("/accounts", response_class=HTMLResponse)
     async def accounts_page(request: Request):
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
-        return render_template(request, "accounts.html", console_context(request))
+        return render_template(request, "accounts.html", await asyncio.to_thread(console_context, request))
 
     @app.get("/login-workspace", response_class=HTMLResponse)
     async def login_workspace_page(request: Request):
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
-        context = console_context(request)
+        context = await asyncio.to_thread(console_context, request)
         # "Re-login" on the accounts page lands here with the account preselected;
         # only accounts the current user can see are matched.
         relogin = str(request.query_params.get("relogin", "")).strip()
@@ -1891,7 +1918,7 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
-        context = console_context(request, with_admin_data=True)
+        context = await asyncio.to_thread(console_context, request, with_admin_data=True)
         if principal(request)["role"] == "admin":
             context["registration"] = registration.policy()
             context["invitations"] = registration.invitations()
@@ -1913,7 +1940,7 @@ def create_app():
         if maybe_redirect:
             return maybe_redirect
 
-        ops, send_filters = filter_send_console(scoped_ops_snapshot(request), request.query_params)
+        ops, send_filters = filter_send_console(await asyncio.to_thread(scoped_ops_snapshot, request), request.query_params)
         return render_template(
             request,
             "send_console.html",
@@ -3220,6 +3247,9 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        setup_redirect = await require_personal_messages(request)
+        if setup_redirect:
+            return setup_redirect
         refs = principal_account_refs(request)
         pid = run_task_now(force_all=refs is None, account_refs=refs)
         if pid == TASK_ALREADY_RUNNING:
@@ -3240,6 +3270,9 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        setup_redirect = await require_personal_messages(request)
+        if setup_redirect:
+            return setup_redirect
         refs = principal_account_refs(request)
         pid = run_failed_retry_now(account_refs=refs)
         if pid == TASK_ALREADY_RUNNING:
@@ -3260,6 +3293,9 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        setup_redirect = await require_personal_messages(request)
+        if setup_redirect:
+            return setup_redirect
         refs = principal_account_refs(request)
         pid = run_unsent_retry_now(account_refs=refs)
         if pid == TASK_ALREADY_RUNNING:
@@ -3409,7 +3445,7 @@ def create_app():
             promoted = finish_login_transition()
             if promoted:
                 try:
-                    await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={}, timeout=90)
+                    await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={"interaction_key": promoted.get("ticket", "")}, timeout=90)
                 except RuntimeError as exc:
                     logger.error("Failed to open login workspace for queued user: %s", exc)
                     return False, promoted
@@ -3876,7 +3912,10 @@ def create_app():
             return JSONResponse({"ok": True, "state": "queued", "workspace": _workspace_payload(request)}, status_code=202)
         try:
             # Off the event loop: opening takes seconds and must not stall other requests.
-            await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={}, timeout=90)
+            async with login_transition_lock:
+                await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={"interaction_key": result["request"].get("ticket", "")}, timeout=90)
+                if not login_lock_owner(request)[2]:
+                    return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请"}, status_code=423)
             return JSONResponse({"ok": True, "state": "active", "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request)})
         except RuntimeError as exc:
             begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=result["request"].get("ticket", ""), account_ref=account_ref)
@@ -4473,7 +4512,12 @@ def create_app():
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
+    register_login_interaction_routes(
+        app, principal=principal, owner=login_lock_owner, expire=_expire_login_workspace,
+        csrf_valid=validate_csrf, call_desktop=lambda *args, **kwargs: call_login_desktop_json(*args, **kwargs),
+    )
     register_registration_routes(app, render_template, flash, login_throttle, secure_cookie)
+    register_personal_streak_routes(app, principal=principal, csrf_valid=validate_csrf, render=render_template, flash=flash)
     return app
 
 

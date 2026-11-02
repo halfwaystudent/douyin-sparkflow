@@ -309,7 +309,7 @@ class WebUiSafetyTests(unittest.TestCase):
             response = client.post("/login-desktop/open", data={"csrf_token": "test"})
 
         self.assertEqual(200, response.status_code)
-        call_login.assert_called_once_with("/open-login", method="POST", payload={}, timeout=90)
+        call_login.assert_called_once_with("/open-login", method="POST", payload={"interaction_key": response.json()["workspace"]["ticket"]}, timeout=90)
 
     def test_websocket_relay_cleans_up_pending_tasks(self):
         cleaned_up = []

@@ -32,7 +32,7 @@
         }
       })();
     </script>
-    <link rel="stylesheet" href="/static/app.css?v=20261102-1">
+    <link rel="stylesheet" href="/static/app.css?v=20261102-3">
   </head>
   <body data-page="{% block page_key %}dashboard{% endblock %}">
     <div class="shell">
@@ -50,6 +50,7 @@
           <a class="nav-item {% if nav == 'accounts' %}active{% endif %}" href="/accounts"><i data-lucide="users"></i><span>账号</span></a>
           <a class="nav-item {% if nav == 'login_workspace' %}active{% endif %}" href="/login-workspace"><i data-lucide="scan-qr-code"></i><span>登录</span></a>
           <div class="nav-label">{% if is_admin %}管理{% else %}个人{% endif %}</div>
+          <a class="nav-item {% if nav == 'personal_streak' %}active{% endif %}" href="/preferences/streak"><i data-lucide="clock"></i><span>我的续火花</span></a>
           <a class="nav-item {% if nav == 'settings' %}active{% endif %}" href="/settings"><i data-lucide="sliders-horizontal"></i><span>{% if is_admin %}设置{% else %}修改密码{% endif %}</span></a>
           <a class="nav-item" href="/setup"><i data-lucide="route"></i><span>使用引导</span></a>
           {% if is_admin %}
@@ -132,7 +133,7 @@
     </dialog>
 
     <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20261102-1"></script>
+    <script defer src="/static/app.js?v=20261102-3"></script>
     <script defer src="/static/passkeys.js?v=20261102-1"></script>
     <script defer src="/static/auth-forms.js?v=20261102-2"></script>
     {% block scripts %}{% endblock %}

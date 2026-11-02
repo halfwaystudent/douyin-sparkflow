@@ -482,13 +482,19 @@
     });
   };
 
+  let refreshing = false;
+  let refreshController = null;
   const refresh = async () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== "visible" || refreshing) return;
+    refreshing = true;
+    refreshController = new AbortController();
+    const deadline = window.setTimeout(() => refreshController.abort(), 10000);
     try {
       const response = await fetch("/api/ops/overview", {
         credentials: "same-origin",
         headers: { Accept: "application/json" },
         cache: "no-store",
+        signal: refreshController.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       render(await response.json());
@@ -497,7 +503,7 @@
         node.textContent = "更新延迟";
         node.classList.add("poll-stale");
       });
-    }
+    } finally { window.clearTimeout(deadline); refreshing = false; }
   };
 
   document.querySelectorAll("[data-refresh-page]").forEach((button) => {
@@ -508,7 +514,10 @@
   });
   refresh();
   timer = window.setInterval(refresh, 10000);
-  window.addEventListener("pagehide", () => window.clearInterval(timer));
+  window.addEventListener("pagehide", () => {
+    window.clearInterval(timer);
+    if (refreshController) refreshController.abort();
+  });
 })();
 
 (() => {
@@ -584,8 +593,16 @@
     const formData = new FormData();
     formData.set("csrf_token", csrfToken);
     Object.entries(payload).forEach(([key, value]) => formData.set(key, String(value ?? "")));
-    const response = await fetch(url, { method: "POST", body: formData, credentials: "same-origin" });
-    const data = await response.json().catch(() => ({}));
+    const controller = new AbortController();
+    const deadline = window.setTimeout(() => controller.abort(), url.endsWith("/open") ? 90000 : 20000);
+    let response, data;
+    try {
+      response = await fetch(url, { method: "POST", body: formData, credentials: "same-origin", signal: controller.signal });
+      data = await response.json().catch((error) => {
+        if (error.name === "AbortError") throw error;
+        return {};
+      });
+    } finally { window.clearTimeout(deadline); }
     if (!response.ok || data.ok === false) {
       const error = new Error(data.error || `请求失败：${response.status}`);
       // Keep the server's grading (category / categoryLabel / retryable) so
@@ -654,6 +671,8 @@
     const previousState = workspace.state;
     const previousTicket = workspace.ticket;
     workspace = next || { state: "closed", active: false, position: 0, ticket: "" };
+    root.dataset.workspaceTicket = workspace.ticket || "";
+    root.dataset.workspaceActive = workspace.state === "active" && workspace.active ? "1" : "0";
     if (workspace.state === "queued") {
       setStatus(`登录工作区排队中，前面还有 ${Math.max(0, Number(workspace.position || 1) - 1)} 人。`, "warning");
       if (qrStatus) qrStatus.textContent = "排队成功，轮到你后会自动打开登录二维码。";
@@ -884,11 +903,17 @@
     }, delay);
   };
 
+  let statusPolling = false;
   const pollStatus = async () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== "visible" || statusPolling) return;
+    statusPolling = true;
+    const controller = new AbortController();
+    const deadline = window.setTimeout(() => controller.abort(), 10000);
+    const heldTicket = workspace.ticket;
     try {
       const statusUrl = workspace.state === "active" ? "/login-desktop/status" : "/login-desktop/workspace-status";
-      const response = await fetch(statusUrl, { credentials: "same-origin", cache: "no-store" });
+      const response = await fetch(statusUrl, { credentials: "same-origin", cache: "no-store", signal: controller.signal });
+      if (heldTicket !== workspace.ticket) return;
       if (response.status === 423) {
         // The lease is not held by this session any more. Showing "check the
         // login-desktop service" here pointed operators at a container that was
@@ -903,11 +928,14 @@
         return;
       }
       if (response.status === 401) {
+        renderWorkspace({ state: "closed", active: false, position: 0, ticket: "" });
+        closeFrame();
         setRecoverVisible(false);
         setStatus("登录状态已失效，请重新登录控制台。", "danger");
         return;
       }
       const data = await response.json();
+      if (heldTicket !== workspace.ticket) return;
       if (!response.ok || data.ok === false) {
         setStatus(data.error || "登录工作区暂时不可用，请稍后重试。", "danger");
         return;
@@ -930,8 +958,8 @@
         closeFrame();
       }
     } catch (error) {
-      setStatus(`状态检查失败：${error.message}`, "danger");
-    }
+      if (heldTicket === workspace.ticket) setStatus(error.name === "AbortError" ? "状态检查响应较慢，将自动重试。" : `状态检查失败：${error.message}`, "warning");
+    } finally { window.clearTimeout(deadline); statusPolling = false; }
   };
 
   const heartbeat = async () => {
@@ -944,7 +972,7 @@
         recoverLease();
         return;
       }
-      workspace = { state: "closed", active: false, position: 0, ticket: "" };
+      renderWorkspace({ state: "closed", active: false, position: 0, ticket: "" });
       closeFrame();
       setStatus(`登录工作区已释放：${error.message}`, "danger");
     }
@@ -1359,6 +1387,8 @@
     window.clearTimeout(recoveryTimer);
     recoveryTimer = null;
     workspace = { state: "closed", active: false, position: 0, ticket: "" };
+    root.dataset.workspaceTicket = "";
+    root.dataset.workspaceActive = "0";
     qrPollStartedAt = 0;
     lastPromotedTicket = "";
     closeFrame();
@@ -1407,6 +1437,7 @@
       recoverLease();
     });
   });
+  root.addEventListener("login-interaction-lease-lost", () => recoverLease());
 
   if (section) section.addEventListener("toggle", () => { if (section.open) pollStatus(); });
   pollStatus();
@@ -1441,7 +1472,7 @@
   };
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
-      hiddenReleaseTimer = window.setTimeout(releaseWorkspace, 15000);
+      hiddenReleaseTimer = window.setTimeout(releaseWorkspace, 120000);
     } else if (hiddenReleaseTimer) {
       window.clearTimeout(hiddenReleaseTimer);
       hiddenReleaseTimer = null;

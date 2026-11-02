@@ -98,6 +98,7 @@ class RedesignedPagesTests(unittest.TestCase):
                                  "messageIntervalSecondsMin": 45, "messageIntervalSecondsMax": 150},
             }),
             patch.object(app_module, "get_web_users", return_value=[]),
+            patch("core.personal_streak.preferences", return_value={"enabled": False, "time": "18:00", "timezone": "Asia/Shanghai", "messages": [], "next_run_at": ""}),
         ]
         for item in patches:
             item.start()

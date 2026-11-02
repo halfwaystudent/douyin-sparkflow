@@ -119,7 +119,7 @@
           <em data-overview-value="nextTriggerHint"></em>
         </div>
         <div class="fact">
-          <small>发送窗口</small>
+          <small>发送安排</small>
           <strong data-overview-value="scheduleLabel">{{ ops.schedule.label or "-" }}</strong>
           <em>{{ summary.enabled_accounts }} 个启用账号</em>
         </div>
@@ -205,8 +205,11 @@
   {% set service_rows = (ops.containers or [])|selectattr("Names", "in", ["douyin-web", "douyin-scheduler", "login-desktop", "mihomo"])|list %}
   <div class="grid-2" style="margin-top: 16px">
     <div class="card">
-      <h3 class="card-title"><i data-lucide="clock-3"></i>今日发送窗口</h3>
-      {% if window_state.enabled %}
+      <h3 class="card-title"><i data-lucide="clock-3"></i>发送安排</h3>
+      {% if ops.schedule.personal %}
+      <p>{{ ops.schedule.label }}{% if not ops.schedule.enabled %} · 自动发送已暂停{% endif %}</p>
+      <a class="button button-quiet" href="/preferences/streak">修改我的时间和内容</a>
+      {% elif window_state.enabled %}
       <p>{{ "%02d"|format(window_state.startHour) }}:00 – {{ "%02d"|format(window_state.endHour) }}:00 之间按计划分批发送，窗口结束后兜底补发未成功的目标。</p>
       <div class="timeline" aria-hidden="true">
         {% for hour in range(window_state.startHour, window_state.endHour) %}
@@ -220,6 +223,7 @@
       {% else %}
       <p>当前是固定时间发送：{{ ops.schedule.label or "未配置" }}。</p>
       {% endif %}
+      {% if not ops.schedule.personal %}<a class="button button-quiet" href="/preferences/streak">设置我的续火花</a>{% endif %}
     </div>
     <div class="card">
       {% if service_rows %}
