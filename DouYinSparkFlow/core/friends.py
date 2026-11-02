@@ -448,9 +448,11 @@ async def _fetch_account_friends_once(
         # browser identity as the sender instead of a throwaway cookie context.
         # The per-account lock is the same one the sender takes, so a send run
         # that starts mid-refresh waits instead of fighting over the profile.
-        profile_config = normalize_persistent_profile_config(
-            get_config(force_reload=True) or {}
-        )
+        fresh_login = auth_only and account.get("_fresh_login_verification") is True
+        if fresh_login:
+            profile_config = {"enabled": False}
+        else:
+            profile_config = normalize_persistent_profile_config(get_config(force_reload=True) or {})
         if profile_config["enabled"]:
             lock_handle, lock_path, lock_token = await acquire_browser_account_lock(
                 account, account_name
@@ -474,7 +476,12 @@ async def _fetch_account_friends_once(
                     await context.add_cookies(cookies)
         else:
             playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
-            context = await browser.new_context()
+            if fresh_login:
+                # Pasted credentials have no stable account profile yet. Never
+                # seed the check from a previous caller's "unknown" profile.
+                context = await browser.new_context(service_workers="block", accept_downloads=False)
+            else:
+                context = await browser.new_context()
             await context.add_cookies(cookies)
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)

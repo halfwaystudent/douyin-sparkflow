@@ -17,6 +17,7 @@
     {% if next_personal_run %}<p>下一次安排：<strong>{{ next_personal_run }}</strong>（{{ preferences.timezone }}）</p>{% endif %}
     <button class="button button-primary" type="submit">保存我的设置</button>
   </form>
+  {% if request.session.get('setup_in_progress') %}<a class="button button-quiet" href="/setup">返回引导，检查下一步</a>{% endif %}
 </section>
 <script>
 (() => {

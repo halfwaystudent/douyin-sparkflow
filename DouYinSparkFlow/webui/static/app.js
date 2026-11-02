@@ -558,6 +558,73 @@
   // (each one performs a page operation on the shared Douyin login page).
   const RECOVER_BUDGET = 2;
   let workspace = { state: "closed", active: false, position: 0, ticket: "" };
+  let workspaceVersion = 0;
+  let bindingBusy = false;
+  let bindingNeedsReview = false;
+  const requestedRelogin = document.querySelector(".login-desktop-open[data-relogin-unique-id]")?.dataset.reloginUniqueId || "";
+  const workspaceRequest = () => requestedRelogin ? { mode: "relogin", relogin_unique_id: requestedRelogin } : { mode: "add" };
+  const bindingResult = document.querySelector("[data-binding-result]");
+  let bindingResultVersion = 0;
+  const setBindingBusy = (busy, { uncertain = false } = {}) => {
+    bindingBusy = busy;
+    bindingNeedsReview = bindingNeedsReview || uncertain;
+    document.querySelectorAll(".login-desktop-open, .login-desktop-save, [data-cookie-login-submit], [data-refresh-login-qr], .login-desktop-close, .login-desktop-reset").forEach((button) => {
+      button.disabled = bindingBusy || bindingNeedsReview;
+    });
+  };
+  const showBindingResult = (account, message, { pending = false, uncertain = false } = {}) => {
+    if (!bindingResult) return;
+    bindingResult.hidden = false;
+    bindingResult.querySelector("[data-binding-result-title]").textContent = uncertain ? "保存结果待核对" : pending ? "账号已保存，登录待确认" : "账号已保存";
+    bindingResult.querySelector("[data-binding-result-message]").textContent = message;
+    const next = bindingResult.querySelector("[data-binding-next]");
+    const ref = account?.account_ref || "";
+    const id = account?.unique_id || "";
+    next.href = !uncertain && ref && root.dataset.setupInProgress === "1"
+      ? `/setup?account=${encodeURIComponent(ref)}`
+      : id ? `/accounts?_anchor=account-${encodeURIComponent(id)}` : "/accounts";
+    next.textContent = uncertain ? "先核对账号，再决定是否重试" : root.dataset.setupInProgress === "1" ? "继续设置" : "选择好友和群";
+    bindingResult.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
+  const followBindingVerification = async (account) => {
+    const version = ++bindingResultVersion;
+    if (!account?.account_ref) return;
+    for (let attempt = 0; attempt < 36; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 5000));
+      if (version !== bindingResultVersion) return;
+      if (document.visibilityState !== "visible") continue;
+      const controller = new AbortController();
+      const deadline = window.setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(`/accounts/binding-status?account_ref=${encodeURIComponent(account.account_ref)}`, {
+          credentials: "same-origin", cache: "no-store", signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (version !== bindingResultVersion) return;
+        const current = (data.accounts || []).find((row) => row.account_ref === account.account_ref);
+        if (!current) {
+          showBindingResult(null, "账号已移除或权限已变化，请重新打开账号页核对。", { uncertain: true });
+          return;
+        }
+        if (account.login_generation && account.login_generation !== current.login_generation) {
+          showBindingResult(current, "这个账号的登录已在另一操作中更新，请到账号页查看最新核验结果。", { pending: true });
+          return;
+        }
+        const state = current.verification?.state || "verified";
+        if (state === "verifying") continue;
+        const reason = current.verification?.reason || "";
+        const message = state === "verified" && current.identity_state === "verified"
+          ? `账号 ${current.username} 的登录验证已通过，可以继续选择目标。`
+          : state === "login_required" || state === "identity_conflict" || current.identity_state === "conflict"
+            ? `账号需要重新登录。${reason}`
+            : `账号身份已保存，暂时未能确认登录状态。${reason} 可以先配置目标和消息，并在账号页核对后续结果。`;
+        showBindingResult(current, message, { pending: state !== "verified" || current.identity_state !== "verified" });
+        return;
+      } catch { /* Keep the saved result and its account link visible. */ }
+      finally { window.clearTimeout(deadline); }
+    }
+  };
   if (displayMode === "native" && copyLoginUrlButton) copyLoginUrlButton.hidden = true;
   if (displayMode === "native" && frameWrap) frameWrap.hidden = true;
   // "显示本机登录浏览器" only makes sense for the Windows native mode; in the
@@ -594,20 +661,34 @@
     formData.set("csrf_token", csrfToken);
     Object.entries(payload).forEach(([key, value]) => formData.set(key, String(value ?? "")));
     const controller = new AbortController();
-    const deadline = window.setTimeout(() => controller.abort(), url.endsWith("/open") ? 90000 : 20000);
+    const binding = url === "/login-desktop/save" || url === "/accounts/cookies";
+    const timeout = url === "/accounts/cookies" ? 210000 : url === "/login-desktop/save" ? 120000 : url.endsWith("/open") ? 100000 : 20000;
+    const deadline = window.setTimeout(() => controller.abort(), timeout);
     let response, data;
     try {
       response = await fetch(url, { method: "POST", body: formData, credentials: "same-origin", signal: controller.signal });
       data = await response.json().catch((error) => {
         if (error.name === "AbortError") throw error;
+        if (binding) throw error;
         return {};
       });
+    } catch (error) {
+      if (binding) {
+        const uncertain = new Error("请求没有返回完整结果，服务器可能仍在保存。请先核对账号，不要重复提交。");
+        uncertain.bindingUncertain = true;
+        throw uncertain;
+      }
+      throw error;
     } finally { window.clearTimeout(deadline); }
     if (!response.ok || data.ok === false) {
       const error = new Error(data.error || `请求失败：${response.status}`);
       // Keep the server's grading (category / categoryLabel / retryable) so
       // callers can render an actionable message instead of a bare string.
       error.payload = data;
+      if (binding && response.status >= 500 && data.binding_pending !== false) {
+        error.bindingUncertain = true;
+        error.message = "服务器没有返回确定的保存结果，请先到账号页核对，暂时不要重复提交。";
+      }
       // 423 is the lease gate: this session no longer holds the login
       // workspace, which callers must recover from instead of reporting the
       // login-desktop service as broken.
@@ -671,6 +752,7 @@
     const previousState = workspace.state;
     const previousTicket = workspace.ticket;
     workspace = next || { state: "closed", active: false, position: 0, ticket: "" };
+    if (workspace.state !== previousState || workspace.ticket !== previousTicket) workspaceVersion += 1;
     root.dataset.workspaceTicket = workspace.ticket || "";
     root.dataset.workspaceActive = workspace.state === "active" && workspace.active ? "1" : "0";
     if (workspace.state === "queued") {
@@ -962,34 +1044,37 @@
     } finally { window.clearTimeout(deadline); statusPolling = false; }
   };
 
+  let heartbeatPending = false;
   const heartbeat = async () => {
-    if (workspace.state !== "active" || !workspace.active || !workspace.ticket) return;
+    if (heartbeatPending || workspace.state !== "active" || !workspace.active || !workspace.ticket) return;
+    const heldTicket = workspace.ticket;
+    const version = workspaceVersion;
+    heartbeatPending = true;
     try {
-      const data = await postForm("/login-desktop/heartbeat", { ticket: workspace.ticket });
+      const data = await postForm("/login-desktop/heartbeat", { ticket: heldTicket });
+      if (heldTicket !== workspace.ticket || version !== workspaceVersion) return;
       renderWorkspace(data.workspace);
     } catch (error) {
+      if (heldTicket !== workspace.ticket || version !== workspaceVersion) return;
       if (error.payload && error.payload.leaseLost) {
         recoverLease();
         return;
       }
-      renderWorkspace({ state: "closed", active: false, position: 0, ticket: "" });
-      closeFrame();
-      setStatus(`登录工作区已释放：${error.message}`, "danger");
-    }
+      setStatus("工作区续期暂未收到回应，正在核对状态；请先保留当前页面。", "warning");
+      pollStatus();
+    } finally { heartbeatPending = false; }
   };
 
   document.querySelectorAll(".login-desktop-open").forEach((button) => {
     button.addEventListener("click", async () => {
+      if (bindingBusy || bindingNeedsReview) return;
+      bindingResultVersion += 1;
+      if (bindingResult) bindingResult.hidden = true;
       if (section) section.open = true;
       startOpening();
       try {
         resetRecoveryBudget();
-        const reloginUniqueId = button.dataset.reloginUniqueId || "";
-        const mode = button.dataset.loginMode || (reloginUniqueId ? "relogin" : "add");
-        const data = await postForm("/login-desktop/open", {
-          mode,
-          ...(reloginUniqueId ? { relogin_unique_id: reloginUniqueId } : {}),
-        });
+        const data = await postForm("/login-desktop/open", workspaceRequest());
         const promotedBefore = lastPromotedTicket;
         renderWorkspace(data.workspace);
         if (data.state === "queued") {
@@ -1077,6 +1162,7 @@
 
   document.querySelectorAll("[data-refresh-login-qr]").forEach((button) => {
     button.addEventListener("click", async () => {
+      if (bindingBusy || bindingNeedsReview) return;
       button.disabled = true;
       try {
         resetRecoveryBudget();
@@ -1103,12 +1189,13 @@
     });
 
     submit?.addEventListener("click", async () => {
+      if (bindingBusy || bindingNeedsReview) return;
       const cookieInput = String(input?.value || "").trim();
       if (!cookieInput) {
         if (status) status.textContent = "请先粘贴 Cookie 内容。";
         return;
       }
-      submit.disabled = true;
+      setBindingBusy(true);
       const previousLabel = status ? status.textContent : "";
       if (status) status.textContent = "正在验证 Cookie 并登录，请稍候...";
       try {
@@ -1129,10 +1216,17 @@
           }
           data = await postForm("/accounts/cookies", { ...cookiePayload, confirm_identity: info.token });
         }
-        if (status) status.textContent = data.message || "Cookie 登录成功，页面即将刷新。";
+        if (status) status.textContent = data.message || "Cookie 登录成功，请继续设置发送目标。";
         if (input) input.value = "";
-        window.setTimeout(() => window.location.reload(), 900);
+        showBindingResult(data.account, data.message || "账号身份和登录状态已核验，可以继续配置发送目标。");
       } catch (error) {
+        if (error.bindingUncertain) {
+          setBindingBusy(false, { uncertain: true });
+          if (input) input.value = "";
+          if (status) status.textContent = error.message;
+          showBindingResult(null, error.message, { uncertain: true });
+          return;
+        }
         // The server already grades the failure (category / retryable), so the
         // operator can tell "pasted the wrong thing" from "the session is gone"
         // from "the service hiccuped" instead of guessing.
@@ -1148,7 +1242,7 @@
             : `Cookie 登录失败${label}：${error.message}${retryHint}`;
         }
       } finally {
-        submit.disabled = false;
+        setBindingBusy(false);
       }
     });
   });
@@ -1160,6 +1254,7 @@
   const setSaving = (saving, { keepDisabled = false } = {}) => {
     window.clearInterval(savingTimer);
     savingTimer = null;
+    setBindingBusy(saving);
     document.querySelectorAll(".login-desktop-save").forEach((item) => {
       item.disabled = saving || keepDisabled;
     });
@@ -1176,9 +1271,15 @@
   };
   document.querySelectorAll(".login-desktop-save").forEach((button) => {
     button.addEventListener("click", async () => {
-      if (button.disabled) return;
+      if (button.disabled || bindingBusy || bindingNeedsReview) return;
+      const saveTicket = workspace.ticket;
+      if (!saveTicket) {
+        setStatus("请先申请自己的登录工作区，完成登录后再保存。", "warning");
+        return;
+      }
       const postSave = (extra = {}) =>
         postForm("/login-desktop/save", {
+          ticket: saveTicket,
           relogin_unique_id: button.dataset.reloginUniqueId || "",
           ...extra,
         });
@@ -1246,7 +1347,7 @@
             "danger",
           );
           closeFrame();
-          window.setTimeout(() => window.location.reload(), 1500);
+          showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true });
           return;
         }
         // A login save starts a friend refresh; when it could not start, say why
@@ -1268,9 +1369,16 @@
           data.verification === "pending" || data.friend_refresh === "started" ? "success" : "warning",
         );
         closeFrame();
-        window.setTimeout(() => window.location.reload(), 800);
+        showBindingResult(data.account, `已保存账号 ${data.account?.username || ""}${refreshNote}。接下来选择好友或群，再设置自己的发送内容。`, { pending: data.verification === "pending" });
+        if (data.verification === "pending") followBindingVerification(data.account);
       } catch (error) {
-        setSaving(false);
+        setSaving(false, { keepDisabled: Boolean(error.bindingUncertain) });
+        if (error.bindingUncertain) {
+          setBindingBusy(false, { uncertain: true });
+          setStatus(error.message, "warning");
+          showBindingResult(null, error.message, { uncertain: true });
+          return;
+        }
         if (error.payload && error.payload.leaseLost) {
           // The workspace moved on while the operator was finishing the scan;
           // report the real condition instead of a generic save failure.
@@ -1348,10 +1456,11 @@
     if (pollQr && data.state !== "queued" && workspace.active) refreshLoginQr(500);
   };
   const acquireWorkspace = async () => {
+    if (bindingBusy || bindingNeedsReview) return;
     const wasAcquiring = acquiringWorkspace;
     acquiringWorkspace = true;
     try {
-      const data = await postForm("/login-desktop/open", { mode: "add" });
+      const data = await postForm("/login-desktop/open", workspaceRequest());
       // A fresh grant cancels any pending re-acquisition: without this the timer
       // armed during recovery still fires and reloads the shared login page.
       window.clearTimeout(recoveryTimer);
@@ -1379,6 +1488,7 @@
     recoveringLease = false;
   };
   const recoverLease = ({ acquire = true } = {}) => {
+    if (bindingBusy || bindingNeedsReview) return;
     // The status poll calls back into this function when the workspace is not
     // ours, so a server that keeps contradicting itself must not recurse here.
     if (recoveringLease) return;
@@ -1479,6 +1589,7 @@
     }
   });
   window.addEventListener("pagehide", () => {
+    bindingResultVersion += 1;
     window.clearInterval(timer);
     window.clearInterval(heartbeatTimer);
     window.clearInterval(countdownTimer);

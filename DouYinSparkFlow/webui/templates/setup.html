@@ -10,10 +10,19 @@
     {% endfor %}
   </ol>
   <section class="card form-stack">
+    {% if setup_blocked_reason %}<p class="notice-inline">{{ setup_blocked_reason }}</p>{% endif %}
+    {% if login_pending %}<p class="notice-inline">{% if login_verification_state == 'verifying' %}账号身份已绑定，登录状态正在核验。{% else %}账号身份已绑定，暂时未能确认登录状态。{% endif %}可以先配置目标和消息；这不代表登录验证已经通过。{% if login_reason %} {{ login_reason }}{% endif %}</p>{% endif %}
     {% if step == 1 %}
     <h2>先登录你的抖音账号</h2>
     <p class="muted">打开登录工作区，扫码或粘贴 Cookie，核对账号后保存。多人同时登录时会依次排队。</p>
     <a class="button button-primary" href="/login-workspace">打开登录工作区</a>
+    {% if accounts %}
+    <form method="get" action="/setup" class="form-stack">
+      <input type="hidden" name="step" value="1">
+      <label class="field"><span>选择已有账号</span><select name="account">{% for account in accounts %}<option value="{{ account.account_ref }}" {% if setup_account and account.account_ref == setup_account.account_ref %}selected{% endif %}>{{ account.username }}</option>{% endfor %}</select></label>
+      <button class="button button-quiet" type="submit">检查这个账号</button>
+    </form>
+    {% endif %}
     {% if ready %}<p>已保存：{{ setup_account.username }}</p>{% endif %}
     {% elif step == 2 %}
     <h2>选择需要续火花的人</h2>
@@ -33,17 +42,18 @@
     <p class="muted">在“我的续火花”中填写自己的消息、每天开始时间和时区。保存后返回这里继续。</p>
     <a class="button button-primary" href="/preferences/streak">设置我的时间和内容</a>
     {% else %}
-    <h2>设置完成</h2>
+    <h2>{% if login_pending %}配置已保存，登录待确认{% else %}设置完成{% endif %}</h2>
     <p>已保存 {{ setup_account.username }} 的账号和目标。可以在“今日”查看进度，在“明细”核对发送结果。</p>
-    <p class="muted">完成引导不会立即发送消息；自动任务按保存的发送安排运行。</p>
+    <p class="muted">完成引导不会立即发送消息。{% if not automatic_enabled %}自动发送已暂停，需要时可以手动发送。{% elif login_pending %}自动任务仍会按运行时检查决定是否发送，请继续核对登录状态。{% else %}自动任务按保存的发送安排运行，发送前仍会检查账号状态。{% endif %}</p>
+    {% if login_pending %}<a class="button button-quiet" href="/accounts?_anchor=account-{{ setup_account.unique_id }}">查看账号核验结果</a>{% endif %}
     {% if passkeys_enabled %}<a class="button button-quiet" href="/settings?_anchor=passkeys">绑定通行密钥，下次用设备验证登录</a>{% endif %}
     {% endif %}
     <div class="form-actions">
       {% if step > 1 %}<a class="button button-quiet" href="/setup?step={{ step - 1 }}&account={{ setup_account.account_ref }}">上一步</a>{% endif %}
       {% if step < 4 %}
-        {% if (step == 1 and ready) or (step == 2 and has_targets) or step == 3 %}<a class="button button-primary" href="/setup?step={{ step + 1 }}&account={{ setup_account.account_ref }}">下一步</a>{% else %}<a class="button button-quiet" href="/setup?step={{ step }}">已保存，重新检查</a>{% endif %}
+        {% if (step == 1 and ready) or (step == 2 and has_targets) or (step == 3 and has_messages) %}<a class="button button-primary" href="/setup?step={{ step + 1 }}&account={{ setup_account.account_ref }}">下一步</a>{% else %}<a class="button button-quiet" href="/setup?step={{ step }}">已保存，重新检查</a>{% endif %}
       {% else %}
-      <form method="post" action="/setup/finish"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-primary" type="submit">完成，查看今日进度</button></form>
+      <form method="post" action="/setup/finish"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-primary" type="submit">{% if login_pending %}返回今日，稍后查看核验{% else %}完成，查看今日进度{% endif %}</button></form>
       {% endif %}
     </div>
   </section>

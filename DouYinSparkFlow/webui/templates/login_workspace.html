@@ -35,6 +35,15 @@
 </div>
 {% endif %}
 
+<section class="card form-stack" data-binding-result hidden aria-live="polite" aria-atomic="true">
+  <h2 data-binding-result-title>绑定结果</h2>
+  <p data-binding-result-message></p>
+  <div class="form-actions">
+    <a class="button button-primary" href="/accounts" data-binding-next>查看账号</a>
+    <a class="button button-quiet" href="/preferences/streak">设置我的时间和内容</a>
+  </div>
+</section>
+
 <section
   id="interactive-login-section"
   class="login-layout"
@@ -45,6 +54,7 @@
     data-public-url="{{ login_desktop_public_url }}"
     data-display-mode="{{ login_desktop_display_mode }}"
     data-csrf-token="{{ csrf_token }}"
+    data-setup-in-progress="{{ '1' if request.session.get('setup_in_progress') else '0' }}"
   >
     <div class="card qr-card">
       <h3 class="card-title"><i data-lucide="smartphone"></i>用抖音 App 扫码</h3>

@@ -843,8 +843,7 @@ class WebCookieLoginEndpointTests(unittest.TestCase):
         self.assertEqual("created", body["action"])
         self.assertNotIn("secret-value", response.text)
         update_user.assert_called_once()
-        clear_state.assert_called_once()
-        self.assertEqual("/clear-login-state", clear_state.call_args.args[0])
+        clear_state.assert_not_called()
         login_result = save.call_args.args[0]
         self.assertEqual("pasted", login_result["cookie_source"])
         self.assertEqual(ACCOUNT_ID, save.call_args.kwargs["identity"]["uid"])

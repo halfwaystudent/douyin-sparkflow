@@ -836,12 +836,43 @@ class LoginDesktopManager:
             "url": payload["url"],
         }
 
-    async def export(self):
+    async def export(self, *, interaction_key=""):
+        # A browser opened for a shared workspace must never be exported by an
+        # older request, including one that waited behind another page action.
+        keyed = bool(interaction_key or self.interaction.token)
+        def check_key(page=None):
+            if (keyed and not self.interaction.owns(interaction_key)) or (not keyed and self.interaction.token):
+                raise InteractionError("登录工作区已释放，请重新申请", 423)
+            if keyed and page is not None:
+                self.interaction.check(interaction_key, page)
+
+        check_key()
         self.mark_activity()
-        page = await self._get_active_page()
-        result = await collect_login_result(page, self.context, timeout_ms=5000)
-        self.schedule_stop_after_export()
-        return result
+        try:
+            await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
+        except asyncio.TimeoutError as exc:
+            raise InteractionError("登录页正在处理上一个操作，请稍后保存", 503) from exc
+        try:
+            check_key()
+            page = await self._get_active_page()
+            check_key(page)
+            context = self.context
+            try:
+                result = await collect_login_result(page, context, timeout_ms=5000)
+            except InteractionError:
+                raise
+            except Exception:
+                check_key(page)
+                try:
+                    result = await collect_www_login_result(page, context)
+                except Exception as exc:
+                    check_key(page)
+                    raise RuntimeError("无法读取已登录账号，请确认登录已完成后重试") from exc
+            check_key(page)
+            self.schedule_stop_after_export()
+            return result
+        finally:
+            self._page_operation_lock.release()
 
 
 def _clean_www_display_name(value):
@@ -1123,15 +1154,24 @@ async def refresh_qr():
 
 
 @app.post("/export")
-async def export():
-    page = await manager._get_active_page()
+async def export(request: Request):
     try:
-        result = await manager.export()
-    except Exception as creator_exc:
-        try:
-            result = await collect_www_login_result(page, manager.context)
-        except Exception as www_exc:
-            raise HTTPException(status_code=400, detail=f"creator export failed: {creator_exc}; www export failed: {www_exc}")
+        body = await request.body()
+        if len(body) > 1024:
+            return JSONResponse({"ok": False, "error": "请求过大"}, status_code=413)
+        payload = await request.json() if body else {}
+        if not isinstance(payload, dict) or set(payload) - {"interaction_key"}:
+            raise ValueError
+        key = payload.get("interaction_key", "")
+        if not isinstance(key, str):
+            raise ValueError
+        result = await manager.export(interaction_key=key)
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "登录工作区凭据格式无效"}, status_code=400)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "result": result}
 
 

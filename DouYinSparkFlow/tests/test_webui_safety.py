@@ -489,10 +489,11 @@ class WebUiSafetyTests(unittest.TestCase):
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
         start = script.index('document.querySelectorAll(".login-desktop-save").forEach((button) =>')
         block = script[start:script.index('document.querySelectorAll(".login-desktop-close")', start)]
-        self.assertIn("if (button.disabled) return;", block)
+        self.assertIn("if (button.disabled || bindingBusy || bindingNeedsReview) return;", block)
         self.assertLess(block.index("setSaving(true);"), block.index("try {"))
         catch = block[block.rindex("} catch (error) {"):]
-        self.assertIn("setSaving(false);", catch)
+        self.assertIn("setSaving(false, { keepDisabled: Boolean(error.bindingUncertain) });", catch)
+        self.assertIn("showBindingResult(null, error.message, { uncertain: true });", catch)
         # Every early return before the result must end the busy state too.
         duplicates = block[block.index("if (candidates.length > 1) {"):block.index("const update = window.confirm(")]
         self.assertGreaterEqual(duplicates.count("setSaving(false);"), 2)
@@ -507,8 +508,10 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertLess(countdown.index("if (statusHeld()) return;"), countdown.index("setStatus("))
         poll = script[script.index("const pollStatus = async"):script.index("const heartbeat = async")]
         self.assertLess(poll.index("if (statusHeld())"), poll.index("当前浏览器已登录"))
-        # After a successful save the page reloads; the buttons stay disabled.
+        # A saved login keeps its result and next step visible, without a reload.
         self.assertIn("setSaving(false, { keepDisabled: true });", block)
+        self.assertIn("showBindingResult(data.account", block)
+        self.assertNotIn("window.location.reload()", block)
 
     def test_save_and_close_do_not_wait_for_the_next_workspace(self):
         source = Path(app_module.__file__).read_text(encoding="utf-8")
@@ -528,7 +531,7 @@ class WebUiSafetyTests(unittest.TestCase):
         # answer at once and the button must not invite a second open.
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
         # The click handler, not startOpening(), which also walks these buttons.
-        block_start = script.index('button.addEventListener("click", async () => {\n      if (section) section.open = true;')
+        block_start = script.index('document.querySelectorAll(".login-desktop-open").forEach((button) => {', script.index("const heartbeat = async"))
         block = script[block_start:script.index('document.querySelectorAll("[data-focus-native-browser]")', block_start)]
         self.assertLess(block.index("startOpening()"), block.index('postForm("/login-desktop/open"'))
         self.assertGreaterEqual(block.count("stopOpening()"), 2)  # queued and failure
@@ -546,7 +549,7 @@ class WebUiSafetyTests(unittest.TestCase):
         # again in the click handler reconnected noVNC mid-handshake.
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
         # The click handler, not startOpening(), which also walks these buttons.
-        block_start = script.index('button.addEventListener("click", async () => {\n      if (section) section.open = true;')
+        block_start = script.index('document.querySelectorAll(".login-desktop-open").forEach((button) => {', script.index("const heartbeat = async"))
         block = script[block_start:script.index('document.querySelectorAll("[data-focus-native-browser]")', block_start)]
         guard = block.index("if (lastPromotedTicket === promotedBefore) {")
         self.assertLess(guard, block.index("loadFrame(true)"))

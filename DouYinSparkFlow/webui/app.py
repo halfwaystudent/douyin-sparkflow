@@ -105,6 +105,8 @@ from webui.login_interaction import register_routes as register_login_interactio
 from webui.personal_streak import register_routes as register_personal_streak_routes
 from webui.personal_streak import schedule_for as personal_schedule_for
 from webui.static_assets import public_assets
+from webui.account_binding import BindingCommitError, commit_login_binding, capture_login_before_write
+from webui.account_binding import register_routes as register_account_binding_routes
 from webui.passkeys import PasskeyStore, login_identity as passkey_identity
 from webui.passkey_routes import register_passkey_routes
 from webui.login_lock import (
@@ -1019,6 +1021,7 @@ def save_exported_login_result(
 
     def update_row(target, accounts, method, confirmed_by=""):
         authorize_save(target, accounts)
+        capture_login_before_write(target)
         target["username"] = username
         target["cookies"] = cookies
         if display_id:
@@ -1065,6 +1068,7 @@ def save_exported_login_result(
         account_identity.bind_identity(account, identity, account_identity.BINDING_NEW)
         account[account_identity.FIELD_LOGIN_GENERATION] = login_generation
         apply_health(account)
+        capture_login_before_write(None)
         accounts.append(account)
         return dict(account)
 
@@ -1118,6 +1122,9 @@ def save_exported_login_result(
     return account, action
 
 
+COOKIE_LOGIN_VERIFICATION_TIMEOUT_SECONDS = 180
+
+
 async def verify_login_result(login_result, *, relogin_account_ref="", relogin_unique_id=""):
     """Verify a pasted login result: usable login state, then trusted identity.
 
@@ -1142,29 +1149,36 @@ async def verify_login_result(login_result, *, relogin_account_ref="", relogin_u
         "unique_id": "",
         "username": identity["username"],
         "account_ref": relogin_account_ref,
+        "_fresh_login_verification": True,
     }
-    try:
-        result = await verify_account_session(account, auth_only=True)
-    except FriendRefreshError as exc:
-        return False, str(exc), identity, exc.category or CATEGORY_LOGIN_REQUIRED
-    except Exception as exc:  # noqa: BLE001 - report any verification failure
-        logger.warning("Login verification failed unexpectedly: %s", exc)
-        return False, f"登录态验证失败：{exc}", identity, CATEGORY_LOGIN_REQUIRED
 
-    resolved = dict(result.get("identity") or {})
-    identity["display_id"] = account_identity.display_id_from_text(
-        resolved.get("display_id") or resolved.get("unique_id") or ""
-    )
-    identity["username"] = str(resolved.get("username") or identity["username"]).strip()
-    try:
+    async def verify_candidate():
+        result = await verify_account_session(account, auth_only=True)
+        resolved = dict(result.get("identity") or {})
+        identity["display_id"] = account_identity.display_id_from_text(
+            resolved.get("display_id") or resolved.get("unique_id") or ""
+        )
+        identity["username"] = str(resolved.get("username") or identity["username"]).strip()
         trusted = await asyncio.to_thread(account_identity.fetch_trusted_identity, cookies)
+        identity["trusted"] = trusted
+        identity["unique_id"] = trusted["uid"]
+        return True, "", identity, ""
+
+    try:
+        return await asyncio.wait_for(verify_candidate(), timeout=COOKIE_LOGIN_VERIFICATION_TIMEOUT_SECONDS)
+    except FriendRefreshError as exc:
+        return False, str(exc), identity, exc.category or CATEGORY_STRUCTURE_CHANGED
     except account_identity.IdentityUnavailable as exc:
         # The login works but who it belongs to is unknown: retry later, do not
         # create or overwrite an account and do not call it a logout.
         return False, str(exc), identity, account_identity.CATEGORY_IDENTITY_UNVERIFIED
-    identity["trusted"] = trusted
-    identity["unique_id"] = trusted["uid"]
-    return True, "", identity, ""
+    except (asyncio.TimeoutError, TimeoutError):
+        return False, "验证登录态超时，未保存本次登录，请稍后重试", identity, CATEGORY_NETWORK_UNAVAILABLE
+    except OSError:
+        return False, "验证时无法连接抖音，未保存本次登录，请稍后重试", identity, CATEGORY_NETWORK_UNAVAILABLE
+    except Exception as exc:  # noqa: BLE001 - an unreadable page is not a logout
+        logger.warning("Login verification failed unexpectedly: %s", type(exc).__name__)
+        return False, "暂时无法完成登录验证，未保存本次登录，请稍后重试", identity, "verification_error"
 
 
 def public_app_settings():
@@ -1845,27 +1859,19 @@ def create_app():
         if maybe_redirect:
             return maybe_redirect
         request.session["setup_in_progress"] = True
-        accounts = get_visible_accounts(principal(request))
+        from core.personal_streak import preferences
+        from webui.setup_flow import setup_state, requested_step
+        current = principal(request)
+        accounts = await asyncio.to_thread(get_visible_accounts, current)
+        profile = await asyncio.to_thread(preferences, current)
         selected = str(request.query_params.get("account", request.session.get("setup_account_ref", "")))
-        account = next((item for item in accounts if item.get("account_ref") == selected), None)
-        account = account or next((item for item in accounts if item.get("cookies")), None)
+        state = setup_state(accounts, profile, selected)
+        account = state["setup_account"]
         if account:
             request.session["setup_account_ref"] = account["account_ref"]
-        ready = bool(account and account.get("cookies"))
-        has_targets = bool(ready and (account.get("targets") or account.get("group_targets")))
-        suggested = 1 if not ready else (2 if not has_targets else 3)
-        try:
-            step = max(1, min(4, int(request.query_params.get("step", suggested))))
-        except ValueError:
-            step = suggested
-        if step > 1 and not ready:
-            step = 1
-        elif step > 2 and not has_targets:
-            step = 2
         return render_template(request, "setup.html", {
-            "step": step, "setup_account": account, "accounts": accounts,
-            "ready": ready, "has_targets": has_targets,
-            "window": get_config(force_reload=True).get("dailySendWindow", {}),
+            **state, "accounts": accounts,
+            "step": requested_step(request.query_params.get("step"), state),
         })
 
     @app.post("/setup/finish")
@@ -1876,6 +1882,23 @@ def create_app():
         form = await request.form()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
+        from core.personal_streak import preferences
+        from webui.setup_flow import setup_state
+        current = principal(request)
+        state = setup_state(
+            await asyncio.to_thread(get_visible_accounts, current),
+            await asyncio.to_thread(preferences, current),
+            str(request.session.get("setup_account_ref", "")),
+        )
+        if not state["can_finish"]:
+            flash(request, state["setup_blocked_reason"], "warning")
+            return redirect("/setup?step=" + str(state["suggested_step"]))
+        if state["login_pending"]:
+            flash(request, "配置已保存，登录状态仍待确认；请在账号页查看核验结果。", "warning")
+        elif not state["automatic_enabled"]:
+            flash(request, "设置完成。自动发送已暂停，需要时可以手动发送。", "success")
+        else:
+            flash(request, "设置完成，后续发送仍会检查账号状态。", "success")
         request.session.pop("setup_in_progress", None)
         request.session.pop("setup_account_ref", None)
         return redirect("/")
@@ -3397,6 +3420,8 @@ def create_app():
         )
 
     login_transition_lock = asyncio.Lock()
+    login_save_lock = asyncio.Lock()
+    cookie_verification_lock = asyncio.Lock()
 
     def _workspace_payload(request):
         current = principal(request)
@@ -4082,10 +4107,13 @@ def create_app():
             if str(row.get("account_ref") or "").strip()
         }
 
-        verified, verification_reason, identity, verification_category = await verify_login_result(
-            {"cookies": cookies},
-            relogin_account_ref=relogin_account_ref,
-        )
+        if cookie_verification_lock.locked():
+            return JSONResponse({"ok": False, "error": "正在验证另一个账号，请稍后重试。", "category": "verification_busy", "retryable": True}, status_code=429, headers={"Retry-After": "5"})
+        async with cookie_verification_lock:
+            verified, verification_reason, identity, verification_category = await verify_login_result(
+                {"cookies": cookies},
+                relogin_account_ref=relogin_account_ref,
+            )
         if not verified:
             # Reject without touching any account: the pasted state was not
             # usable, or whose account it is could not be confirmed yet.
@@ -4180,8 +4208,9 @@ def create_app():
             "cookies": cookies,
             "cookie_source": "pasted",
         }
-        try:
-            account, action = save_exported_login_result(
+
+        def persist_cookie_login():
+            return save_exported_login_result(
                 login_result,
                 relogin_account_ref=relogin_account_ref,
                 display_name=display_name,
@@ -4194,20 +4223,26 @@ def create_app():
                 principal_resolver=lambda: principal(request),
                 expected_principal=current,
             )
+
+        claim = None
+        if current.get("role") == "user":
+            claim = lambda account: update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
+        try:
+            account, action = await asyncio.to_thread(
+                commit_login_binding,
+                persist_cookie_login,
+                update_accounts=update_user_data,
+                claim_callback=claim,
+                owner_username=current.get("username", ""),
+            )
+        except BindingCommitError as exc:
+            return JSONResponse({"ok": False, "error": str(exc), "binding_pending": exc.uncertain}, status_code=503)
         except LoginSavePermissionDenied as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
         except IDENTITY_SAVE_ERRORS as exc:
             return _identity_error_response(exc, current, "cookies", display_id=display_id)
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-
-        if current.get("role") == "user":
-            update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
-
-        try:
-            call_login_desktop("/clear-login-state", method="POST", payload={}, timeout=60)
-        except RuntimeError as exc:
-            logger.warning("Cookie login saved but clearing the shared login state failed: %s", exc)
 
         summary = cookie_summary(cookies)
         logger.info(
@@ -4225,6 +4260,7 @@ def create_app():
                 "identityState": "verified",
                 "account": {
                     "account_ref": account.get("account_ref"),
+                    "login_generation": account_identity.account_login_generation(account),
                     "unique_id": account.get("unique_id"),
                     "username": account.get("username"),
                     "platform_uid": account.get(account_identity.FIELD_UID, ""),
@@ -4248,6 +4284,28 @@ def create_app():
         active = get_login_lock()
         if not owns_login_lock(active, username=current["username"], session_id=current.get("session_id", "")):
             return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请"}, status_code=423)
+        ticket = str(active.get("ticket") or "")
+        submitted_ticket = str(form.get("ticket") or "")
+        if not submitted_ticket.isascii() or len(submitted_ticket) > 128 or (shared and not submitted_ticket) or (submitted_ticket and not secrets.compare_digest(submitted_ticket, ticket)):
+            return JSONResponse({"ok": False, "error": "登录工作区已更新，请重新申请后再保存"}, status_code=423)
+        if login_save_lock.locked():
+            return JSONResponse({"ok": False, "error": "正在处理上一次保存，请稍候", "category": "login_save_in_progress", "retryable": True}, status_code=409)
+        async with login_save_lock:
+            return await _save_owned_login(request, form, current, active, ticket)
+
+    async def _save_owned_login(request, form, current, active, ticket):
+        class WorkspaceChanged(RuntimeError):
+            pass
+
+        def principal_for_save():
+            live = principal(request)
+            held = get_login_lock()
+            if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+                raise WorkspaceChanged("登录会话已变化，请重新登录")
+            if not owns_login_lock(held, username=current["username"], session_id=current.get("session_id", "")) or not secrets.compare_digest(str((held or {}).get("ticket") or ""), ticket):
+                raise WorkspaceChanged("登录工作区已释放，请重新申请")
+            return live
+
         relogin_unique_id = str(form.get("relogin_unique_id", "")).strip()
         display_name = str(form.get("display_name", "")).strip()
         operation = str(active.get("mode", "relogin"))
@@ -4270,7 +4328,9 @@ def create_app():
         try:
             # Off the event loop: exporting reads the live login page and must not
             # freeze every other request (noVNC, heartbeats) while it runs.
-            payload = await asyncio.to_thread(call_login_desktop, "/export", method="POST", payload={}, timeout=30)
+            principal_for_save()
+            payload = await asyncio.to_thread(call_login_desktop, "/export", method="POST", payload={"interaction_key": ticket}, timeout=30)
+            principal_for_save()
             if not payload.get("ok"):
                 raise RuntimeError("login-desktop export did not return ok")
             exported = payload.get("result", {}) or {}
@@ -4286,7 +4346,9 @@ def create_app():
                 )
             except account_identity.IdentityUnavailable as exc:
                 # Keep the workspace: the operator can retry the save.
+                principal_for_save()
                 return _identity_error_response(exc, current, "login-desktop", display_id=display_id)
+            principal_for_save()
             uid = trusted["uid"]
             rows, match_kind = rows_for_identity(
                 get_userData(force_reload=True), uid, display_id
@@ -4427,6 +4489,7 @@ def create_app():
                     raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
                 if target_row and not confirmation and not account_identity.account_uid(target_row):
                     legacy_check = await asyncio.to_thread(legacy_identity_check, target_row)
+                    principal_for_save()
             # Only the instant checks run here. Re-reading the login state in a
             # second browser took minutes on this host, so it runs after the
             # save, in the background (D12); the account shows "verifying".
@@ -4439,8 +4502,9 @@ def create_app():
                 verification_reason = str(exc)
                 verification_category = getattr(exc, "category", "cookie_format_invalid")
             verification_token = uuid.uuid4().hex if verified is None else ""
-            try:
-                account, action = save_exported_login_result(
+
+            def persist_workspace_login():
+                return save_exported_login_result(
                     exported,
                     relogin_unique_id=relogin_unique_id,
                     relogin_account_ref=relogin_account_ref,
@@ -4454,9 +4518,23 @@ def create_app():
                     confirmation=confirmation,
                     auto_matched=auto_matched,
                     expected_records=expected_records,
-                    principal_resolver=lambda: principal(request),
+                    principal_resolver=principal_for_save,
                     expected_principal=current,
                 )
+
+            claim = None
+            if current.get("role") == "user":
+                claim = lambda account: update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
+            try:
+                account, action = await asyncio.to_thread(
+                    commit_login_binding,
+                    persist_workspace_login,
+                    update_accounts=update_user_data,
+                    claim_callback=claim,
+                    owner_username=current.get("username", ""),
+                )
+            except BindingCommitError as exc:
+                return JSONResponse({"ok": False, "error": str(exc), "binding_pending": exc.uncertain}, status_code=503)
             except LoginSavePermissionDenied as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
             except IDENTITY_SAVE_ERRORS as exc:
@@ -4476,12 +4554,11 @@ def create_app():
                 verified,
                 bool(existing),
             )
-            if (operation == "add" or adopt_unassigned) and current.get("role") == "user":
-                update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
-            begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=active.get("ticket", ""), account_ref=active.get("account_ref", ""))
+            released = begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=ticket, account_ref=active.get("account_ref", ""))
             # The account is saved; do not hold the answer until the login
             # browser is reset and reopened for whoever is queued next.
-            _reset_and_promote_later()
+            if released:
+                _reset_and_promote_later()
             if verification_token:
                 _queue_login_verification(
                     account.get("account_ref", ""),
@@ -4500,6 +4577,7 @@ def create_app():
                 "identityLabel": account_identity.IDENTITY_STATE_LABELS["verified"],
                 "account": {
                     "account_ref": account.get("account_ref"),
+                    "login_generation": account_identity.account_login_generation(account),
                     "unique_id": account.get("unique_id"),
                     "username": account.get("username"),
                     "platform_uid": account.get(account_identity.FIELD_UID, ""),
@@ -4509,7 +4587,13 @@ def create_app():
                 },
                 "workspace": _workspace_payload(request),
             })
+        except WorkspaceChanged as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=423)
         except RuntimeError as exc:
+            try:
+                principal_for_save()
+            except WorkspaceChanged as changed:
+                return JSONResponse({"ok": False, "error": str(changed)}, status_code=423)
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     register_login_interaction_routes(
@@ -4518,6 +4602,7 @@ def create_app():
     )
     register_registration_routes(app, render_template, flash, login_throttle, secure_cookie)
     register_personal_streak_routes(app, principal=principal, csrf_valid=validate_csrf, render=render_template, flash=flash)
+    register_account_binding_routes(app, principal=principal, read_accounts=lambda **kwargs: get_userData(**kwargs))
     return app
 
 

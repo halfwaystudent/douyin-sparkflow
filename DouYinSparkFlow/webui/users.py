@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 
 from filelock import FileLock
@@ -34,7 +35,13 @@ class UserStoreError(ValueError):
 
 
 def _web_users_lock():
-    return FileLock(f"{USERS_FILE}.lock", timeout=30)
+    return _users_file_lock(str(USERS_FILE.resolve()))
+
+
+@lru_cache(maxsize=64)
+def _users_file_lock(path):
+    # Reuse the instance so a save and its ownership update can hold one lock.
+    return FileLock(f"{path}.lock", timeout=30)
 
 
 def normalize_username(username: str) -> str:
