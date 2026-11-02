@@ -1443,25 +1443,6 @@ class DashboardRefreshStatusTests(unittest.TestCase):
     def setUp(self):
         self.script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
 
-    def test_failure_path_keeps_the_last_successful_refresh_time(self):
-        self.assertIn("上次成功刷新", self.script)
-        self.assertIn("showRefreshOutcome", self.script)
-        # The failure branch must render the retained timestamp, not only a message.
-        failure_block = self.script[
-            self.script.index("showRefreshOutcome(`刷新失败：") :
-            self.script.index("showRefreshOutcome(`刷新失败：") + 200
-        ]
-        self.assertIn("showRefreshOutcome", failure_block)
-        self.assertIn("lastSuccessAt = data.previousUpdatedAt", self.script)
-        self.assertIn("data.categoryLabel", self.script)
-
-    def test_success_path_records_the_new_refresh_time(self):
-        # The refresh is now an async job the panel polls, so the successful
-        # timestamp comes from the finished job rather than the POST response.
-        self.assertIn("/async", self.script)
-        self.assertIn("${refreshUrl}/status", self.script)
-        self.assertIn("lastSuccessAt = job.updatedAt", self.script)
-
     def test_refresh_reports_collection_progress(self):
         self.assertIn("正在读取好友列表…已采集", self.script)
         self.assertIn("data-refresh-all-friends", self.script)

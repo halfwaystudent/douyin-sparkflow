@@ -1,4 +1,25 @@
 (() => {
+  if (document.body.hasAttribute("data-auth-theme")) {
+    const root = document.documentElement;
+    const system = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const storedTheme = () => {
+      try { return localStorage.getItem("sparkflow-theme"); }
+      catch { return null; }
+    };
+    const followSystem = () => {
+      const stored = storedTheme();
+      root.dataset.theme = stored === "dark" || stored === "light" ? stored : system?.matches ? "dark" : "light";
+    };
+    followSystem();
+    system?.addEventListener?.("change", followSystem);
+    document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const next = root.dataset.theme === "dark" ? "light" : "dark";
+        root.dataset.theme = next;
+        try { localStorage.setItem("sparkflow-theme", next); } catch {}
+      });
+    });
+  }
   const token = new URLSearchParams(window.location.hash.slice(1)).get("invite");
   const invitation = document.querySelector('[name="invitation_token"]');
   if (token && invitation) {

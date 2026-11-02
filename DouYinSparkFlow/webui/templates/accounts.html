@@ -38,13 +38,14 @@
       <span class="account-ident">
         <span class="account-avatar">{{ (account.username or "A")[:1] }}</span>
         <span class="account-name">
-          <strong>{{ account.username }}</strong>
-          <small>{{ account.targets|length }} 个目标好友 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
+          <strong data-account-saved-name>{{ account.username }}</strong>
+          <small><span data-account-target-count>{{ account.targets|length }}</span> 个发送目标 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
           {% set ident_ids = identity_view(account) %}
           <small class="identity-ids">{% if ident_ids.platform_uid %}平台 UID {{ ident_ids.platform_uid }}{% else %}历史 ID {{ account.unique_id }}（类型未知）{% endif %}{% if ident_ids.display_id %} · 页面显示 ID {{ ident_ids.display_id }}{% endif %}</small>
         </span>
       </span>
       <span class="summary-metrics">
+        <span class="pill warning" data-account-draft hidden>未保存</span>
         {% if duplicate_count > 1 %}
         <span class="pill warning" title="同名账号通常来自重复保存登录态，建议确认后合并或删除多余的记录">同名 {{ duplicate_count }} 个</span>
         {% endif %}
@@ -56,13 +57,14 @@
         <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
         {% set patrol = patrol_view(account) %}
         {% if patrol.has %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">{% if patrol.conclusion == 'ok' %}巡查正常{% else %}巡查：{{ patrol.conclusionLabel }}{% endif %}</span>{% endif %}
-        <span class="pill {% if enabled %}success{% else %}warning{% endif %}">{% if enabled %}已启用{% else %}已停用{% endif %}</span>
+        <span class="pill {% if enabled %}success{% else %}warning{% endif %}" data-account-enabled>{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>
     </summary>
     <div class="fold-body">
-      <form method="post" action="/accounts/{{ account.unique_id }}/update" class="form-stack">
+      <form method="post" action="/accounts/{{ account.unique_id }}/update" class="form-stack" data-editor-form data-editor-kind="account" data-review-url="/accounts?_anchor=account-{{ account.unique_id|urlencode }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="edit_revision" value="{{ account_edit_revision(account) }}">
         <div class="form-grid">
           <label class="field">
             <span>显示名</span>
@@ -111,7 +113,7 @@
           </div>
           <div class="group-picker" data-account-id="{{ account.unique_id }}" data-refresh-url="/accounts/{{ account.unique_id }}/groups/refresh" data-csrf-token="{{ csrf_token }}">
             <div class="group-picker-notices">{% for target, notice in (account.group_target_notices|default({}, true)).items() %}<span class="pill {% if notice.kind == 'missing' %}danger{% else %}warning{% endif %}">{{ '未找到此群' if notice.kind == 'missing' else '已改名为 ' ~ notice.currentName }}</span>{% endfor %}</div>
-            <div class="group-picker-list"></div>
+            <div class="group-picker-list">{% for target, conversation_id in (account.group_target_bindings|default({}, true)).items() %}<label><input type="checkbox" name="group_bind" value="{{ conversation_id }}" checked><span>{{ target }}（{{ conversation_id }}）</span></label>{% endfor %}</div>
             <script type="application/json" id="groups-cache-{{ account.unique_id }}">{{ account.group_cache|default([], true)|tojson }}</script>
             <script type="application/json" id="group-bindings-{{ account.unique_id }}">{{ account.group_target_bindings|default({}, true)|tojson }}</script>
           </div>
@@ -128,12 +130,16 @@
           </label>
           <p class="group-target-editor-note">保存时会统一为“群聊：群名称”。同名好友与群聊可以同时保留；刷新好友列表不会修改这里的群聊目标。消息发送不代表群火花已成功，仍以发送明细中的结果为准。</p>
         </section>
-        <div class="form-actions">
-          <button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存</span></button>
+        <div class="form-actions editor-actions" data-editor-actions>
+          <button class="button button-primary" type="submit" data-editor-save><i data-lucide="check"></i><span data-editor-save-label>保存这个账号</span></button>
+          <span class="muted compact" data-editor-state aria-live="polite"></span>
+          {% if request.session.get('setup_in_progress') %}<a class="button button-quiet" href="/setup?account={{ account.account_ref|urlencode }}" data-editor-next {% if not account.targets %}hidden{% endif %}>继续设置</a>{% endif %}
           <a class="button button-quiet" href="/login-workspace?relogin={{ account.unique_id|urlencode }}">
             <i data-lucide="scan-qr-code"></i><span>重新登录</span>
           </a>
         </div>
+        <p class="notice-inline" data-editor-feedback role="status" aria-live="polite" hidden></p>
+        <a class="section-link" href="/accounts?_anchor=account-{{ account.unique_id|urlencode }}" data-editor-review target="_blank" rel="noopener" hidden>在新页核对已保存内容</a>
       </form>
       {% set patrol = patrol_view(account) %}
       <section class="patrol-panel" data-patrol-panel style="padding-top: 14px; border-top: 1px solid var(--line)">

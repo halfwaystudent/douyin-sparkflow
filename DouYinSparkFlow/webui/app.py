@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import hmac
 import os
 import secrets
 import time
@@ -107,6 +108,7 @@ from webui.personal_streak import schedule_for as personal_schedule_for
 from webui.static_assets import public_assets
 from webui.account_binding import BindingCommitError, commit_login_binding, capture_login_before_write
 from webui.account_binding import register_routes as register_account_binding_routes
+from webui.account_editing import AccountEditConflict, account_edit_revision
 from webui.passkeys import PasskeyStore, login_identity as passkey_identity
 from webui.passkey_routes import register_passkey_routes
 from webui.login_lock import (
@@ -126,6 +128,8 @@ from webui.ops import (
     TASK_ALREADY_RUNNING,
     get_overview_snapshot,
     get_ops_snapshot,
+    get_host_status_snapshot,
+    HostStatusBusy,
     cache_age_label,
     duplicate_display_names,
     identity_view,
@@ -158,9 +162,10 @@ LOGIN_QR_WAIT_SECONDS = 10
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["cache_age_label"] = cache_age_label
 templates.env.globals["duplicate_display_names"] = duplicate_display_names
-templates.env.globals["schedule_window_state"] = schedule_window_state
+templates.env.globals["schedule_window_state"] = lambda: schedule_window_state(allow_host_commands=False)
 templates.env.globals["identity_view"] = identity_view
 templates.env.globals["patrol_view"] = account_patrol.patrol_view
+templates.env.globals["account_edit_revision"] = account_edit_revision
 
 
 def _dedupe_targets(values):
@@ -1367,21 +1372,24 @@ def create_app():
 
     def render_template(request, template_name, context=None, status_code=200):
         base_context = dict(context or {})
+        current = current_principal(request)
+        administrator = bool(current and current.get("role") == "admin")
+        workspace_page = template_name == "login_workspace.html"
         base_context.update(
             {
                 "request": request,
-                "current_user": current_user(request),
-                "csrf_token": csrf_token(request) if current_user(request) else "",
+                "current_user": current.get("username") if current else None,
+                "csrf_token": csrf_token(request) if current else "",
                 "is_https": is_https_request(request),
-                "principal": current_principal(request),
-                "is_admin": bool(current_principal(request) and current_principal(request).get("role") == "admin"),
+                "principal": current,
+                "is_admin": administrator,
                 "host_operations_enabled": False,
                 "passkeys_enabled": passkeys is not None,
                 "setup_in_progress": request.session.get("setup_in_progress", False),
                 "registration_available": registration.policy()["mode"] != "closed",
-                "app_settings": public_app_settings(),
-                "login_desktop_public_url": controlled_login_desktop_url(request),
-                "login_desktop_display_mode": login_desktop_display_mode() if current_principal(request) and current_principal(request)["role"] == "admin" else "novnc",
+                "app_settings": public_app_settings() if template_name == "settings.html" and administrator else {},
+                "login_desktop_public_url": login_desktop_public_url(request) if workspace_page and administrator else "",
+                "login_desktop_display_mode": login_desktop_display_mode() if workspace_page and administrator else "novnc",
             }
         )
         return templates.TemplateResponse(
@@ -1511,7 +1519,7 @@ def create_app():
 
     def scoped_ops_snapshot(request):
         refs = principal_account_refs(request)
-        snapshot = get_ops_snapshot(account_refs=refs, include_host_data=request.url.path in {"/", "/settings"})
+        snapshot = get_ops_snapshot(account_refs=refs, include_host_data=False)
         schedule = personal_schedule_for(principal(request))
         if schedule:
             snapshot["schedule"] = schedule
@@ -1665,6 +1673,27 @@ def create_app():
             await asyncio.to_thread(scoped_overview_snapshot, request),
             headers={"Cache-Control": "no-store"},
         )
+
+    host_status_gate = asyncio.Lock()
+
+    @app.get("/api/ops/host-status")
+    async def host_status(request: Request):
+        current = principal(request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "请先登录。"}, status_code=401)
+        if current.get("role") != "admin":
+            return JSONResponse({"ok": False, "error": "无权查看服务器状态。"}, status_code=403)
+        if host_status_gate.locked():
+            return JSONResponse({"ok": False, "error": "服务器状态正在查询，请稍后重试。"}, status_code=429, headers={"Retry-After": "2"})
+        async with host_status_gate:
+            try:
+                result = await asyncio.to_thread(get_host_status_snapshot)
+            except HostStatusBusy:
+                return JSONResponse({"ok": False, "error": "服务器状态正在查询，请稍后重试。"}, status_code=429, headers={"Retry-After": "2"})
+        live = principal(request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return JSONResponse({"ok": False, "error": "登录状态已变化，请重新登录。"}, status_code=401)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @app.post("/account/password")
     async def change_own_password(request: Request):
@@ -1976,23 +2005,33 @@ def create_app():
 
     @app.post("/accounts/{unique_id}/update")
     async def update_account(request: Request, unique_id: str):
+        ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
         maybe_redirect = require_user(request)
         if maybe_redirect:
+            if ajax:
+                return JSONResponse({"ok": False, "error": "登录已过期，请重新登录后再保存。", "redirect": "/login", "retryable": False}, status_code=401)
             return maybe_redirect
 
         form = await request.form()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            if ajax:
+                return JSONResponse({"ok": False, "error": "页面已过期，请刷新后重试。", "retryable": False}, status_code=403)
             return Response("Invalid CSRF token", status_code=403)
 
         username = str(form.get("username", "")).strip()
-        targets = _dedupe_targets(
-            [*extract_targets_from_form(form), *extract_group_targets_from_form(form)]
-        )
+        submitted_revision = str(form.get("edit_revision", ""))
 
         def mutate(account, accounts):
             del accounts
+            live = principal(request)
+            if not live or not can_access_account(live, account):
+                raise LoginSavePermissionDenied("账号权限已变化，请刷新页面后重试。")
+            revision = account_edit_revision(account)
+            missing_revision = shared and not submitted_revision
+            changed_revision = submitted_revision and (not submitted_revision.isascii() or not hmac.compare_digest(submitted_revision, revision))
+            if missing_revision or changed_revision:
+                raise AccountEditConflict(account)
             previous_targets = list(account.get("targets") or [])
-            account["username"] = username or account.get("username", "")
             picked_ids = sorted({str(value) for value in form.getlist('group_bind')})
             cache = {
                 str(item.get('conversationId')): str(item.get('name') or '').strip()
@@ -2004,6 +2043,10 @@ def create_app():
                 for target, conversation_id in dict(account.get('group_target_bindings') or {}).items()
                 if str(target).strip() and str(conversation_id).strip()
             }
+            unknown_group = any(conversation_id not in cache and conversation_id not in previous_bindings.values() for conversation_id in picked_ids)
+            if submitted_revision and unknown_group:
+                raise AccountEditConflict(account, "群列表已变化，部分所选群暂时无法核实。本次尚未保存，请刷新列表后核对。")
+            account["username"] = username or account.get("username", "")
             old_target_by_id = {}
             for target, conversation_id in previous_bindings.items():
                 old_target_by_id.setdefault(conversation_id, target)
@@ -2051,18 +2094,28 @@ def create_app():
             friend_identity.apply_web_target_selection(account, previous_targets)
             return None
 
-        account, _, access_error = mutate_account_for_request(
-            request,
-            unique_id,
-            mutate,
-        )
+        try:
+            account, _, access_error = await asyncio.to_thread(mutate_account_for_request, request, unique_id, mutate)
+        except AccountEditConflict as exc:
+            if not ajax:
+                submitted_targets = _dedupe_targets([*extract_targets_from_form(form), *extract_group_targets_from_form(form)])
+                return render_template(request, "edit_conflict.html", {"edit_message": str(exc), "submitted_name": username, "submitted_targets": "\n".join(submitted_targets), "submitted_groups": form.getlist("group_bind"), "review_url": f"/accounts?_anchor=account-{quote(str(unique_id), safe='')}"}, status_code=409)
+            return JSONResponse({"ok": False, "error": str(exc), "category": "edit_conflict", "retryable": True, "edit_revision": exc.revision}, status_code=409)
+        except LoginSavePermissionDenied as exc:
+            return JSONResponse({"ok": False, "error": str(exc), "retryable": False}, status_code=403)
+        except (StorageError, StorageLockTimeout):
+            return JSONResponse({"ok": False, "error": "暂时无法保存，请保留本次输入并稍后重试。", "retryable": True}, status_code=503)
         if access_error:
+            if ajax:
+                return JSONResponse({"ok": False, "error": "无权操作此账号。" if access_error == 403 else "账号已移除。", "retryable": False}, status_code=access_error)
             return PlainTextResponse(
                 "Forbidden" if access_error == 403 else "Account not found",
                 status_code=access_error,
             )
         if account:
-            flash(request, f"Updated account {account['username']}.", "success")
+            if ajax:
+                return JSONResponse({"ok": True, "message": "账号设置已保存。", "edit_revision": account_edit_revision(account), "account": {"account_ref": account.get("account_ref"), "unique_id": account.get("unique_id"), "username": account.get("username"), "target_count": len(account.get("targets") or []), "enabled": bool(account.get("enabled", True))}})
+            flash(request, f"已保存账号 {account['username']}，共 {len(account.get('targets') or [])} 个发送目标。", "success")
         else:
             flash(request, "Account not found.", "error")
 
@@ -2104,14 +2157,14 @@ def create_app():
     # dict is enough: one entry per account, overwritten by the next refresh.
     friend_refresh_jobs: dict[str, dict] = {}
 
-    def _write_friend_cache(normalized_id, friends, updated_at):
+    def _write_friend_cache(normalized_id, friends, updated_at, snapshot):
         def mutate(accounts):
             target = account_by_unique_id(accounts, normalized_id)
-            if not target:
-                return None, False
+            if not account_identity.same_login_snapshot(target, snapshot):
+                return False, False
             target["friends_cache"] = list(friends)
             target["friends_cache_updated_at"] = updated_at
-            return None, True
+            return True, True
 
         return update_user_data(mutate, force_reload=True)
 
@@ -2148,6 +2201,10 @@ def create_app():
             ],
         }
 
+    def _refresh_snapshot_is_current(snapshot):
+        current = account_by_ref(get_userData(force_reload=True), snapshot.get("account_ref", ""))
+        return account_identity.same_login_snapshot(current, snapshot)
+
     def _finish_friend_job(normalized_id, **fields):
         job = friend_refresh_jobs.get(normalized_id)
         if job is not None:
@@ -2156,6 +2213,7 @@ def create_app():
         _friend_refresh_active.discard(normalized_id)
 
     async def _run_friend_refresh_job(normalized_id, account, username):
+        account = dict(account, _refresh_snapshot=account_identity.login_snapshot(account))
         def on_progress(collected):
             job = friend_refresh_jobs.get(normalized_id)
             if job is not None:
@@ -2262,25 +2320,31 @@ def create_app():
             return
 
         updated_at = datetime.now().isoformat(timespec="seconds")
-        _write_friend_cache(normalized_id, friends, updated_at)
+        if not await asyncio.to_thread(_write_friend_cache, normalized_id, friends, updated_at, account["_refresh_snapshot"]):
+            _finish_friend_job(normalized_id, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
+            return
 
         index_updated = False
         if scan_complete and friends:
             try:
-                record_friend_scan(
-                    account,
+                recorded = await asyncio.to_thread(
+                    record_friend_scan, account,
                     friends,
                     scan_complete=True,
                     targets=account.get("targets") or [],
                 )
-                index_updated = True
+                index_updated = recorded is not False
             except Exception:
                 logger.warning(
                     "Friend index update after async refresh failed for %s",
                     account.get("username", normalized_id),
                     exc_info=True,
                 )
-        identity = _record_friend_identity(account, friends) if index_updated else {}
+        identity = await asyncio.to_thread(_record_friend_identity, account, friends) if index_updated else {}
+
+        if not await asyncio.to_thread(_refresh_snapshot_is_current, account["_refresh_snapshot"]):
+            _finish_friend_job(normalized_id, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
+            return
 
         _finish_friend_job(
             normalized_id,
@@ -2310,6 +2374,7 @@ def create_app():
             return "running"
         _friend_refresh_active.add(normalized_id)
         friend_refresh_jobs[normalized_id] = {
+            **account_identity.login_snapshot(account),
             "state": "running",
             "stage": "starting",
             "collected": 0,
@@ -2414,6 +2479,7 @@ def create_app():
             if normalized_id and normalized_id not in _friend_refresh_active:
                 _friend_refresh_active.add(normalized_id)
                 friend_refresh_jobs[normalized_id] = {
+                    **account_identity.login_snapshot(saved),
                     "state": "running",
                     "stage": "starting",
                     "collected": 0,
@@ -2488,6 +2554,7 @@ def create_app():
 
         _friend_refresh_active.add(normalized_id)
         friend_refresh_jobs[normalized_id] = {
+            **account_identity.login_snapshot(account),
             "state": "running",
             "stage": "starting",
             "collected": 0,
@@ -2508,7 +2575,7 @@ def create_app():
         if maybe_redirect:
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-        _, account, access_error = account_for_request(request, unique_id)
+        _, account, access_error = await asyncio.to_thread(account_for_request, request, unique_id)
         if access_error:
             return JSONResponse(
                 {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
@@ -2517,7 +2584,7 @@ def create_app():
 
         normalized_id = normalize_unique_id(unique_id)
         job = friend_refresh_jobs.get(normalized_id)
-        if job is None:
+        if job is None or not account_identity.same_login_snapshot(account, job):
             return JSONResponse(
                 {
                     "state": "idle",
@@ -2537,7 +2604,8 @@ def create_app():
             updated_at = datetime.now().isoformat(timespec="seconds")
             def mutate(accounts):
                 target = account_by_unique_id(accounts, normalized_id)
-                if not target: return None, False
+                if not account_identity.same_login_snapshot(target, account):
+                    return None, False
                 target['group_cache'] = list(groups); target['group_cache_updated_at'] = updated_at
                 names = {item['conversationId']: item['name'] for item in groups}
                 notices = dict(target.get('group_target_notices') or {})
@@ -2557,6 +2625,9 @@ def create_app():
                 target['group_target_notices'] = notices
                 return statuses, True
             statuses = await asyncio.to_thread(update_user_data, mutate, force_reload=True)
+            if statuses is None:
+                group_refresh_jobs[normalized_id].update(state='failed', stage='changed', error='账号已更新或移除，本次旧刷新结果未保存。', category='account_changed', retryable=True)
+                return
             group_refresh_jobs[normalized_id].update(state='done', stage='done', groups=groups, updatedAt=updated_at, targets=statuses or [], message=f'已刷新 {len(groups)} 个群聊')
         except Exception as exc:
             group_refresh_jobs[normalized_id].update(state='failed', stage='failed', error=str(exc))
@@ -2579,16 +2650,19 @@ def create_app():
             conflict = friend_refresh_conflict(normalized_id)
         if conflict:
             return JSONResponse({'error': conflict, 'category': 'busy'}, status_code=409)
-        _group_refresh_active.add(normalized_id); group_refresh_jobs[normalized_id]={'state':'running','stage':'starting','previousUpdatedAt':account.get('group_cache_updated_at','')}
+        _group_refresh_active.add(normalized_id); group_refresh_jobs[normalized_id]={**account_identity.login_snapshot(account), 'state':'running','stage':'starting','previousUpdatedAt':account.get('group_cache_updated_at','')}
         _start_background(_run_group_refresh_job(normalized_id, dict(account)))
         return JSONResponse({'ok':True,'state':'running'}, status_code=202)
 
     @app.get('/accounts/{unique_id}/groups/refresh/status')
     async def refresh_groups_status(request: Request, unique_id: str):
         if require_user(request): return JSONResponse({'error':'Unauthorized'}, status_code=401)
-        _, account, access_error = account_for_request(request, unique_id)
+        _, account, access_error = await asyncio.to_thread(account_for_request, request, unique_id)
         if access_error: return JSONResponse({'error':'Forbidden'}, status_code=access_error.status_code)
-        return JSONResponse(dict(group_refresh_jobs.get(normalize_unique_id(unique_id), {'state':'idle','previousUpdatedAt':account.get('group_cache_updated_at','')})))
+        job = group_refresh_jobs.get(normalize_unique_id(unique_id))
+        if not job or not account_identity.same_login_snapshot(account, job):
+            job = {'state':'idle','previousUpdatedAt':account.get('group_cache_updated_at','')}
+        return JSONResponse(dict(job))
 
     # "Immediate patrol" for one account. Same permission and CSRF checks as
     # the friend refresh; the patrol itself runs in the background and shares
@@ -2720,6 +2794,7 @@ def create_app():
             return JSONResponse({"error": "Forbidden" if access_error.status_code == 403 else "Account not found."}, status_code=access_error.status_code)
 
         normalized_id = normalize_unique_id(unique_id)
+        account = dict(account, _refresh_snapshot=account_identity.login_snapshot(account))
         if task_run_lock_status().get("running"):
             return JSONResponse(
                 {
@@ -2843,15 +2918,16 @@ def create_app():
 
         def mutate(updated_account, accounts):
             del accounts
+            if not account_identity.same_login_snapshot(updated_account, account["_refresh_snapshot"]):
+                raise account_identity.AccountChangedConcurrently("账号已更新或移除，本次旧刷新结果未保存。")
             updated_account["friends_cache"] = friends
             updated_account["friends_cache_updated_at"] = updated_at
             return None
 
-        _, _, access_error = mutate_account_for_request(
-            request,
-            unique_id,
-            mutate,
-        )
+        try:
+            _, _, access_error = await asyncio.to_thread(mutate_account_for_request, request, unique_id, mutate)
+        except account_identity.AccountChangedConcurrently as exc:
+            return JSONResponse({"error": str(exc), "category": "account_changed", "retryable": True}, status_code=409)
         if access_error:
             return JSONResponse(
                 {"error": "Forbidden" if access_error == 403 else "Account not found."},
@@ -2861,20 +2937,23 @@ def create_app():
         index_updated = False
         if scan_complete and friends:
             try:
-                record_friend_scan(
-                    account,
+                recorded = await asyncio.to_thread(
+                    record_friend_scan, account,
                     friends,
                     scan_complete=True,
                     targets=account.get("targets") or [],
                 )
-                index_updated = True
+                index_updated = recorded is not False
             except Exception:
                 logger.warning(
                     "Friend index update after refresh failed for %s",
                     account.get("username", normalized_id),
                     exc_info=True,
                 )
-        identity = _record_friend_identity(account, friends) if index_updated else {}
+        identity = await asyncio.to_thread(_record_friend_identity, account, friends) if index_updated else {}
+
+        if not await asyncio.to_thread(_refresh_snapshot_is_current, account["_refresh_snapshot"]):
+            return JSONResponse({"error": "账号已更新或移除，本次旧刷新结果未保存。", "category": "account_changed", "retryable": True}, status_code=409)
 
         logger.info(
             "Friend refresh stored for %s: count=%s complete=%s index_updated=%s",

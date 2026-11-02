@@ -35,6 +35,7 @@ from datetime import timedelta
 from urllib.parse import urlparse
 
 from core import streak_state
+from core.identity import same_login_snapshot
 from utils.config import update_user_data
 from utils.logger import setup_logger
 
@@ -1122,6 +1123,10 @@ def persist_identity_scan(
 
     def mutate(accounts):
         matched = _match_account(accounts, user)
+        snapshot = user.get("_refresh_snapshot")
+        if snapshot:
+            if not same_login_snapshot(matched, snapshot):
+                return None, False
         if matched is None:
             return None, False
         result = reconcile_targets(

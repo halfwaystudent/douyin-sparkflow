@@ -225,15 +225,17 @@
       {% endif %}
       {% if not ops.schedule.personal %}<a class="button button-quiet" href="/preferences/streak">设置我的续火花</a>{% endif %}
     </div>
-    <div class="card">
-      {% if service_rows %}
+    <div class="card" {% if is_admin %}data-host-status{% endif %}>
+      {% if is_admin %}
       <h3 class="card-title"><i data-lucide="activity"></i>服务状态</h3>
-      <ul class="status-list">
+      <p class="muted compact" data-host-status-message>正在检查服务状态，其他操作可以继续。</p>
+      <ul class="status-list" data-host-status-list {% if not service_rows %}hidden{% endif %}>
         {% set service_names = {"douyin-web": "控制台", "douyin-scheduler": "定时调度", "login-desktop": "登录工作区", "mihomo": "备用代理"} %}
         {% for item in service_rows %}
         <li><span class="dot {% if item.State == 'running' %}ok{% else %}bad{% endif %}"></span>{{ service_names[item.Names] }}<span class="muted compact">{{ item.Status }}</span></li>
         {% endfor %}
       </ul>
+      <button class="button button-quiet button-sm" type="button" data-host-status-retry hidden>重新检查</button>
       {% else %}
       <h3 class="card-title"><i data-lucide="sparkles"></i>小提示</h3>
       <p>弱证据（仅回显/仅回执）表示消息大概率发出了，但没有拿到服务端的强确认；不放心可以在发送明细里标记为待核验，系统会再发一次。</p>
@@ -242,3 +244,4 @@
   </div>
 </div>
 {% endblock %}
+{% block scripts %}{% if is_admin %}<script defer src="/static/host-status.js?v=20261102-5"></script>{% endif %}{% endblock %}

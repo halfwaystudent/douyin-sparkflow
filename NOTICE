@@ -9,3 +9,8 @@ page interaction, page responsiveness, and installation checks.
 
 These contributions use the project's PolyForm Noncommercial License 1.0.0.
 The original copyright notices and third-party licenses remain in effect.
+
+The authentication pages inline a small SVG subset from the vendored Lucide
+icons. The original Lucide/Feather notices are retained in
+DouYinSparkFlow/webui/templates/_auth-icon-license.html and
+DouYinSparkFlow/webui/static/lucide-LICENSE.txt.

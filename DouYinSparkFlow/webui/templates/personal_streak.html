@@ -5,8 +5,9 @@
 {% block page_sub %}<p class="page-sub">设置自己的时间和内容，只用于自己名下的抖音账号。</p>{% endblock %}
 {% block content %}
 <section class="card form-stack" style="max-width: 680px">
-  <form method="post" action="/preferences/streak" class="form-stack" data-auth-form>
+  <form method="post" action="/preferences/streak" class="form-stack" data-editor-form data-editor-kind="preferences" data-review-url="/preferences/streak" {% if unsaved_input %}data-editor-unsaved="1"{% endif %}>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="edit_revision" value="{{ preferences.revision|default('', true) }}">
     <label class="check"><input type="checkbox" name="enabled" {% if preferences.enabled %}checked{% endif %}><span>每天自动续火花</span></label>
     <div class="form-grid">
       <label class="field"><span>每天开始时间</span><input type="time" name="time" value="{{ preferences.time }}" required></label>
@@ -14,8 +15,13 @@
     </div>
     <label class="field"><span>发送内容</span><textarea name="messages" rows="4" maxlength="10020" required placeholder="填写自己的消息，每行一条">{{ preferences.messages|join('\n') }}</textarea><small>每行一条，最多 20 条，每条最多 500 字；有多条时轮换使用。</small></label>
     <p class="muted compact">到时间后开始安排发送，忙碌时会排队。开启前请先保存自己的账号和发送目标。修改设置会停止旧计划后续的浏览器发送；已提交的请求可能完成。</p>
-    {% if next_personal_run %}<p>下一次安排：<strong>{{ next_personal_run }}</strong>（{{ preferences.timezone }}）</p>{% endif %}
-    <button class="button button-primary" type="submit">保存我的设置</button>
+    <p data-editor-next-run {% if not next_personal_run %}hidden{% endif %}>下一次安排：<strong>{{ next_personal_run }}</strong>（{{ preferences.timezone }}）</p>
+    <div class="form-actions editor-actions" data-editor-actions>
+      <button class="button button-primary" type="submit" data-editor-save><span data-editor-save-label>保存我的设置</span></button>
+      <span class="muted compact" data-editor-state aria-live="polite"></span>
+    </div>
+    <p class="notice-inline" data-editor-feedback role="status" aria-live="polite" hidden></p>
+    <a class="section-link" href="/preferences/streak" data-editor-review target="_blank" rel="noopener" {% if not edit_conflict %}hidden{% endif %}>在新页核对已保存内容</a>
   </form>
   {% if request.session.get('setup_in_progress') %}<a class="button button-quiet" href="/setup">返回引导，检查下一步</a>{% endif %}
 </section>

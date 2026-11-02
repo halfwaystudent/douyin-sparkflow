@@ -7,6 +7,9 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+import threading
+from copy import deepcopy
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,6 +51,9 @@ TASK_SCHEDULE_MARKERS = (
     PATROL_SCHEDULE_MARKER,
 )
 HOST_CRONTAB_PATH = Path("/host-spool-cron/root")
+_display_crontab = None
+_host_status_cache = None
+_host_status_lock = threading.Lock()
 # The scheduler container mounts ./DouYinSparkFlow/logs at /app/logs, so trigger
 # output written here stays readable from both the scheduler and the web
 # container (the panel). /var/log is not mounted and silently diverges.
@@ -553,12 +559,17 @@ def read_log_tail(lines=200):
 
 
 def read_crontab():
+    global _display_crontab
     if running_in_container() and HOST_CRONTAB_PATH.exists():
-        return HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+        text = HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+        _display_crontab = text
+        return text
     try:
         result = subprocess.run(["crontab", "-l"], text=True, capture_output=True, timeout=10)
         if result.returncode != 0:
+            _display_crontab = ""
             return ""
+        _display_crontab = result.stdout
         return result.stdout
     except FileNotFoundError:
         # Native Windows installs do not provide ``crontab``. The caller can
@@ -579,7 +590,7 @@ def _format_window_schedule(window_config):
     )
 
 
-def schedule_window_state(now=None):
+def schedule_window_state(now=None, *, allow_host_commands=True):
     """Report whether right now sits inside today's configured send window.
 
     The window may only be edited from outside it, so the save route and the
@@ -587,7 +598,7 @@ def schedule_window_state(now=None):
     """
     current = now or datetime.now(_schedule_timezone())
     try:
-        parsed = parse_schedule_string(current_daily_schedule())
+        parsed = parse_schedule_string(current_daily_schedule(allow_host_commands=allow_host_commands))
     except ValueError:
         parsed = None
     if not parsed or parsed.get("mode") != "window":
@@ -865,18 +876,21 @@ def persist_schedule_config(time_string):
 
 
 def update_daily_schedule(time_string):
+    global _display_crontab
     persist_schedule_config(time_string)
     current = read_crontab()
     updated = replace_douyin_cron_schedule(current, time_string)
     if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
         try:
             HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+            _display_crontab = updated
             return subprocess.CompletedProcess(args=["write-host-crontab"], returncode=0, stdout="", stderr="")
         except Exception as exc:
             logger.error("update_daily_schedule failed: %s", exc)
             return _empty_result(stderr=str(exc))
     try:
         process = subprocess.run(["crontab", "-"], input=updated, text=True, capture_output=True, check=True, timeout=10)
+        _display_crontab = updated
         return process
     except Exception as exc:
         logger.error("update_daily_schedule failed: %s", exc)
@@ -1016,7 +1030,7 @@ def _sync_fixed_schedule_patrol(send_lines, all_lines):
         return _empty_result(stderr=str(exc))
 
 
-def current_daily_schedule():
+def current_daily_schedule(*, allow_host_commands=True):
     config = get_config(force_reload=True)
     window = dict(config.get("dailySendWindow") or {})
     if window.get("enabled"):
@@ -1025,7 +1039,15 @@ def current_daily_schedule():
         except Exception:
             logger.warning("current_daily_schedule found invalid dailySendWindow=%s", window)
 
-    for line in read_crontab().splitlines():
+    if allow_host_commands:
+        crontab = read_crontab()
+    elif HOST_CRONTAB_PATH.exists():
+        crontab = HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+    else:
+        crontab = _display_crontab
+    if crontab is None:
+        return "状态待查询"
+    for line in crontab.splitlines():
         if is_patrol_schedule_line(line):
             # The patrol line is not a send time.
             continue
@@ -1195,10 +1217,10 @@ def preview_daily_schedule(time_string):
     }
 
 
-def get_schedule_snapshot(now=None):
+def get_schedule_snapshot(now=None, *, allow_host_commands=True):
     now = now or datetime.now(_schedule_timezone())
     window = _normalize_send_window()
-    label = current_daily_schedule()
+    label = current_daily_schedule(allow_host_commands=allow_host_commands)
     if window.get("enabled"):
         next_trigger = _next_window_trigger(now, window)
     else:
@@ -1212,7 +1234,8 @@ def get_schedule_snapshot(now=None):
     return {
         "label": label,
         "nextTriggerAt": next_trigger.isoformat(timespec="seconds") if next_trigger else "",
-        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M") if next_trigger else "",
+        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M") if next_trigger else ("状态待查询" if label == "状态待查询" else ""),
+        "statusPending": label == "状态待查询",
     }
 
 
@@ -1944,7 +1967,7 @@ def get_overview_snapshot(account_refs=None):
     return {
         "now": send_console["now"],
         "schedule": {
-            **get_schedule_snapshot(),
+            **get_schedule_snapshot(allow_host_commands=False),
             # The next cron trigger is only meaningful while something is still
             # waiting to be sent; otherwise the window just spins empty.
             "remainingTargets": int(summary["today_pending_targets"])
@@ -2130,9 +2153,10 @@ def get_ops_snapshot(account_refs=None, *, include_host_data=True):
     """
     send_console = get_send_console_snapshot(account_refs=account_refs)
     if account_refs is not None or not include_host_data:
+        schedule = get_schedule_snapshot(allow_host_commands=False)
         return {
             "send_console": send_console, "task_lock": task_run_lock_status(),
-            "schedule": get_schedule_snapshot(), "daily_schedule": current_daily_schedule(),
+            "schedule": schedule, "daily_schedule": schedule.get("label", ""),
             "compose_root": "", "compose_file": "", "containers": [], "task_containers": [],
             "schedule_alignment": {}, "recent_triggers": [], "crontab": "", "log_tail": [], "image_present": False,
         }
@@ -2152,3 +2176,27 @@ def get_ops_snapshot(account_refs=None, *, include_host_data=True):
         "log_tail": _cached("log-tail", lambda: read_log_tail(120)),
         "image_present": _cached("image-present", _check_image_present),
     }
+
+
+class HostStatusBusy(RuntimeError):
+    pass
+
+
+def get_host_status_snapshot():
+    """Slow host probes are requested separately from business-page HTML."""
+    global _host_status_cache
+    if not _host_status_lock.acquire(blocking=False):
+        raise HostStatusBusy("host status probe is already running")
+    try:
+        if _host_status_cache is not None and time.monotonic() - _host_status_cache[0] < 5:
+            return deepcopy(_host_status_cache[1])
+        visible = {"douyin-web", "douyin-scheduler", "login-desktop", "mihomo"}
+        containers = [
+            {key: str(row.get(key) or "") for key in ("Names", "State", "Status")}
+            for row in get_container_status() if row.get("Names") in visible
+        ]
+        result = {"ok": True, "containers": containers, "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        _host_status_cache = (time.monotonic(), result)
+        return deepcopy(result)
+    finally:
+        _host_status_lock.release()

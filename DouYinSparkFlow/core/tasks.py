@@ -29,6 +29,7 @@ from core.browser import (
 from core.im_receipt import parse_send_response
 from core.msg_builder import build_message, build_message_candidates, using_message_config, current_message_config
 from core import personal_streak
+from core.identity import same_login_snapshot
 from core.protocol_dispatch import run_protocol_tasks
 from core import friend_identity, notifications, streak_state
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
@@ -3113,7 +3114,13 @@ def _clear_account_send_failure(user):
 
 def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, missing_targets=None):
     def mutate(accounts):
-        matched = _find_matching_account(accounts, user)
+        snapshot = user.get("_refresh_snapshot")
+        if snapshot:
+            matched = next((row for row in accounts if row.get("account_ref") == snapshot.get("account_ref")), None)
+        else:
+            matched = _find_matching_account(accounts, user)
+        if snapshot and not same_login_snapshot(matched, snapshot):
+            return None, False
         if matched is None:
             return None, False
         existing_index = dict(matched.get("friend_index") or {})
@@ -3160,7 +3167,7 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
             "Could not find account to persist friend index for user=%s",
             user.get("username", "unknown"),
         )
-        return
+        return False
 
     existing_index, meta, matched_account = saved
 
@@ -3176,6 +3183,7 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
         bool(scan_complete),
         list(missing_targets or []),
     )
+    return True
 
 
 def record_friend_scan(user, names, *, scan_complete, targets=None, missing_targets=None, scanned_at=None):
@@ -3212,14 +3220,14 @@ def record_friend_scan(user, names, *, scan_complete, targets=None, missing_targ
             if str(target or "").strip()
             and _normalize_target_name(str(target).strip()) not in found
         ]
-    _persist_friend_index(
+    persisted = _persist_friend_index(
         user,
         records,
         scanned_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         scan_complete=bool(scan_complete),
         missing_targets=list(missing_targets),
     )
-    return records
+    return records if persisted is not False else False
 
 
 def _log_rejected_state_transition(action, user, target_name, state, now, *, requested, detail=""):

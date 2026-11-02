@@ -1,7 +1,23 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cut"><title>注册 · SparkFlow</title><meta name="referrer" content="same-origin"><link rel="stylesheet" href="/static/app.css?v=20261102-2"></head>
-<body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cut">
+  <meta name="color-scheme" content="light dark">
+  <title>注册 · SparkFlow</title>
+  <meta name="referrer" content="same-origin">
+  <script>
+    (function () {
+      var stored = null;
+      try { stored = localStorage.getItem("sparkflow-theme"); } catch (e) {}
+      document.documentElement.dataset.theme = stored === "light" || stored === "dark"
+        ? stored
+        : (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    })();
+  </script>
+  {% include "_auth-style.html" %}
+</head>
+<body data-auth-theme>
 <main class="registration-main">
   <section class="card form-stack">
     <a class="brand" href="/login">续火花 <small>SparkFlow</small></a>
@@ -24,5 +40,5 @@
     <a class="button button-quiet" href="/login">返回登录</a>
   </section>
 </main>
-<script defer src="/static/auth-forms.js?v=20261102-2"></script>
+<script defer src="/static/auth-forms.js?v=20261102-5"></script>
 </body></html>

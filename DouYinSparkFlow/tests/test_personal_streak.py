@@ -147,7 +147,7 @@ class PersonalStreakTests(unittest.TestCase):
     def test_form_cannot_select_other_user_or_bypass_csrf(self):
         alice = self.fixture.login()
         csrf = self.fixture.token(alice)
-        form = {"csrf_token": csrf, "enabled": "on", "time": "09:15", "timezone": "Asia/Shanghai", "messages": "自己的文字", "user_id": users.get_web_users()[1]["user_id"], "username": "bob"}
+        form = {"csrf_token": csrf, "edit_revision": streak.preferences(ALICE)["revision"], "enabled": "on", "time": "09:15", "timezone": "Asia/Shanghai", "messages": "自己的文字", "user_id": users.get_web_users()[1]["user_id"], "username": "bob"}
         response = alice.post("/preferences/streak", data=form, follow_redirects=False)
         self.assertEqual(303, response.status_code)
         self.assertEqual(["自己的文字"], streak.preferences(ALICE)["messages"])

@@ -14,6 +14,10 @@ STORE_KEY = "personal_streak"
 UTC = timezone.utc
 
 
+class PreferenceConflict(ValueError):
+    pass
+
+
 def _now():
     return datetime.now(UTC)
 
@@ -75,10 +79,12 @@ def preferences(principal):
         people = _people()
         key = _principal_key(principal, people)
         profile = (users._load_raw().get(STORE_KEY) or {}).get(key) or _default()
-        return {field: deepcopy(profile.get(field)) for field in ("enabled", "time", "timezone", "messages", "next_run_at")}
+        result = {field: deepcopy(profile.get(field)) for field in ("enabled", "time", "timezone", "messages", "next_run_at")}
+        result["revision"] = str(profile.get("revision") or "")
+        return result
 
 
-def save_preferences(principal, *, enabled, at_time, timezone_name, messages):
+def save_preferences(principal, *, enabled, at_time, timezone_name, messages, expected_revision=None):
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(at_time)):
         raise ValueError("请选择有效的续火花时间")
     try:
@@ -102,6 +108,8 @@ def save_preferences(principal, *, enabled, at_time, timezone_name, messages):
         raw = users._load_raw()
         profiles = raw.setdefault(STORE_KEY, {})
         old = profiles.get(key) or {}
+        if expected_revision is not None and str(expected_revision) != str(old.get("revision") or ""):
+            raise PreferenceConflict("设置已在另一页更新。你的输入已保留，请先核对已保存内容。")
         if all(old.get(field) == value for field, value in wanted.items()):
             return deepcopy(old)
         wanted["revision"] = uuid.uuid4().hex

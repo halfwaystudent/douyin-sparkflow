@@ -173,6 +173,8 @@
     message.textContent =
       source.dataset.confirm ||
       "该操作会立即影响续火花任务，请确认是否继续。";
+    const editWarning = window.sparkflowEditorWarning?.();
+    if (editWarning) message.textContent += ` ${editWarning}`;
     accept.textContent = source.dataset.confirmAccept || "确认执行";
     accept.className =
       source.dataset.confirmTone === "primary"
@@ -236,8 +238,10 @@
     pendingButton = null;
     dialog.close();
     if (form) {
+      window.dispatchEvent(new Event("sparkflow:leave-approved"));
       HTMLFormElement.prototype.submit.call(form);
     } else if (href) {
+      window.dispatchEvent(new Event("sparkflow:leave-approved"));
       window.location.assign(href);
     } else if (button) {
       button.dataset.confirmApproved = "1";
@@ -1602,248 +1606,380 @@
 })();
 
 (() => {
-  const parseJson = (id) => {
-    const node = document.getElementById(id);
-    if (!node) return [];
-    try {
-      return JSON.parse(node.textContent || "[]");
-    } catch {
-      return [];
+  const parseJson = (id, fallback = []) => {
+    try { return JSON.parse(document.getElementById(id)?.textContent || JSON.stringify(fallback)); }
+    catch { return fallback; }
+  };
+  const delay = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  const refreshController = ({ button, status, url, csrf, apply, progress, autoCheck = true }) => {
+    let pending = null, checkAgain = false, stopped = false, version = 0;
+    const requests = new Set();
+    const initialStatus = String(status?.textContent || "").trim();
+    let lastSuccess = "";
+    const rememberPrevious = (value) => {
+      if (!value) return;
+      const incoming = Date.parse(value), current = Date.parse(lastSuccess);
+      if (!lastSuccess || (Number.isFinite(incoming) && Number.isFinite(current) && incoming > current)) lastSuccess = value;
+    };
+    const show = (message, preservePrevious = false) => {
+      if (!status) return;
+      status.textContent = message;
+      if (preservePrevious) {
+        const detail = document.createElement("span");
+        detail.className = "friend-picker-last-refresh";
+        detail.textContent = lastSuccess ? `上次成功刷新：${lastSuccess}` : initialStatus || "尚未成功读取列表";
+        status.append(" ", detail);
+      }
+    };
+    const request = async (path, body) => {
+      const controller = new AbortController();
+      requests.add(controller);
+      const timeout = window.setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await fetch(path, {
+          method: body ? "POST" : "GET", ...(body ? { body } : {}),
+          credentials: "same-origin", cache: "no-store", signal: controller.signal,
+        });
+        if (response.status === 401 || response.redirected) {
+          const error = new Error("登录状态已失效，请重新登录平台后再检查。");
+          error.known = true;
+          throw error;
+        }
+        if (response.status === 403 || response.status === 404) {
+          const error = new Error("账号已移除或权限已变化，请重新打开账号页核对。");
+          error.known = true;
+          throw error;
+        }
+        const data = await response.json();
+        if (!response.ok || data.ok === false) {
+          const label = data.categoryLabel ? `（${data.categoryLabel}）` : "";
+          const error = new Error(`${data.error || `请求失败（${response.status}）`}${label}`);
+          error.known = response.status < 500;
+          error.previousUpdatedAt = data.previousUpdatedAt;
+          throw error;
+        }
+        return data;
+      } finally {
+        window.clearTimeout(timeout);
+        requests.delete(controller);
+      }
+    };
+    const execute = async (start) => {
+      const heldVersion = version;
+      if (button) { button.disabled = true; button.setAttribute("aria-busy", "true"); }
+      let started = false;
+      try {
+        let job = await request(`${url}/status`);
+        if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
+        if (start && job.state !== "running" && !checkAgain) {
+          show("正在启动刷新…");
+          const body = new FormData();
+          body.set("csrf_token", csrf);
+          const data = await request(`${url}/async`, body);
+          job = data.job || data;
+          started = true;
+        }
+        const deadline = Date.now() + 360000;
+        while (job.state === "running") {
+          started = true;
+          if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
+          show(progress(job));
+          if (Date.now() >= deadline) {
+            checkAgain = true;
+            const message = "暂时未收到最终结果，后台可能仍在处理。请稍后点刷新重新检查；当前选择已保留。";
+            show(message, true);
+            return { ok: false, pending: true, started, message };
+          }
+          await delay(2000);
+          if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
+          job = await request(`${url}/status`);
+        }
+        if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
+        if (job.state === "done") {
+          checkAgain = false;
+          lastSuccess = job.updatedAt || lastSuccess;
+          apply(job);
+          const message = job.message || "列表已刷新，当前选择已保留。";
+          show(message);
+          return { ok: true, started, message };
+        }
+        if (job.state === "failed") {
+          rememberPrevious(job.previousUpdatedAt);
+          checkAgain = false;
+          const error = new Error(job.error || "未能完成刷新，请稍后重试。");
+          error.known = true;
+          throw error;
+        }
+        checkAgain = false;
+        if (start) {
+          const message = "当前没有运行中的刷新任务，可以再点一次刷新。";
+          show(message, true);
+          return { ok: false, started, message };
+        }
+        return { ok: true, started, message: "已检查当前状态" };
+      } catch (error) {
+        if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
+        rememberPrevious(error.previousUpdatedAt);
+        checkAgain = !error.known;
+        const message = error.known
+          ? `刷新未完成：${error.message}`
+          : "暂时未收到刷新结果，后台可能仍在处理。请稍后点刷新重新检查；当前选择已保留。";
+        show(message, true);
+        return { ok: false, pending: !error.known, started, message };
+      } finally {
+        if (button) { button.disabled = false; button.removeAttribute("aria-busy"); }
+      }
+    };
+    const run = (start = true) => {
+      if (stopped) return Promise.resolve({ ok: false, pending: true, message: "页面已关闭" });
+      if (pending) return start ? pending.then((result) => result.started ? result : run(true)) : pending;
+      pending = execute(start).finally(() => { pending = null; });
+      return pending;
+    };
+    button?.addEventListener("click", () => run(true));
+    window.addEventListener("pagehide", () => {
+      stopped = true;
+      version += 1;
+      requests.forEach((controller) => controller.abort());
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted) {
+        stopped = false;
+        const heldVersion = version;
+        Promise.resolve(pending).then(() => {
+          if (!stopped && heldVersion === version) run(false);
+        });
+      }
+    });
+    if (autoCheck) run(false);
+    return run;
+  };
+
+  const initializeWhenVisible = (picker, initialize) => {
+    const folds = [];
+    for (let node = picker.parentElement; node; node = node.parentElement) {
+      if (node.tagName === "DETAILS") folds.push(node);
     }
+    const check = () => { if (folds.every((fold) => fold.open)) initialize(); };
+    folds.forEach((fold) => fold.addEventListener("toggle", check));
+    check();
   };
 
   document.querySelectorAll(".friend-picker").forEach((picker) => {
-    const accountId = picker.dataset.accountId;
-    const refreshUrl = picker.dataset.refreshUrl;
-    const csrfToken = picker.dataset.csrfToken;
-    const form = picker.closest("form");
-    const textarea = form?.querySelector(".targets-textarea");
-    const search = picker.querySelector(".friend-search-input");
-    const refreshButton = picker.querySelector(".friend-refresh-button");
-    const list = picker.querySelector(".friend-picker-list");
-    const summary = picker.querySelector(".friend-picker-summary");
-    const status = picker.querySelector(".friend-picker-status");
-    let friends = parseJson(`friends-cache-${accountId}`);
-    const isGroupTarget = (value) => String(value || "").trim().startsWith("群聊：") || String(value || "").trim().startsWith("群聊:");
-    let selected = new Set(parseJson(`selected-targets-${accountId}`).filter((target) => !isGroupTarget(target)));
-
-    const parseTargets = (value) =>
-      [...new Set(
-        String(value || "")
-          .replaceAll(",", "\n")
-          .split(/\r?\n/)
-          .map((item) => item.trim())
-          .filter(Boolean),
-      )];
-
-    const combined = () => [...new Set([...selected, ...friends])];
-
-    const syncTextarea = () => {
-      if (textarea) textarea.value = [...selected].join("\n");
-    };
-
-    const render = () => {
-      const query = String(search?.value || "").trim().toLowerCase();
-      const names = combined().filter((name) =>
-        name.toLowerCase().includes(query),
-      );
-      if (summary) summary.textContent = `已选 ${selected.size} 人`;
-      list.innerHTML = "";
-      if (!names.length) {
-        const empty = document.createElement("div");
-        empty.className = "friend-picker-empty";
-        empty.textContent = combined().length
-          ? "没有匹配的好友。"
-          : "点击“刷新好友列表”后再选择目标。";
-        list.appendChild(empty);
-        return;
-      }
-      names.forEach((name) => {
-        const label = document.createElement("label");
-        label.className = `friend-option${selected.has(name) ? " selected" : ""}`;
-        const text = document.createElement("span");
-        text.textContent = name;
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = selected.has(name);
-        checkbox.addEventListener("change", () => {
-          if (checkbox.checked) selected.add(name);
-          else selected.delete(name);
-          syncTextarea();
-          render();
+    let refresh = null;
+    const initialize = (autoCheck = true) => {
+      if (refresh) return refresh;
+      const accountId = picker.dataset.accountId;
+      const form = picker.closest("form");
+      const textarea = form?.querySelector(".targets-textarea");
+      const search = picker.querySelector(".friend-search-input");
+      const list = picker.querySelector(".friend-picker-list");
+      const summary = picker.querySelector(".friend-picker-summary");
+      let friends = parseJson(`friends-cache-${accountId}`);
+      const isGroupTarget = (value) => /^群聊[:：]/.test(String(value || "").trim());
+      let selected = new Set(parseJson(`selected-targets-${accountId}`).filter((target) => !isGroupTarget(target)));
+      let lastRender = "", searchTimer = null;
+      const updateSummary = () => { if (summary) summary.textContent = `已选 ${selected.size} 人`; };
+      const render = () => {
+        const query = String(search?.value || "").trim().toLowerCase();
+        const all = [...new Set([...selected, ...friends])];
+        const names = all.filter((name) => name.toLowerCase().includes(query));
+        updateSummary();
+        const signature = JSON.stringify([names, names.map((name) => selected.has(name))]);
+        if (signature === lastRender) return;
+        lastRender = signature;
+        list.textContent = "";
+        if (!names.length) {
+          const empty = document.createElement("div");
+          empty.className = "friend-picker-empty";
+          empty.textContent = all.length ? "没有匹配的好友。" : "点击“刷新好友列表”后再选择目标。";
+          list.appendChild(empty);
+          return;
+        }
+        const fragment = document.createDocumentFragment();
+        names.forEach((name) => {
+          const label = document.createElement("label");
+          label.className = `friend-option${selected.has(name) ? " selected" : ""}`;
+          const text = document.createElement("span");
+          text.textContent = name;
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = selected.has(name);
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) selected.add(name);
+            else selected.delete(name);
+            if (textarea) textarea.value = [...selected].join("\n");
+            label.classList.toggle("selected", checkbox.checked);
+            updateSummary();
+            lastRender = "";
+          });
+          label.append(text, checkbox);
+          fragment.appendChild(label);
         });
-        label.append(text, checkbox);
-        list.appendChild(label);
+        list.appendChild(fragment);
+      };
+      textarea?.addEventListener("input", () => {
+        selected = new Set(String(textarea.value || "").replaceAll(",", "\n").split(/\r?\n/).map((item) => item.trim()).filter((item) => item && !isGroupTarget(item)));
+        render();
       });
-    };
-
-    textarea?.addEventListener("input", () => {
-      selected = new Set(parseTargets(textarea.value).filter((target) => !isGroupTarget(target)));
+      search?.addEventListener("input", () => {
+        window.clearTimeout(searchTimer);
+        searchTimer = window.setTimeout(render, 80);
+      });
+      search?.addEventListener("keydown", (event) => { if (event.key === "Enter") event.preventDefault(); });
       render();
-    });
-    // Group targets live in their own textarea and are normalized by the server
-    // on save. Rewriting the value while typing would drop new lines and spaces.
-    search?.addEventListener("input", render);
-    // This element is the only place the last successful refresh time is shown,
-    // so remember its initial text and keep it visible while reporting failures.
-    const initialStatusText = String(status?.textContent || "").trim();
-    let lastSuccessAt = "";
-    const describeLastSuccess = () => {
-      const previous = String(lastSuccessAt || "").trim();
-      if (previous) return `上次成功刷新：${previous}`;
-      return initialStatusText || "尚未读取好友列表";
+      refresh = refreshController({
+        button: picker.querySelector(".friend-refresh-button"), status: picker.querySelector(".friend-picker-status"),
+        url: picker.dataset.refreshUrl, csrf: picker.dataset.csrfToken,
+        apply: (job) => { friends = job.friends || friends; render(); },
+        progress: (job) => job.stage === "collecting" ? `正在读取好友列表…已采集 ${job.collected || 0} 个` : "正在启动并读取好友列表…",
+        autoCheck,
+      });
+      return refresh;
     };
-    const showRefreshOutcome = (message) => {
-      if (!status) return;
-      status.textContent = message;
-      const detail = document.createElement("span");
-      detail.className = "friend-picker-last-refresh";
-      detail.textContent = describeLastSuccess();
-      status.append(" ", detail);
-    };
-
-    const stageLabel = (job) => {
-      if (job.stage === "starting") return "正在启动浏览器…";
-      if (job.stage === "collecting") return `正在读取好友列表…已采集 ${job.collected || 0} 个`;
-      return "正在处理…";
-    };
-
-    const pollJob = async () => {
-      for (let attempt = 0; attempt < 200; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        const response = await fetch(`${refreshUrl}/status`, {
-          credentials: "same-origin",
-          cache: "no-store",
-        });
-        const job = await response.json().catch(() => ({}));
-        if (job.state === "running") {
-          if (status) status.textContent = stageLabel(job);
-          continue;
-        }
-        return job;
-      }
-      return { state: "failed", error: "刷新仍未完成，请稍后在运行日志中查看结果。" };
-    };
-
-    const doRefresh = async () => {
-      refreshButton.disabled = true;
-      if (status) status.textContent = "正在启动刷新…";
-      try {
-        const formData = new FormData();
-        formData.set("csrf_token", csrfToken);
-        const response = await fetch(`${refreshUrl}/async`, {
-          method: "POST",
-          body: formData,
-          credentials: "same-origin",
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || data.ok === false) {
-          // Keep an in-session timestamp when this failure body omits it (busy,
-          // forbidden, or unexpected errors).
-          lastSuccessAt = data.previousUpdatedAt || lastSuccessAt;
-          const label = data.categoryLabel ? `（${data.categoryLabel}）` : "";
-          throw new Error(`${data.error || "刷新失败"}${label}`);
-        }
-        const job = await pollJob();
-        if (job.state === "done") {
-          lastSuccessAt = job.updatedAt || lastSuccessAt;
-          friends = job.friends || [];
-          if (status) status.textContent = job.message || "好友列表已刷新";
-          render();
-          return { ok: true, message: job.message || "已刷新" };
-        }
-        lastSuccessAt = job.previousUpdatedAt || lastSuccessAt;
-        const label = job.categoryLabel ? `（${job.categoryLabel}）` : "";
-        throw new Error(`${job.error || "刷新失败"}${label}`);
-      } catch (error) {
-        // Keep the previous successful refresh time visible after a failure.
-        showRefreshOutcome(`刷新失败：${error.message}`);
-        return { ok: false, message: error.message };
-      } finally {
-        refreshButton.disabled = false;
-      }
-    };
-
-    // Exposed so the batch button can drive every account sequentially.
-    picker.refreshFriends = doRefresh;
-    refreshButton?.addEventListener("click", doRefresh);
-    // A successful login save starts a friend refresh in the background, so pick
-    // its progress up on load instead of leaving the operator with a stale list.
-    fetch(`${refreshUrl}/status`, { credentials: "same-origin", cache: "no-store" })
-      .then((response) => response.json())
-      .then((job) => {
-        if (!job || job.state !== "running") return;
-        if (status) status.textContent = stageLabel(job);
-        return pollJob().then((finished) => {
-          if (finished.state === "done") {
-            lastSuccessAt = finished.updatedAt || lastSuccessAt;
-            friends = finished.friends || friends;
-            if (status) status.textContent = finished.message || "好友列表已刷新";
-            render();
-          } else if (finished.state === "failed") {
-            showRefreshOutcome(`刷新失败：${finished.error || "未知原因"}`);
-          }
-        });
-      })
-      .catch(() => {});
-    render();
+    picker.refreshFriends = () => initialize(false)(true);
+    initializeWhenVisible(picker, initialize);
   });
 
-  // Batch refresh: run every account sequentially (the server also refuses to
-  // overlap with a send run) and summarise partial failures instead of hiding
-  // them behind per-account status text.
   const batchButton = document.querySelector("[data-refresh-all-friends]");
   const batchSummary = document.querySelector("[data-refresh-all-friends-summary]");
-  const renderBatchSummary = (results) => {
-    if (!batchSummary) return;
-    const ok = results.filter((item) => item.ok).length;
-    const failed = results.filter((item) => !item.ok);
-    batchSummary.hidden = false;
-    batchSummary.textContent = failed.length
-      ? `成功 ${ok} 个，失败 ${failed.length} 个：${failed.map((item) => item.message).join("；")}`
-      : `全部成功（${ok} 个账号）`;
-  };
   batchButton?.addEventListener("click", async () => {
     const pickers = [...document.querySelectorAll(".friend-picker")];
     const results = [];
     batchButton.disabled = true;
-    if (batchSummary) {
-      batchSummary.hidden = false;
-      batchSummary.textContent = `正在刷新 ${pickers.length} 个账号…`;
-    }
+    if (batchSummary) { batchSummary.hidden = false; batchSummary.textContent = `正在刷新 ${pickers.length} 个账号…`; }
     try {
       for (const picker of pickers) {
-        if (typeof picker.refreshFriends !== "function") continue;
-        results.push(await picker.refreshFriends());
+        if (typeof picker.refreshFriends === "function") results.push(await picker.refreshFriends());
       }
-    } finally {
-      batchButton.disabled = false;
-    }
-    renderBatchSummary(results);
+    } finally { batchButton.disabled = false; }
+    if (!batchSummary) return;
+    const ok = results.filter((item) => item.ok).length;
+    const pending = results.filter((item) => item.pending).length;
+    const failed = results.filter((item) => !item.ok && !item.pending);
+    batchSummary.textContent = failed.length || pending
+      ? `成功 ${ok} 个，待核对 ${pending} 个，未完成 ${failed.length} 个。${failed.map((item) => item.message).join("；")}`
+      : `全部成功（${ok} 个账号）`;
+  });
+
+  document.querySelectorAll(".group-picker").forEach((picker) => {
+    let refresh = null;
+    const initialize = () => {
+      if (refresh) return refresh;
+      const id = picker.dataset.accountId;
+      const list = picker.querySelector(".group-picker-list");
+      const editor = picker.closest(".group-target-editor");
+      const bindings = parseJson(`group-bindings-${id}`, {});
+      let groups = parseJson(`groups-cache-${id}`);
+      const selected = new Set(Object.values(bindings).map(String));
+      const names = new Map(Object.entries(bindings).map(([target, conversationId]) => [String(conversationId), target.replace(/^群聊[:：]/, "")]));
+      const search = document.createElement("input");
+      search.type = "search";
+      search.className = "friend-search-input group-search-input";
+      search.placeholder = "搜索群名或编号";
+      search.setAttribute("aria-label", "搜索群名或编号");
+      const summary = document.createElement("p");
+      summary.className = "friend-picker-summary";
+      const submittedSelection = document.createElement("div");
+      submittedSelection.hidden = true;
+      list.before(search, summary, submittedSelection);
+      let searchTimer = null;
+      const updateSummary = () => {
+        summary.textContent = `已选 ${selected.size} 个群`;
+        submittedSelection.textContent = "";
+        [...selected].sort().forEach((conversationId) => {
+          const input = document.createElement("input");
+          input.type = "hidden";
+          input.name = "group_bind";
+          input.value = conversationId;
+          submittedSelection.appendChild(input);
+        });
+      };
+      const render = () => {
+        list.textContent = "";
+        updateSummary();
+        const known = new Map();
+        groups.forEach((group) => {
+          const conversationId = String(group.conversationId || "");
+          if (!conversationId) return;
+          names.set(conversationId, String(group.name || "未命名群"));
+          known.set(conversationId, {name: names.get(conversationId), conversationId});
+        });
+        const available = new Set(known.keys());
+        selected.forEach((conversationId) => {
+          if (!known.has(conversationId)) known.set(conversationId, {name: names.get(conversationId) || "已选群", conversationId});
+        });
+        const query = search.value.trim().toLowerCase();
+        const fragment = document.createDocumentFragment();
+        known.forEach((group) => {
+          if (query && !`${group.name} ${group.conversationId}`.toLowerCase().includes(query)) return;
+          const label = document.createElement("label"), box = document.createElement("input"), text = document.createElement("span");
+          box.type = "checkbox";
+          box.dataset.groupChoice = "";
+          box.value = group.conversationId;
+          box.checked = selected.has(group.conversationId);
+          text.textContent=`${group.name}（${String(group.conversationId)}）`;
+          if (!available.has(group.conversationId)) {
+            const note = document.createElement("small");
+            note.textContent = "本次未读取到，已保留选择；可取消";
+            text.append(" ", note);
+          }
+          box.addEventListener("change", () => {
+            if (box.checked) selected.add(group.conversationId);
+            else selected.delete(group.conversationId);
+            updateSummary();
+          });
+          label.append(box, text);
+          fragment.appendChild(label);
+        });
+        list.appendChild(fragment);
+        if (!list.childElementCount) {
+          const empty = document.createElement("p");
+          empty.className = "friend-picker-empty";
+          empty.textContent = query ? "没有匹配的群。" : "刷新群列表后，可以选择需要发送的群。";
+          list.appendChild(empty);
+        }
+      };
+      search.addEventListener("input", () => {
+        window.clearTimeout(searchTimer);
+        searchTimer = window.setTimeout(render, 80);
+      });
+      search.addEventListener("keydown", (event) => { if (event.key === "Enter") event.preventDefault(); });
+      render();
+      refresh = refreshController({
+        button: editor?.querySelector(".group-refresh-button"), status: editor?.querySelector("[data-group-status]"),
+        url: picker.dataset.refreshUrl, csrf: picker.dataset.csrfToken,
+        apply: (job) => {
+          groups = job.groups || groups;
+          const notices = picker.querySelector(".group-picker-notices");
+          if (notices) {
+            notices.textContent = "";
+            (job.targets || []).filter((target) => target.status !== "ok").forEach((target) => {
+              const pill = document.createElement("span");
+              pill.className = `pill ${target.status === "missing" ? "danger" : "warning"}`;
+              pill.textContent = target.status === "missing" ? "未找到此群" : `已改名为 ${target.name || ""}`;
+              notices.appendChild(pill);
+            });
+          }
+          render();
+        },
+        progress: () => "正在读取群列表…当前选择已保留。",
+      });
+      return refresh;
+    };
+    initializeWhenVisible(picker, initialize);
   });
 })();
 
 (() => {
-  const parse = (id) => { try { return JSON.parse(document.getElementById(id)?.textContent || '[]'); } catch { return []; } };
-  document.querySelectorAll('.group-picker').forEach((picker) => {
-    const id = picker.dataset.accountId, list = picker.querySelector('.group-picker-list');
-    const button = picker.closest('.group-target-editor')?.querySelector('.group-refresh-button');
-    const status = picker.closest('.group-target-editor')?.querySelector('[data-group-status]');
-    let groups = parse(`groups-cache-${id}`), bindings = parse(`group-bindings-${id}`);
-    const notices = picker.querySelector('.group-picker-notices');
-    const renderNotices = (targets = []) => { if (!notices) return; notices.textContent = ''; targets.filter((target) => target.status !== 'ok').forEach((target) => { const pill = document.createElement('span'); pill.className = `pill ${target.status === 'missing' ? 'danger' : 'warning'}`; pill.textContent = target.status === 'missing' ? '未找到此群' : `已改名为 ${target.name || ''}`; notices.appendChild(pill); }); };
-    const render = () => { list.textContent = ''; const selected = new Set(Object.values(bindings)); groups.forEach((group) => { const label=document.createElement('label'), box=document.createElement('input'), text=document.createElement('span'); box.type='checkbox'; box.name='group_bind'; box.value=group.conversationId; box.checked=selected.has(group.conversationId); text.textContent=`${group.name}（${String(group.conversationId)}）`; label.append(box,text); list.append(label); }); };
-    const poll = async () => { for(let i=0;i<200;i+=1) { await new Promise(r=>setTimeout(r,1000)); const job=await fetch(`${picker.dataset.refreshUrl}/status`,{credentials:'same-origin'}).then(r=>r.json()); if(job.state==='running') continue; return job; } return {state:'failed',error:'刷新超时'}; };
-    button?.addEventListener('click', async () => { button.disabled=true; if(status) status.textContent='正在刷新群列表…'; try { const body=new FormData(); body.set('csrf_token',picker.dataset.csrfToken); const response=await fetch(`${picker.dataset.refreshUrl}/async`,{method:'POST',body,credentials:'same-origin'}); if(!response.ok) throw new Error((await response.json()).error || '刷新失败'); const job=await poll(); if(job.state!=='done') throw new Error(job.error || '刷新失败'); groups=job.groups || []; renderNotices(job.targets || []); if(status) status.textContent=job.message || '群列表已刷新'; render(); } catch(error) { if(status) status.textContent=`刷新失败：${error.message}`; } finally { button.disabled=false; } });
-    render();
-  });
+  const renderAvailableIcons = () => {
+    if (window.lucide) window.lucide.createIcons({ attrs: { "aria-hidden": "true" } });
+  };
+  window.addEventListener("DOMContentLoaded", renderAvailableIcons);
+  document.querySelector("[data-icon-library]")?.addEventListener("load", renderAvailableIcons, {once: true});
+  if (document.readyState !== "loading") renderAvailableIcons();
 })();
-
-window.addEventListener("DOMContentLoaded", () => {
-  if (window.lucide) {
-    window.lucide.createIcons({ attrs: { "aria-hidden": "true" } });
-  }
-});
 
 // Chromium does not scroll a half-hidden item of a sideways-scrolling strip into view on Tab,
 // and for a textarea it only reveals the caret line. Only for Tab: a click, a tap that opens the

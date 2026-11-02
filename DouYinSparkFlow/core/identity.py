@@ -115,6 +115,20 @@ def account_login_generation(account) -> str:
     return str((account or {}).get(FIELD_LOGIN_GENERATION) or "")
 
 
+def login_snapshot(account):
+    account = account or {}
+    return {
+        "account_ref": str(account.get("account_ref") or ""),
+        FIELD_LOGIN_GENERATION: account_login_generation(account),
+    }
+
+
+def same_login_snapshot(account, snapshot):
+    expected = str((snapshot or {}).get("account_ref") or "")
+    return bool(expected and str((account or {}).get("account_ref") or "") == expected
+                and account_login_generation(account) == account_login_generation(snapshot))
+
+
 class AccountChangedConcurrently(RuntimeError):
     """The record changed between the identity check and the write."""
 
