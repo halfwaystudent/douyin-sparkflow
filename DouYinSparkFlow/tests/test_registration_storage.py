@@ -60,6 +60,53 @@ class RegistrationTests(unittest.TestCase):
         users.update_web_user("new-user", enabled=True)
         self.assertIsNotNone(users.authenticate("new-user", "Safe-registration-2026!"))
 
+    def test_browser_registration_preserves_origin_and_keeps_cross_origin_blocked(self):
+        from playwright.sync_api import sync_playwright
+
+        registration.configure("public", True, 100)
+        with patch.dict(os.environ, {"SPARKFLOW_SESSION_COOKIE_SECURE": "1"}):
+            application = app_module.create_app()
+        client = TestClient(application, base_url="https://testserver")
+        submissions = []
+
+        def respond(route):
+            request = route.request
+            if not request.url.startswith("https://testserver/"):
+                return route.abort()
+            headers = request.all_headers()
+            response = client.request(request.method, request.url, headers=headers,
+                                      content=request.post_data_buffer, follow_redirects=False)
+            if request.method == "POST" and request.url.endswith("/register"):
+                submissions.append((headers.get("origin"), response.status_code))
+            route.fulfill(status=response.status_code, body=response.content,
+                          headers={key: value for key, value in response.headers.items()
+                                   if key not in {"content-length", "content-encoding"}})
+
+        with sync_playwright() as runtime:
+            browser = runtime.chromium.launch()
+            page = browser.new_page()
+            page.route("**/*", respond)
+            page.goto("https://testserver/register")
+            page.locator('[name="username"]').fill("browser-guest")
+            page.locator('[name="password"]').fill("Safe-registration-2026!")
+            page.locator('[name="confirm_password"]').fill("Safe-registration-2026!")
+            with page.expect_response(lambda response: response.request.method == "POST"
+                                      and response.url.endswith("/register")):
+                page.get_by_role("button", name="创建账号").click()
+            page.wait_for_load_state("load")
+            self.assertEqual([("https://testserver", 303)], submissions)
+            created = users.find_web_user("browser-guest")
+            self.assertIsNotNone(created)
+            self.assertFalse(created["enabled"])
+            self.assertEqual([], created["account_refs"])
+            browser.close()
+
+        for origin in ("null", "https://other.test"):
+            with self.subTest(origin=origin):
+                response = client.post("/register", headers={"Origin": origin})
+                self.assertEqual(403, response.status_code)
+                self.assertEqual("Cross-origin request denied", response.text)
+
     def test_invitation_is_hashed_single_use_and_not_consumed_on_validation_error(self):
         registration.configure("invite", False, 100)
         token = registration.create_invitation("owner")
