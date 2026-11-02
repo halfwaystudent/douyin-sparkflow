@@ -19,6 +19,7 @@ DouYinSparkFlow/config.json
 
 .migration-backups/
 DouYinSparkFlow/webui_users.json
+DouYinSparkFlow/webui_passkeys.json
 DouYinSparkFlow/*.lock
 # >>> Comet managed project state >>>
 !/.comet/

@@ -9,6 +9,7 @@ logs/
 config.json
 usersData.json
 webui_settings.json
+webui_passkeys.json
 *.log
 *.lock
 # Runtime cache the protocol sender fills in on demand, and vendored archives.

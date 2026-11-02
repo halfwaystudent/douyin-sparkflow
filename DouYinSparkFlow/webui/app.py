@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from core import identity as account_identity
 from core import streak_state
@@ -67,6 +68,7 @@ from utils.config import (
 from utils import notify
 from utils.logger import setup_logger
 from webui.auth import (
+    BootstrapAlreadyConfigured,
     bootstrap_admin_password,
     clear_session,
     csrf_token,
@@ -93,6 +95,9 @@ from webui.users import (
     update_web_user,
 )
 from webui.login_guard import LoginThrottle, password_problem
+from webui.security import SecurityMiddleware
+from webui.passkeys import PasskeyStore, login_identity as passkey_identity
+from webui.passkey_routes import register_passkey_routes
 from webui.login_lock import (
     begin_expiration as begin_login_expiration,
     begin_force_reset as begin_login_force_reset,
@@ -116,8 +121,6 @@ from webui.ops import (
     log_file_path,
     read_log_tail,
     summarize_log_tail,
-    refresh_proxy,
-    restart_proxy,
     run_failed_retry_now,
     run_task_now,
     run_unsent_retry_now,
@@ -239,7 +242,8 @@ def login_desktop_public_url(request: Request) -> str:
         or settings.get("login_desktop_public_url")
         or ""
     ).strip()
-    if configured_url:
+    shared = str(os.getenv("SPARKFLOW_SHARED_MODE", "")).lower() in {"1", "true", "yes", "on"}
+    if configured_url and not shared:
         return configured_url
     if login_desktop_display_mode() == "native":
         return ""
@@ -1276,9 +1280,21 @@ def create_app():
         "on",
     }
     app = FastAPI(title="DouYin Spark Flow Admin", lifespan=lifespan)
+    shared = str(os.getenv("SPARKFLOW_SHARED_MODE", "")).lower() in {"1", "true", "yes", "on"}
+    allowed_hosts = [host.strip() for host in os.getenv("SPARKFLOW_ALLOWED_HOSTS", "").split(",") if host.strip()]
+    bootstrap_token = os.getenv("SPARKFLOW_BOOTSTRAP_TOKEN", "")
+    if shared:
+        if not allowed_hosts or any("*" in host for host in allowed_hosts):
+            raise ValueError("Shared mode requires explicit SPARKFLOW_ALLOWED_HOSTS (without wildcards).")
+        if not settings.get("admin_password_hash") and len(bootstrap_token) < 24:
+            raise ValueError("Set SPARKFLOW_BOOTSTRAP_TOKEN to at least 24 characters before shared setup.")
     # Per app instance so each test client starts clean; production runs one.
     login_throttle = LoginThrottle()
     app.state.login_throttle = login_throttle
+    rp_id = os.getenv("SPARKFLOW_PASSKEY_RP_ID", "").strip()
+    origin = os.getenv("SPARKFLOW_PASSKEY_ORIGIN", "").strip()
+    passkeys = PasskeyStore(rp_id, origin) if rp_id or origin else None
+    register_passkey_routes(app, passkeys, login_throttle)
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings["session_secret"],
@@ -1286,6 +1302,9 @@ def create_app():
         same_site="lax",
         https_only=secure_cookie,
     )
+    if allowed_hosts:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts, www_redirect=False)
+    app.add_middleware(SecurityMiddleware, shared=shared, public_scheme="https" if secure_cookie else None)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     DEBUG_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1308,6 +1327,9 @@ def create_app():
                 "is_https": is_https_request(request),
                 "principal": current_principal(request),
                 "is_admin": bool(current_principal(request) and current_principal(request).get("role") == "admin"),
+                "host_operations_enabled": False,
+                "passkeys_enabled": passkeys is not None,
+                "setup_in_progress": request.session.get("setup_in_progress", False),
                 "app_settings": public_app_settings(),
                 "login_desktop_public_url": login_desktop_public_url(request),
                 "login_desktop_display_mode": login_desktop_display_mode(),
@@ -1380,6 +1402,17 @@ def create_app():
         if principal(request).get("role") != "admin":
             return PlainTextResponse("Forbidden", status_code=403)
         return None
+
+    def confirm_password(request, username, password):
+        from webui.users import authenticate
+        client_ip = request.client.host if request.client else ""
+        if login_throttle.retry_after(client_ip, username):
+            return False
+        if not authenticate(username, password):
+            login_throttle.record_failure(client_ip, username)
+            return False
+        login_throttle.record_success(client_ip, username)
+        return True
 
     def account_for_request(request, unique_id):
         accounts, _ = ensure_account_refs(get_userData(force_reload=True))
@@ -1459,6 +1492,7 @@ def create_app():
             {
                 "flash": pop_flash(request),
                 "bootstrapped": is_bootstrapped(),
+                "bootstrap_token_required": bool(bootstrap_token),
             },
         )
 
@@ -1469,7 +1503,13 @@ def create_app():
             return redirect("/login")
 
         form = await request.form()
+        if bootstrap_token and not secrets.compare_digest(str(form.get("bootstrap_token", "")).encode("utf-8"), bootstrap_token.encode("utf-8")):
+            return PlainTextResponse("Invalid setup token", status_code=403)
         username = str(form.get("username", "admin")).strip() or "admin"
+        from webui.users import USERNAME_RE
+        if not USERNAME_RE.fullmatch(username):
+            flash(request, "用户名只能包含字母、数字、下划线、点和短横线，最多 64 位。", "error")
+            return redirect("/login")
         password = str(form.get("password", ""))
         confirm = str(form.get("confirm_password", ""))
         if not password or password != confirm:
@@ -1480,7 +1520,10 @@ def create_app():
             flash(request, problem, "error")
             return redirect("/login")
 
-        bootstrap_admin_password(password, username=username)
+        try:
+            bootstrap_admin_password(password, username=username)
+        except BootstrapAlreadyConfigured:
+            return PlainTextResponse("Admin login is already configured.", status_code=409)
         flash(request, "Admin credentials created. Please log in.", "success")
         return redirect("/login")
 
@@ -1499,13 +1542,13 @@ def create_app():
         wait = login_throttle.retry_after(client_ip, username)
         if wait:
             minutes = max(1, (wait + 59) // 60)
-            logger.warning("Web login locked for ip=%s user=%s retry_after=%ss", client_ip, username[:40], wait)
+            logger.warning("Web login locked for ip=%s user=%r retry_after=%ss", client_ip, username[:40], wait)
             flash(request, f"登录失败次数过多，请 {minutes} 分钟后再试。", "error")
             return redirect("/login")
         identity = authenticate(username, password)
         if not identity:
             login_throttle.record_failure(client_ip, username)
-            logger.warning("Web login failed for ip=%s user=%s", client_ip, username[:40])
+            logger.warning("Web login failed for ip=%s user=%r", client_ip, username[:40])
             flash(request, "Invalid username or password.", "error")
             return redirect("/login")
         login_throttle.record_success(client_ip, username)
@@ -1522,6 +1565,9 @@ def create_app():
 
     @app.post("/logout")
     async def logout_action(request: Request):
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
         clear_session(request)
         return redirect("/login")
 
@@ -1550,6 +1596,9 @@ def create_app():
         if current.get("role") == "admin":
             flash(request, "请在系统设置中修改管理员密码。", "info")
             return redirect("/settings#system")
+        if not confirm_password(request, current["username"], str(form.get("current_password", ""))):
+            flash(request, "当前密码不正确或尝试次数过多，请稍后重试。", "error")
+            return redirect("/settings#password")
         password = str(form.get("new_password", ""))
         confirm = str(form.get("confirm_password", ""))
         if not password or password != confirm:
@@ -1617,6 +1666,21 @@ def create_app():
                 account_refs=refs,
             )
             flash(request, "普通用户已更新。", "success")
+        except UserStoreError as exc:
+            flash(request, str(exc), "error")
+        return redirect("/settings#users")
+
+    @app.post("/admin/users/{username}/revoke-sessions")
+    async def revoke_user_sessions(request: Request, username: str):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+        try:
+            update_web_user(username, revoke_sessions=True)
+            flash(request, "该用户的登录会话已撤销，下次操作需要重新登录。", "success")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
         return redirect("/settings#users")
@@ -1707,6 +1771,47 @@ def create_app():
             "accounts": list((ops.get("send_console") or {}).get("accounts") or []),
         }
 
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        request.session["setup_in_progress"] = True
+        accounts = get_visible_accounts(principal(request))
+        selected = str(request.query_params.get("account", request.session.get("setup_account_ref", "")))
+        account = next((item for item in accounts if item.get("account_ref") == selected), None)
+        account = account or next((item for item in accounts if item.get("cookies")), None)
+        if account:
+            request.session["setup_account_ref"] = account["account_ref"]
+        ready = bool(account and account.get("cookies"))
+        has_targets = bool(ready and (account.get("targets") or account.get("group_targets")))
+        suggested = 1 if not ready else (2 if not has_targets else 3)
+        try:
+            step = max(1, min(4, int(request.query_params.get("step", suggested))))
+        except ValueError:
+            step = suggested
+        if step > 1 and not ready:
+            step = 1
+        elif step > 2 and not has_targets:
+            step = 2
+        return render_template(request, "setup.html", {
+            "step": step, "setup_account": account, "accounts": accounts,
+            "ready": ready, "has_targets": has_targets,
+            "window": get_config(force_reload=True).get("dailySendWindow", {}),
+        })
+
+    @app.post("/setup/finish")
+    async def finish_setup(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+        request.session.pop("setup_in_progress", None)
+        request.session.pop("setup_account_ref", None)
+        return redirect("/")
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request):
         maybe_redirect = require_user(request)
@@ -1746,6 +1851,8 @@ def create_app():
         if maybe_redirect:
             return maybe_redirect
         context = console_context(request, with_admin_data=True)
+        identity = passkey_identity(principal(request)["username"]) if passkeys else None
+        context["passkey_list"] = passkeys.list_keys(identity) if identity else []
         if principal(request).get("role") == "admin":
             context["notify"] = notify.notifications_view(
                 get_config(force_reload=True).get("notifications")
@@ -2970,6 +3077,10 @@ def create_app():
             return Response("Invalid CSRF token", status_code=403)
 
         settings = get_app_settings(force_reload=True)
+        if str(form.get("new_password", "")):
+            if not confirm_password(request, principal(request)["username"], str(form.get("current_password", ""))):
+                flash(request, "当前密码不正确或尝试次数过多，设置未保存。", "error")
+                return redirect("/settings#system")
         settings["compose_root"] = str(form.get("compose_root", settings.get("compose_root", ""))).strip()
         settings["ops_log_file"] = str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()
         settings["proxy_refresh_script"] = str(form.get("proxy_refresh_script", settings.get("proxy_refresh_script", ""))).strip()
@@ -3112,32 +3223,12 @@ def create_app():
         return redirect("/ops/send-console")
 
     @app.post("/ops/proxy/refresh")
-    async def proxy_refresh(request: Request):
-        maybe_redirect = require_admin(request)
-        if maybe_redirect:
-            return maybe_redirect
-
-        form = await request.form()
-        if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return Response("Invalid CSRF token", status_code=403)
-
-        refresh_proxy()
-        flash(request, "Proxy subscription refreshed.", "success")
-        return redirect("/settings#ops")
-
     @app.post("/ops/proxy/restart")
-    async def proxy_restart(request: Request):
+    async def proxy_maintenance_unavailable(request: Request):
         maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
-
-        form = await request.form()
-        if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return Response("Invalid CSRF token", status_code=403)
-
-        restart_proxy()
-        flash(request, "Proxy container restarted.", "success")
-        return redirect("/settings#ops")
+        return PlainTextResponse("Manage the proxy on the server", status_code=403)
 
     @app.post("/ops/schedule")
     async def save_schedule(request: Request):
@@ -3403,6 +3494,22 @@ def create_app():
                         elif message.get("text") is not None:
                             await upstream.send(message["text"])
 
+                async def watch_workspace():
+                    while True:
+                        await asyncio.sleep(1)
+                        live = current_principal(websocket)
+                        lease = get_login_lock()
+                        if not live or not owns_login_lock(
+                            lease,
+                            username=live.get("username", ""),
+                            session_id=live.get("session_id", ""),
+                        ) or (
+                            lease.get("account_ref") and live.get("role") != "admin"
+                            and lease["account_ref"] not in live.get("account_refs", [])
+                        ):
+                            await websocket.close(code=4403)
+                            return
+
                 async def upstream_to_client():
                     async for message in upstream:
                         if isinstance(message, bytes):
@@ -3410,7 +3517,7 @@ def create_app():
                         else:
                             await websocket.send_text(message)
 
-                await _run_websocket_relays(client_to_upstream(), upstream_to_client())
+                await _run_websocket_relays(client_to_upstream(), upstream_to_client(), watch_workspace())
         except (ConnectionClosed, WebSocketDisconnect):
             pass
         except Exception as exc:

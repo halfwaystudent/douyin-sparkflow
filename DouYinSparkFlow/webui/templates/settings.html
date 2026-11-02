@@ -11,7 +11,7 @@
 {% if is_admin %}
 {% set summary = ops.send_console.summary %}
 {% set total = summary.total_targets or 0 %}
-<div class="settings-layout">
+<div class="settings-layout" data-settings-tabs>
   <nav class="settings-nav" aria-label="设置分区">
     <a href="#messages"><i data-lucide="message-circle-heart"></i>消息</a>
     <a href="#schedule"><i data-lucide="calendar-clock"></i>发送窗口</a>
@@ -19,6 +19,7 @@
     <a href="#system"><i data-lucide="server-cog"></i>系统</a>
     <a href="#notify"><i data-lucide="bell"></i>推送通知</a>
     <a href="#users"><i data-lucide="users-round"></i>Web 用户</a>
+    {% if passkeys_enabled %}<a href="#passkeys"><i data-lucide="fingerprint"></i>通行密钥</a>{% endif %}
   </nav>
 
   <div>
@@ -115,6 +116,7 @@
             <i data-lucide="send"></i><span>全部重发</span>
           </button>
         </form>
+        {% if host_operations_enabled %}
         <form method="post" action="/ops/proxy/refresh">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="button button-quiet" type="submit"><i data-lucide="cloud-download"></i><span>刷新代理订阅</span></button>
@@ -129,6 +131,7 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="button button-danger" type="submit"><i data-lucide="power"></i><span>重启代理</span></button>
         </form>
+        {% endif %}
       </div>
     </section>
 
@@ -158,6 +161,7 @@
         </div>
         <fieldset>
           <legend>修改管理员密码（留空表示不修改）</legend>
+          <label class="field"><span>当前密码</span><input type="password" name="current_password" autocomplete="current-password"></label>
           <div class="form-grid">
             <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种"></label>
             <label class="field"><span>确认新密码</span><input type="password" name="confirm_password" autocomplete="new-password"></label>
@@ -239,6 +243,7 @@
     </section>
     {% endif %}
 
+    {% include 'passkeys.html' %}
     <section class="card settings-section" id="users">
       <div class="card-head">
         <div>
@@ -310,6 +315,16 @@
               </fieldset>
               <div class="form-actions"><button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存用户</span></button></div>
             </form>
+            <form method="post" action="/admin/users/{{ web_user.username }}/revoke-sessions" data-confirm="撤销该用户的所有登录会话？用户可以用原密码重新登录。">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="button button-secondary button-sm" type="submit"><i data-lucide="log-out"></i><span>退出所有会话</span></button>
+            </form>
+            {% if passkeys_enabled %}
+            <form method="post" action="/admin/users/{{ web_user.username }}/revoke-passkeys" data-confirm="移除该用户的全部通行密钥并撤销会话？用户仍可用密码登录。">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="button button-danger button-sm" type="submit">移除全部通行密钥</button>
+            </form>
+            {% endif %}
             <form method="post" action="/admin/users/{{ web_user.username }}/delete" data-confirm-title="删除 Web 用户" data-confirm="只删除 Web 用户并解除账号绑定，不删除抖音账号数据。确认继续吗？" data-confirm-accept="确认删除">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button class="button button-danger button-sm" type="submit"><i data-lucide="trash-2"></i><span>删除用户</span></button>
@@ -322,6 +337,7 @@
   </div>
 </div>
 {% else %}
+{% include 'passkeys.html' %}
 <section class="card settings-section" id="password" style="max-width: 560px">
   <div class="card-head">
     <div>
@@ -330,6 +346,7 @@
     </div>
   </div>
   <form method="post" action="/account/password" class="form-stack">
+    <label class="field"><span>当前密码</span><input type="password" name="current_password" autocomplete="current-password" required></label>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种" required></label>
     <label class="field"><span>确认新密码</span><input type="password" name="confirm_password" autocomplete="new-password" required></label>

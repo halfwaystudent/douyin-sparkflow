@@ -186,6 +186,7 @@ prepare_runtime_files() {
   if [ ! -f "$env_file" ]; then
     run_root cp "$APP_ROOT/.env.example" "$env_file"
   fi
+  run_root chmod 600 "$env_file"
 
   set_env_value "$env_file" "APP_ROOT" "$APP_ROOT"
   set_env_value "$env_file" "DEFAULT_SCHEDULE" "$DEFAULT_SCHEDULE"
@@ -250,15 +251,21 @@ compose_up() {
 
 print_summary() {
   local env_file="$APP_ROOT/.env"
-  local web_port login_port login_bind host_ip
+  local web_port web_bind login_port login_bind host_ip
   web_port="$(read_env_value "$env_file" WEB_PORT)"
+  web_bind="$(read_env_value "$env_file" WEB_BIND_ADDRESS)"
   login_port="$(read_env_value "$env_file" LOGIN_DESKTOP_WEB_PORT)"
   login_bind="$(read_env_value "$env_file" LOGIN_DESKTOP_BIND_ADDRESS)"
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   host_ip="${host_ip:-127.0.0.1}"
   echo
   echo "Douyin SparkFlow is running."
-  echo "Web UI: http://${host_ip}:${web_port:-8787}"
+  if [ "${web_bind:-127.0.0.1}" = "127.0.0.1" ]; then
+    echo "Web UI is local-only: http://127.0.0.1:${web_port:-8787}"
+    echo "Use an HTTPS reverse proxy or SSH tunnel: ssh -L ${web_port:-8787}:127.0.0.1:${web_port:-8787} <user>@${host_ip}"
+  else
+    echo "Web UI: http://${host_ip}:${web_port:-8787}"
+  fi
   if [ "${login_bind:-127.0.0.1}" = "127.0.0.1" ]; then
     echo "Login desktop is local-only: http://127.0.0.1:${login_port:-8788}/vnc.html?autoconnect=1&resize=scale&view_only=0"
     echo "For remote access, create an SSH tunnel: ssh -L ${login_port:-8788}:127.0.0.1:${login_port:-8788} <user>@${host_ip}"

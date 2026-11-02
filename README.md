@@ -115,7 +115,7 @@ bash ./deploy/install-local.sh
 ```
 
 **服务端口说明**：
-- `8787`：Web 管理控制台，默认监听全部网卡
+- `8787`：Web 管理控制台，默认只绑定 `127.0.0.1`，远程访问使用 HTTPS 反向代理或 SSH 隧道
 - `8788`：noVNC 登录桌面，默认只绑定 `127.0.0.1`
 - `7890` / `9090`：代理和控制端口，默认只绑定 `127.0.0.1`
 
@@ -211,6 +211,8 @@ douyin-sparkflow/
 
 ## 📖 使用文档
 
+多人共用部署见 [共享部署说明](docs/shared-deployment.md)，包含用户分配、会话撤销和 HTTPS 配置。
+
 ### 🔑 账号管理
 
 - **扫码 / Cookie 登录**：在登录工作区用抖音 APP 扫码，或粘贴 Cookie，保存前会验证
@@ -251,7 +253,7 @@ douyin-sparkflow/
 #### `.env` - 环境变量配置
 
 ```bash
-WEB_BIND_ADDRESS=0.0.0.0
+WEB_BIND_ADDRESS=127.0.0.1
 WEB_PORT=8787
 
 # noVNC 默认仅允许本机或 SSH 隧道访问
@@ -533,6 +535,8 @@ Web 通过 HTTPS 反向代理部署时，可设置 `SPARKFLOW_SESSION_COOKIE_SEC
 ---
 
 ## 📄 许可证
+
+安全加固、共享用户管理、通行密钥、使用引导和手机适配的新增贡献署名：**wuha-like-sleep**。详见 [NOTICE](NOTICE)，原项目版权和许可证保持不变。
 
 本项目自有代码采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，仅授权非商业用途。本项目为公开源码项目，不授予商业使用权；如需商业使用，请事先取得版权持有人的书面授权。
 

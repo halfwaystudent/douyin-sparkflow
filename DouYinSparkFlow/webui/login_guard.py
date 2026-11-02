@@ -190,6 +190,8 @@ def password_problem(password, username=""):
     Applies to passwords being set now; existing passwords keep working.
     """
     value = str(password or "")
+    if len(value) > 1024:
+        return "密码不能超过 1024 位。"
     if len(value) < PASSWORD_MIN_LENGTH:
         return f"密码至少需要 {PASSWORD_MIN_LENGTH} 位。"
     classes = sum(

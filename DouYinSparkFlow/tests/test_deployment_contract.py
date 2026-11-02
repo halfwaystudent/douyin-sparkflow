@@ -76,8 +76,12 @@ class DeploymentContractTests(unittest.TestCase):
         scheduler = text.split("  scheduler:", 1)[1].split("\n  task:", 1)[0]
         task = text.split("  task:", 1)[1]
 
-        self.assertIn("/var/run/docker.sock:/var/run/docker.sock", web)
-        self.assertIn(".:/opt/douyin-sparkflow", web)
+        self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", web)
+        self.assertNotIn(".:/opt/douyin-sparkflow", web)
+        self.assertIn("${WEB_BIND_ADDRESS:-127.0.0.1}", web)
+        for service in (web, scheduler, task):
+            self.assertIn("no-new-privileges:true", service)
+            self.assertIn("cap_drop: [ALL]", service)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", scheduler)
         self.assertNotIn(".:/opt/douyin-sparkflow", scheduler)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", task)

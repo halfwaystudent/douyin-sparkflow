@@ -66,6 +66,7 @@
 {% endblock %}
 
 {% block content %}
+{% if not accounts %}<p class="callout"><span>第一次使用？跟着引导完成账号和发送设置。</span><a class="button button-primary" href="/setup">开始设置</a></p>{% endif %}
 <div data-overview-root>
   <div
     class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"

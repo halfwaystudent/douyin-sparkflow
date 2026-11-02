@@ -1,5 +1,8 @@
 services:
   proxy:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     image: metacubex/mihomo:latest
     container_name: mihomo
     restart: unless-stopped
@@ -15,6 +18,9 @@ services:
       - ./proxy/config.yaml:/root/.config/mihomo/config.yaml:ro
 
   web:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     build:
       context: ./DouYinSparkFlow
       dockerfile: Dockerfile.server
@@ -42,19 +48,23 @@ services:
       SPARKFLOW_LOGIN_DESKTOP_NOVNC_WS_URL: ws://login-desktop:6080/websockify
       SPARKFLOW_LOGIN_DESKTOP_API_TOKEN_FILE: /run/login-api/token
       SPARKFLOW_SESSION_COOKIE_SECURE: ${SPARKFLOW_SESSION_COOKIE_SECURE:-0}
+      SPARKFLOW_PASSKEY_RP_ID: ${SPARKFLOW_PASSKEY_RP_ID:-}
+      SPARKFLOW_PASSKEY_ORIGIN: ${SPARKFLOW_PASSKEY_ORIGIN:-}
       DOCKER_API_VERSION: ${DOCKER_API_VERSION:-}
     ports:
-      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-8787}:8787"
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8787}:8787"
     command: python main.py --web --host 0.0.0.0 --port 8787
     volumes:
       - ./DouYinSparkFlow:/app
       - ./DouYinSparkFlow/logs:/app/logs
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./state/cron:/host-spool-cron
       - ./state/login-api:/run/login-api:ro
-      - .:/opt/douyin-sparkflow
+      - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
 
   login-desktop:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     image: douyin-sparkflow:local
     container_name: login-desktop
     restart: unless-stopped
@@ -90,6 +100,9 @@ services:
       - ./state/login-api:/run/login-api
 
   scheduler:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     image: douyin-sparkflow:local
     container_name: douyin-scheduler
     restart: unless-stopped
@@ -106,6 +119,9 @@ services:
       - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
 
   task:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
     image: douyin-sparkflow:local
     container_name: douyin-task
     depends_on:

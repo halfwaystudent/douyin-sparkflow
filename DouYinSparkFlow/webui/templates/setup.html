@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}使用引导{% endblock %}
+{% block page_title %}一步一步完成设置{% endblock %}
+{% block page_sub %}<p class="page-sub">第 {{ step }} 步，共 4 步。每次只处理一件事。</p>{% endblock %}
+{% block content %}
+<div class="setup-wizard">
+  <ol class="setup-steps" aria-label="设置进度">
+    {% for label in ['登录账号', '选择目标', '发送设置', '完成'] %}
+    <li {% if loop.index == step %}aria-current="step"{% endif %}><span>{{ loop.index }}</span>{{ label }}</li>
+    {% endfor %}
+  </ol>
+  <section class="card form-stack">
+    {% if step == 1 %}
+    <h2>先登录你的抖音账号</h2>
+    <p class="muted">打开登录工作区，扫码或粘贴 Cookie，核对账号后保存。多人同时登录时会依次排队。</p>
+    <a class="button button-primary" href="/login-workspace">打开登录工作区</a>
+    {% if ready %}<p>已保存：{{ setup_account.username }}</p>{% endif %}
+    {% elif step == 2 %}
+    <h2>选择需要续火花的人</h2>
+    <p class="muted">进入账号页，刷新好友或群列表，勾选目标并保存。只选择愿意接收消息的人。</p>
+    <p>当前账号：{{ setup_account.username }}</p>
+    {% if accounts|length > 1 %}
+    <form method="get" action="/setup" class="form-stack">
+      <input type="hidden" name="step" value="2">
+      <label class="field"><span>切换账号</span><select name="account">{% for account in accounts %}<option value="{{ account.account_ref }}" {% if account.account_ref == setup_account.account_ref %}selected{% endif %}>{{ account.username }}</option>{% endfor %}</select></label>
+      <button class="button button-quiet" type="submit">切换</button>
+    </form>
+    {% endif %}
+    <a class="button button-primary" href="/accounts?_anchor=account-{{ setup_account.unique_id }}">选择好友或群</a>
+    {% if has_targets %}<p>已保存发送目标，可以继续。</p>{% endif %}
+    {% elif step == 3 %}
+    <h2>确认发送安排</h2>
+    {% if window.enabled %}<p>发送窗口：{{ window.startHour }}:00–{{ window.endHour }}:00，每天在窗口内分批发送。</p>{% else %}<p>当前未启用发送窗口，具体安排由管理员设置。</p>{% endif %}
+    {% if is_admin %}
+    <p class="muted">先设置消息内容，再确认每天的发送时间。保存后返回这里继续。</p>
+    <div class="form-actions"><a class="button button-quiet" href="/settings?_anchor=messages">设置消息内容</a><a class="button button-quiet" href="/settings?_anchor=schedule">设置发送时间</a></div>
+    {% else %}<p class="muted">消息内容和发送时间由管理员统一设置；如需调整，请联系管理员。</p>{% endif %}
+    {% else %}
+    <h2>设置完成</h2>
+    <p>已保存 {{ setup_account.username }} 的账号和目标。可以在“今日”查看进度，在“明细”核对发送结果。</p>
+    <p class="muted">完成引导不会立即发送消息；自动任务按保存的发送安排运行。</p>
+    {% if passkeys_enabled %}<a class="button button-quiet" href="/settings?_anchor=passkeys">绑定通行密钥，下次用设备验证登录</a>{% endif %}
+    {% endif %}
+    <div class="form-actions">
+      {% if step > 1 %}<a class="button button-quiet" href="/setup?step={{ step - 1 }}&account={{ setup_account.account_ref }}">上一步</a>{% endif %}
+      {% if step < 4 %}
+        {% if (step == 1 and ready) or (step == 2 and has_targets) or step == 3 %}<a class="button button-primary" href="/setup?step={{ step + 1 }}&account={{ setup_account.account_ref }}">下一步</a>{% else %}<a class="button button-quiet" href="/setup?step={{ step }}">已保存，重新检查</a>{% endif %}
+      {% else %}
+      <form method="post" action="/setup/finish"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-primary" type="submit">完成，查看今日进度</button></form>
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}

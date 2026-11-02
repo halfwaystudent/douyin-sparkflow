@@ -111,7 +111,7 @@ DEFAULT_APP_SETTINGS = {
     "session_secret": "",
     "session_max_age_seconds": 8 * 60 * 60,
     "compose_root": "",
-    "ui_host": "0.0.0.0",
+    "ui_host": "127.0.0.1",
     "ui_port": 8787,
     "login_poll_interval_seconds": 1,
     "ops_log_file": "/app/logs/douyin-sparkflow.log",
@@ -494,13 +494,17 @@ def _migrate_legacy_app_settings(settings):
 def get_app_settings(force_reload=False):
     global appSettings
     if appSettings is None or force_reload:
-        appSettings = _load_json_file(app_settings_path(), DEFAULT_APP_SETTINGS)
-        _migrate_legacy_app_settings(appSettings)
-        if not appSettings.get("session_secret"):
-            appSettings["session_secret"] = secrets.token_urlsafe(32)
-        if not appSettings.get("compose_root"):
-            appSettings["compose_root"] = default_compose_root()
-        _save_json_file(app_settings_path(), appSettings)
+        target = app_settings_path()
+        with FileLock(f"{target}.lock", timeout=30):
+            appSettings = _load_json_file(target, DEFAULT_APP_SETTINGS)
+            before = deepcopy(appSettings)
+            _migrate_legacy_app_settings(appSettings)
+            if not appSettings.get("session_secret"):
+                appSettings["session_secret"] = secrets.token_urlsafe(32)
+            if not appSettings.get("compose_root"):
+                appSettings["compose_root"] = default_compose_root()
+            if appSettings != before:
+                _save_json_file(target, appSettings)
     return deepcopy(appSettings)
 
 
@@ -524,5 +528,6 @@ def save_app_settings(new_settings):
         appSettings["session_secret"] = secrets.token_urlsafe(32)
     if not appSettings.get("compose_root"):
         appSettings["compose_root"] = default_compose_root()
-    _save_json_file(app_settings_path(), appSettings)
+    with FileLock(f"{app_settings_path()}.lock", timeout=30):
+        _save_json_file(app_settings_path(), appSettings)
     return deepcopy(appSettings)

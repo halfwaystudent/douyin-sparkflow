@@ -6,3 +6,4 @@ python-multipart==0.0.32
 uvicorn==0.54.0
 starlette==1.7.0
 tzdata==2026.6
+webauthn==3.0.1

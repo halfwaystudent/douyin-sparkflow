@@ -319,11 +319,10 @@ class RedesignedPagesTests(unittest.TestCase):
         with (
             patch.object(app_module, "validate_csrf", return_value=True),
             patch.object(app_module, "update_config"),
-            patch.object(app_module, "refresh_proxy"),
             patch.object(app_module, "create_web_user"),
         ):
             self.assertEqual("/settings?_anchor=messages", self.client.post("/config", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
-            self.assertEqual("/settings?_anchor=ops", self.client.post("/ops/proxy/refresh", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
+            self.assertEqual(403, self.client.post("/ops/proxy/refresh", data={"csrf_token": "t"}, follow_redirects=False).status_code)
             self.assertEqual("/settings?_anchor=users", self.client.post("/admin/users/create", data={"csrf_token": "t", "username": "a", "password": "b"}, follow_redirects=False).headers["location"])
 
     def test_theme_follows_the_system_until_the_user_picks_one(self):

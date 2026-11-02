@@ -2,7 +2,13 @@ import hashlib
 import hmac
 import secrets
 
-from utils.config import get_app_settings, save_app_settings
+from filelock import FileLock
+
+from utils.config import app_settings_path, get_app_settings, save_app_settings
+
+
+class BootstrapAlreadyConfigured(ValueError):
+    pass
 
 
 def hash_password(password, salt=None):
@@ -12,6 +18,8 @@ def hash_password(password, salt=None):
 
 
 def verify_password(password, stored_hash):
+    if len(password) > 1024:
+        return False
     if not stored_hash or "$" not in stored_hash:
         return False
     try:
@@ -25,7 +33,7 @@ def verify_password(password, stored_hash):
 
 
 def is_bootstrapped():
-    return bool(get_app_settings().get("admin_password_hash"))
+    return bool(get_app_settings(force_reload=True).get("admin_password_hash"))
 
 
 def _session_version(value):
@@ -36,11 +44,14 @@ def _session_version(value):
 
 
 def bootstrap_admin_password(password, username="admin"):
-    settings = get_app_settings(force_reload=True)
-    settings["admin_username"] = username.strip() or "admin"
-    settings["admin_password_hash"] = hash_password(password)
-    settings["admin_session_version"] = _session_version(settings.get("admin_session_version")) + 1
-    return save_app_settings(settings)
+    with FileLock(f"{app_settings_path()}.bootstrap.lock", timeout=30):
+        settings = get_app_settings(force_reload=True)
+        if settings.get("admin_password_hash"):
+            raise BootstrapAlreadyConfigured("Admin login is already configured.")
+        settings["admin_username"] = username.strip() or "admin"
+        settings["admin_password_hash"] = hash_password(password)
+        settings["admin_session_version"] = _session_version(settings.get("admin_session_version")) + 1
+        return save_app_settings(settings)
 
 
 def update_admin_password(password):
@@ -76,10 +87,10 @@ def current_principal(request):
     session_id = request.session.get("session_id", "")
     role = request.session.get("role")
     session_version = _session_version(request.session.get("auth_version"))
-    admin_username = str(get_app_settings().get("admin_username", "admin")).strip() or "admin"
+    settings = get_app_settings(force_reload=True)
+    admin_username = str(settings.get("admin_username", "admin")).strip() or "admin"
     if role == "admin" or (role is None and username.casefold() == admin_username.casefold()):
-        settings = get_app_settings()
-        if session_version != _session_version(settings.get("admin_session_version")):
+        if username.casefold() != admin_username.casefold() or session_version != _session_version(settings.get("admin_session_version")):
             return None
         return {
             "username": admin_username,
@@ -122,7 +133,7 @@ def csrf_token(request):
 
 def validate_csrf(request, submitted_token):
     stored_token = request.session.get("csrf_token")
-    return bool(stored_token and submitted_token and hmac.compare_digest(stored_token, submitted_token))
+    return bool(stored_token and submitted_token and hmac.compare_digest(stored_token.encode("utf-8"), submitted_token.encode("utf-8")))
 
 
 def is_https_request(request):

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT_OVERRIDE="${APP_ROOT:-}"
@@ -78,7 +79,13 @@ ensure_line() {
   local key="$1"
   local value="$2"
   if grep -q "^${key}:" "$CONFIG_FILE"; then
-    sed -i "s#^${key}:.*#${key}: ${value}#" "$CONFIG_FILE"
+    local updated_file
+    updated_file="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
+    if ! sed "s#^${key}:.*#${key}: ${value}#" "$CONFIG_FILE" > "$updated_file"; then
+      rm -f "$updated_file"
+      return 1
+    fi
+    mv "$updated_file" "$CONFIG_FILE"
   else
     printf '%s: %s\n' "$key" "$value" >> "$CONFIG_FILE"
   fi
@@ -89,6 +96,7 @@ ensure_line "allow-lan" "true"
 ensure_line "bind-address" "'*'"
 ensure_line "external-controller" "'0.0.0.0:9090'"
 ensure_line "secret" "'$controller_secret'"
+chmod 600 "$CONFIG_FILE"
 
 if command -v docker >/dev/null 2>&1 && [ -f "$APP_ROOT/docker-compose.yml" ]; then
   if docker compose version >/dev/null 2>&1; then

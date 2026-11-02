@@ -1,10 +1,51 @@
+(() => {
+  const layout = document.querySelector("[data-settings-tabs]");
+  if (!layout) return;
+  const links = [...layout.querySelectorAll(".settings-nav a")];
+  const panels = [...layout.querySelectorAll("section.settings-section")];
+  const select = () => {
+    const requested = window.location.hash.slice(1)
+      || new URLSearchParams(window.location.search).get("_anchor");
+    const selected = panels.find((panel) => panel.id === requested) || panels[0];
+    panels.forEach((panel) => { panel.hidden = panel !== selected; });
+    links.forEach((link) => {
+      const active = link.hash === `#${selected.id}`;
+      link.classList.toggle("active", active);
+      if (active) link.setAttribute("aria-current", "location");
+      else link.removeAttribute("aria-current");
+    });
+  };
+  links.forEach((link) => {
+    link.addEventListener("click", (event) => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      if (!panels.some((panel) => `#${panel.id}` === link.hash)) return;
+      event.preventDefault();
+      const url = new URL(window.location.href);
+      url.searchParams.delete("_anchor");
+      url.hash = link.hash;
+      window.history.pushState(null, "", url);
+      select();
+      layout.scrollIntoView({ block: "start" });
+    });
+  });
+  window.addEventListener("hashchange", select);
+  window.addEventListener("popstate", select);
+  select();
+})();
+
 // Query-based positioning avoids fragment-encoding bugs in mobile redirects.
 (() => {
   const position = () => {
-    const anchor = new URLSearchParams(window.location.search).get("_anchor");
+    const anchor = new URLSearchParams(window.location.search).get("_anchor") || window.location.hash.slice(1);
     if (!anchor) return;
     const target = document.getElementById(anchor);
-    if (target) target.scrollIntoView({ block: "start" });
+    if (target) {
+      if (target.matches("details")) target.open = true;
+      for (let parent = target.parentElement; parent; parent = parent.parentElement) {
+        if (parent.matches("details")) parent.open = true;
+      }
+      target.scrollIntoView({ block: "start" });
+    }
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", position, { once: true });

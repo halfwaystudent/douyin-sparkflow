@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import tempfile
@@ -37,6 +38,17 @@ def _web_users_lock():
 
 def normalize_username(username: str) -> str:
     return str(username or "").strip().casefold()
+
+
+def _reserved_username(username):
+    settings = get_app_settings(force_reload=True)
+    return normalize_username(username) in {
+        "admin", normalize_username(settings.get("admin_username") or "admin"),
+    }
+
+
+def stable_user_id(user):
+    return str(user.get("user_id") or "legacy-" + hashlib.sha256(normalize_username(user["username"]).encode()).hexdigest())
 
 
 def _coerce_session_version(value) -> int:
@@ -88,6 +100,7 @@ def get_web_users(force_reload: bool = False) -> list[dict]:
         users.append(
             {
                 "username": username,
+                "user_id": stable_user_id(raw),
                 "role": "user",
                 "password_hash": str(raw.get("password_hash", "")),
                 "enabled": bool(raw.get("enabled", True)),
@@ -109,7 +122,7 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
     for raw in users:
         username = str(raw.get("username", "")).strip()
         key = normalize_username(username)
-        if not username or key == normalize_username("admin") or key in seen:
+        if not username or _reserved_username(username) or key in seen:
             raise UserStoreError("invalid or duplicate Web user")
         if not USERNAME_RE.fullmatch(username):
             raise UserStoreError("Web username may contain only letters, digits, _, ., and -")
@@ -126,6 +139,7 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
         normalized.append(
             {
                 "username": username,
+                "user_id": stable_user_id(raw),
                 "role": "user",
                 "password_hash": password_hash,
                 "enabled": bool(raw.get("enabled", True)),
@@ -308,7 +322,7 @@ def create_web_user(username: str, password: str, *, enabled: bool = True, accou
             _load_raw().get("auth_epoch")
         ) + 1
         username = str(username or "").strip()
-        if not USERNAME_RE.fullmatch(username) or normalize_username(username) == normalize_username("admin"):
+        if not USERNAME_RE.fullmatch(username) or _reserved_username(username):
             raise UserStoreError("invalid Web username")
         if not password:
             raise UserStoreError("password is required")
@@ -318,6 +332,7 @@ def create_web_user(username: str, password: str, *, enabled: bool = True, accou
             raise UserStoreError("one or more accounts are already assigned")
         item = {
             "username": username,
+            "user_id": uuid.uuid4().hex,
             "role": "user",
             "password_hash": hash_password(password),
             "enabled": bool(enabled),
@@ -339,6 +354,7 @@ def update_web_user(
     enabled: bool | None = None,
     account_refs: list[str] | None = None,
     append_account_ref: str | None = None,
+    revoke_sessions: bool = False,
 ) -> dict:
     if append_account_ref is not None and account_refs is not None:
         raise UserStoreError("cannot replace and append account references together")
@@ -353,14 +369,14 @@ def update_web_user(
         if target is None:
             raise UserStoreError("Web user not found")
         original_username = target["username"]
-        revoke_session = False
+        revoke_session = revoke_sessions
         if new_username is not None:
             new_username = str(new_username).strip()
-            if not USERNAME_RE.fullmatch(new_username) or normalize_username(new_username) == normalize_username("admin"):
+            if not USERNAME_RE.fullmatch(new_username) or _reserved_username(new_username):
                 raise UserStoreError("invalid Web username")
             if normalize_username(new_username) != normalize_username(target["username"]) and find_web_user(new_username):
                 raise UserStoreError("Web username already exists")
-            revoke_session = (
+            revoke_session = revoke_session or (
                 normalize_username(new_username)
                 != normalize_username(target["username"])
             )
@@ -380,6 +396,7 @@ def update_web_user(
         if account_refs is not None:
             if all_assigned_refs(original_username).intersection(refs):
                 raise UserStoreError("one or more accounts are already assigned")
+            revoke_session = revoke_session or set(target["account_refs"]) != set(refs)
             target["account_refs"] = refs
         if revoke_session:
             auth_epoch = max(

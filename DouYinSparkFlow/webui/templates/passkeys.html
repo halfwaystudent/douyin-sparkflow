@@ -1,0 +1,14 @@
+{% if passkeys_enabled %}
+<section class="card settings-section" id="passkeys">
+  <div class="card-head"><div><h2><i data-lucide="fingerprint"></i>通行密钥</h2><p>绑定后可用设备的指纹、面容或 PIN 登录。验证方式取决于设备，密码登录仍可使用。</p></div></div>
+  <div class="form-stack" data-passkey-panel data-csrf-token="{{ csrf_token }}">
+    <label class="field"><span>密钥名称</span><input type="text" name="passkey_label" placeholder="例如：我的手机" maxlength="80"></label>
+    <label class="field"><span>当前密码</span><input type="password" name="passkey_current_password" autocomplete="current-password"></label>
+    <button class="button button-primary" type="button" data-passkey-register><i data-lucide="plus"></i><span>绑定通行密钥</span></button>
+    <p class="notice-inline" role="status" aria-live="polite" data-passkey-status></p>
+    {% for key in passkey_list %}
+    <div class="form-actions"><span>{{ key.label }} · {{ key.created_at }}</span><button type="button" class="button button-danger button-sm" data-passkey-delete="{{ key.id }}" data-csrf-token="{{ csrf_token }}">移除</button></div>
+    {% else %}<p class="muted">还没有绑定通行密钥。</p>{% endfor %}
+  </div>
+</section>
+{% endif %}

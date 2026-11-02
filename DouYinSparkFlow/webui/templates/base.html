@@ -32,7 +32,7 @@
         }
       })();
     </script>
-    <link rel="stylesheet" href="/static/app.css?v=20261024-5">
+    <link rel="stylesheet" href="/static/app.css?v=20261102-1">
   </head>
   <body data-page="{% block page_key %}dashboard{% endblock %}">
     <div class="shell">
@@ -51,6 +51,7 @@
           <a class="nav-item {% if nav == 'login_workspace' %}active{% endif %}" href="/login-workspace"><i data-lucide="scan-qr-code"></i><span>登录</span></a>
           <div class="nav-label">{% if is_admin %}管理{% else %}个人{% endif %}</div>
           <a class="nav-item {% if nav == 'settings' %}active{% endif %}" href="/settings"><i data-lucide="sliders-horizontal"></i><span>{% if is_admin %}设置{% else %}修改密码{% endif %}</span></a>
+          <a class="nav-item" href="/setup"><i data-lucide="route"></i><span>使用引导</span></a>
           {% if is_admin %}
           <a class="nav-item {% if nav == 'logs' %}active{% endif %}" href="/ops/logs"><i data-lucide="scroll-text"></i><span>运行日志</span></a>
           {% endif %}
@@ -65,6 +66,7 @@
             </button>
           </div>
           <form method="post" action="/logout">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="button button-ghost button-sm button-block" type="submit"><i data-lucide="log-out"></i><span>退出登录</span></button>
           </form>
         </div>
@@ -74,6 +76,7 @@
         <header class="mobile-top">
           <a class="brand" href="/"><span class="brand-mark"><i data-lucide="flame"></i></span><span>续火花</span></a>
           <div class="mobile-top-actions">
+            <a class="icon-button" href="/setup" aria-label="使用引导" title="使用引导"><i data-lucide="circle-help"></i></a>
             {% if is_admin %}
             <a class="icon-button" href="/ops/logs" aria-label="运行日志" title="运行日志"><i data-lucide="scroll-text"></i></a>
             {% endif %}
@@ -82,6 +85,7 @@
               <i data-lucide="sun" class="theme-dark-icon"></i>
             </button>
             <form method="post" action="/logout">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button class="icon-button" type="submit" aria-label="退出登录" title="退出登录"><i data-lucide="log-out"></i></button>
             </form>
           </div>
@@ -101,6 +105,9 @@
           <div class="flash flash-{{ flash.level }}" role="status">{{ flash.message }}</div>
           {% endif %}
 
+          {% if setup_in_progress and request.url.path != '/setup' %}
+          <p class="callout"><span>完成当前操作后，返回引导继续下一步。</span><a class="button button-quiet button-sm" href="/setup">返回引导</a></p>
+          {% endif %}
           {% block content %}{% endblock %}
         </main>
       </div>
@@ -125,7 +132,8 @@
     </dialog>
 
     <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20261024-4"></script>
+    <script defer src="/static/app.js?v=20261102-1"></script>
+    <script defer src="/static/passkeys.js?v=20261102-1"></script>
     {% block scripts %}{% endblock %}
   </body>
 </html>

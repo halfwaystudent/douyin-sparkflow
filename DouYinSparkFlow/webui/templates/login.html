@@ -14,7 +14,7 @@
           : (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
       })();
     </script>
-    <link rel="stylesheet" href="/static/app.css?v=20261005-2">
+    <link rel="stylesheet" href="/static/app.css?v=20261102-1">
   </head>
   <body data-page="login">
     <div class="auth">
@@ -52,6 +52,9 @@
 
           {% if not bootstrapped %}
           <form method="post" action="/bootstrap" class="form-stack">
+            {% if bootstrap_token_required %}
+            <label class="field"><span>初始化密钥</span><input type="password" name="bootstrap_token" autocomplete="off" required><small>由服务器管理员提供，仅用于首次创建管理员。</small></label>
+            {% endif %}
             <label class="field">
               <span>管理员用户名</span>
               <input type="text" name="username" value="admin" autocomplete="username">
@@ -84,12 +87,19 @@
           </form>
           {% endif %}
 
+          {% if bootstrapped and passkeys_enabled %}
+          <div data-passkey-panel>
+            <button type="button" class="button button-quiet button-block" data-passkey-login><i data-lucide="fingerprint"></i><span>使用通行密钥登录</span></button>
+            <p class="notice-inline" data-passkey-status role="status" aria-live="polite">填写用户名后，用已绑定的设备验证。</p>
+          </div>
+          {% endif %}
           <p class="auth-foot">登录页不会展示服务器凭据或任何登录态数据。</p>
         </section>
       </main>
     </div>
 
     <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20261005-6"></script>
+    <script defer src="/static/app.js?v=20261102-1"></script>
+    <script defer src="/static/passkeys.js?v=20261102-1"></script>
   </body>
 </html>
