@@ -21,18 +21,28 @@ SPARKFLOW_BOOTSTRAP_TOKEN=填写随机生成的初始化密钥
 
 初始化密钥至少 24 个字符，可以用 `openssl rand -hex 24` 生成。不要提交 `.env`，也不要把密钥放进 URL。多个允许的域名用逗号隔开，不填写协议、端口或通配符。
 
+首次安装先生成存储密钥（主机需要 Python 3）：
+
+```bash
+python3 deploy/init-storage-key.py
+```
+
+密钥生成后请单独保管受保护的备份。脚本不会覆盖已有密钥。不要把密钥和数据备份放在同一个压缩包中。
+
 然后执行：
 
 ```bash
 mkdir -p state/cron state/login-api state/login-profile state/browser-profiles DouYinSparkFlow/logs
 bash ./refresh_proxy.sh
 docker compose -f docker-compose.yml -f docker-compose.shared.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.shared.yml build web
+docker compose -f docker-compose.yml -f docker-compose.shared.yml run --rm --no-deps web python scripts/migrate_secure_storage.py
 docker compose -f docker-compose.yml -f docker-compose.shared.yml up -d --build web scheduler
 ```
 
 以后更新或重启也使用两个 Compose 文件，不能改用单独的基础配置。上面的命令没有启动一次性发送任务。
 
-基础配置和共享配置都不再挂载 Docker socket 或整个仓库根目录，容器关闭提权并移除额外能力。共享配置还将 Web 端口固定绑定在宿主机 `127.0.0.1`，不发布 noVNC 的独立端口。发送和巡查仍由本机的调度容器执行。代理刷新和容器重启改为在服务器上操作，不再通过面板执行。
+基础配置和共享配置都不再挂载 Docker socket 或整个仓库根目录，容器关闭提权，仅保留读写私有挂载文件所需的 DAC_OVERRIDE 能力。共享配置还将 Web 端口固定绑定在宿主机 `127.0.0.1`，不发布 noVNC 的独立端口。发送和巡查仍由本机的调度容器执行。代理刷新和容器重启改为在服务器上操作，不再通过面板执行。
 
 从旧部署升级时，请同时检查原有 `.env`，将 `WEB_BIND_ADDRESS` 调整为 `127.0.0.1`。脚本不会擅自覆盖原来的网络设置。
 
@@ -48,9 +58,17 @@ sparkflow.example.com {
 
 代理需要保留原始 Host，并支持 WebSocket。浏览器只访问 HTTPS 域名；共享配置启用了 Secure Cookie，直接打开 HTTP 地址无法正常登录。如果反向代理本身在容器中，需要另外配置它到 Web 服务的私有网络连接，不应为方便连接而开放公网端口。
 
+登录和注册按来源 IP 限流。代理通过 Docker 网桥连接时，请将 `.env` 的 `SPARKFLOW_TRUSTED_PROXY_IPS` 设置为实际反向代理的可信地址，避免所有用户被当作同一个来源。不要填 `*` 或不受信任的公网地址；否则攻击者可能伪造转发头来绕过限流。
+
 首次打开页面时，输入初始化密钥并创建管理员。创建成功后可从 `.env` 删除初始化密钥，重建 Web 容器。已经初始化的管理员不能被再次覆盖。
 
 ## 用户和会话
+
+后台“注册邀请”可选择关闭注册、仅邀请注册或开放注册。默认关闭；开放时默认需要管理员审核，用户总数默认上限 100。邀请只能使用一次，可设置 1–168 小时有效期，并可随时撤销。邀请链接只在生成时显示，服务器仅保存其摘要；链接中的密钥通过 URL fragment 传递，注册页读取后会从地址栏移除。
+
+开放注册前必须完成 HTTPS、安全 Cookie 和加密存储配置；不满足条件时后台不会保存“开放注册”设置。修改注册方式还需要验证当前管理员密码。
+
+自助注册只创建普通用户，不能指定管理员角色，也不能领取已有账号。管理员在“Web 用户”里确认新用户后勾选“允许登录”并保存，才算审核通过。关闭注册会立即阻止新的注册提交，包括已经打开的注册页面和邀请。
 
 第一次使用可点“使用引导”，依次完成登录账号、选择目标、确认发送安排和完成设置。设置页按栏目切换，未显示栏目的输入不会因切换而丢失。
 
@@ -60,7 +78,15 @@ sparkflow.example.com {
 4. 修改密码、停用用户或调整账号分配后，旧会话失效。“退出所有会话”可以单独撤销该用户的会话，保留账号和密码；需要阻止重新登录时，应停用用户或重置密码。
 5. 登录桌面仍采用排队方式，同一时刻只供一个会话操作。已建立的桌面连接每秒复查一次登录状态和工作区归属，撤权后断开。
 
-共享模式只允许通过面板内置代理访问登录桌面，忽略外部 noVNC 地址配置。普通用户不能访问全局日志、调试截图、用户管理或其他人的账号操作接口。
+退出登录会在服务端撤销当前会话。会话有固定过期时间，默认 8 小时、最多 24 小时，浏览器反复刷新 Cookie 也不能延长。升级到本版后，旧格式的登录会话需要重新登录。
+
+完整交互式登录桌面仅管理员可用，并且仍须拥有当前工作区。普通用户使用二维码或 Cookie 登录；需要手动浏览器验证时应改用 Cookie，或联系管理员协助。共享模式不发布独立 noVNC 端口，忽略外部 noVNC 地址配置。普通用户不能访问全局日志、调试截图、用户管理或其他人的账号操作接口。
+
+登录桌面使用镜像内代码，不再挂载平台源码与运行数据库。涉及登录桌面的升级，需要重新构建镜像并重建该服务，不能只重启 Web：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.shared.yml up -d --build --force-recreate web login-desktop scheduler
+```
 
 ## 通行密钥（Passkey）
 
@@ -81,10 +107,12 @@ RP ID 填域名，Origin 填浏览器实际使用的 HTTPS 地址，不带末尾
 
 ## 数据与限制
 
+加密存储、旧数据迁移、密钥轮换和备份恢复见 [数据安全说明](data-security.md)。共享配置要求加密存储，发现未迁移的明文运行文件或无法读取的密钥时不会启动。普通本地单用户配置仍兼容旧格式；不要将它直接用作公开注册服务。
+
 备份至少包括 `.env`、`state/`、`DouYinSparkFlow/config.json`、`usersData.json`、`webui_settings.json`、`webui_users.json`、`webui_passkeys.json`。这些文件包含凭据或敏感资料，备份也需要限制访问权限。
 
 当前仍使用文件存储和单 Web 进程，登录限流计数保存在该进程内。适合小范围共享，不能据此视为完成了面向公众的托管平台。不要启动多个 Web 副本，也不要绕过共享配置直接暴露登录桌面。
 
-本次改动没有把所有应用代码改成只读挂载，也没有实现每个用户独立的容器、凭据加密或双因素认证。服务器管理员仍有读取运行数据的能力。平台兼容性、账号风险和非商业许可证要求与原项目相同。
+本次改动没有把所有应用代码改成只读挂载，也没有实现每个用户独立的容器或强制双因素认证。服务器管理员仍有读取运行数据的能力。平台兼容性、账号风险和非商业许可证要求与原项目相同。
 
 新增贡献：wuha-like-sleep。原作者版权及第三方许可见仓库 LICENSE 和 NOTICE。

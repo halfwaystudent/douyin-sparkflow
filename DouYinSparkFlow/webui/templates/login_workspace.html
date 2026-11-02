@@ -84,9 +84,9 @@
         >
           <i data-lucide="x-circle"></i><span>关闭登录界面</span>
         </button>
-        <button class="button button-ghost button-sm" type="button" data-copy-login-url>
+        {% if is_admin %}<button class="button button-ghost button-sm" type="button" data-copy-login-url>
           <i data-lucide="copy"></i><span>复制地址</span>
-        </button>
+        </button>{% endif %}
         {% if is_admin %}
         <button
           class="button button-danger button-sm login-desktop-reset"
@@ -143,6 +143,7 @@
     </details>
   </div>
 
+  {% if is_admin %}
   <div class="desktop-frame-wrap">
     <div class="native-login-panel" data-native-login hidden>
       <i data-lucide="monitor-up"></i>
@@ -159,5 +160,8 @@
       title="交互式登录浏览器"
     ></iframe>
   </div>
+  {% else %}
+  <p class="notice-inline">扫码遇到需要手动验证的情况，可以改用 Cookie 登录，或联系管理员协助。</p>
+  {% endif %}
 </section>
 {% endblock %}

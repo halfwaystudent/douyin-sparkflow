@@ -9,7 +9,24 @@ logs/
 config.json
 usersData.json
 webui_settings.json
+webui_users.json
 webui_passkeys.json
+webui_sessions.json
+.data-backups/
+.migration-backups/
+.theme-backup-*/
+.env
+state/
+*.key
+*.bak
+*.bak-*
+*.tmp
+usersData.json.*
+webui_users.json.*
+webui_settings.json.*
+webui_passkeys.json.*
+webui_sessions.json.*
+config.json.*
 *.log
 *.lock
 # Runtime cache the protocol sender fills in on demand, and vendored archives.

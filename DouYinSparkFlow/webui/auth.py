@@ -1,10 +1,12 @@
 import hashlib
 import hmac
 import secrets
+import time
 
 from filelock import FileLock
 
 from utils.config import app_settings_path, get_app_settings, save_app_settings
+from webui import sessions
 
 
 class BootstrapAlreadyConfigured(ValueError):
@@ -65,13 +67,18 @@ def issue_session(request, username, *, role="admin", account_refs=None, auth_ve
     request.session.clear()
     request.session["user"] = username
     request.session["role"] = role
-    request.session["account_refs"] = list(account_refs or [])
+    # Account assignments are resolved from the user store on every request.
     request.session["auth_version"] = _session_version(auth_version)
     request.session["session_id"] = secrets.token_urlsafe(24)
     request.session["csrf_token"] = secrets.token_urlsafe(24)
+    lifetime = max(1, min(int(get_app_settings().get("session_max_age_seconds", 28800)), 86400))
+    request.session["expires_at"] = time.time() + lifetime
 
 
-def clear_session(request):
+def clear_session(request, *, revoke=True):
+    expires_at = request.session.get("expires_at", 0)
+    if revoke:
+        sessions.revoke(request.session.get("session_id", ""), expires_at)
     request.session.clear()
 
 
@@ -85,6 +92,9 @@ def current_principal(request):
     if not username:
         return None
     session_id = request.session.get("session_id", "")
+    expires_at = request.session.get("expires_at", 0)
+    if not session_id or not isinstance(expires_at, (int, float)) or expires_at <= time.time() or sessions.is_revoked(session_id):
+        return None
     role = request.session.get("role")
     session_version = _session_version(request.session.get("auth_version"))
     settings = get_app_settings(force_reload=True)

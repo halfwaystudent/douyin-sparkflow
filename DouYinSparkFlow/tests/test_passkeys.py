@@ -11,6 +11,7 @@ from webauthn.helpers.exceptions import WebAuthnException
 
 from tests import test_shared_security as fixtures
 from tests.test_webui_pages import _snapshot
+from tests.auth_helpers import login_form
 from webui import app as app_module, passkeys, users
 
 
@@ -85,7 +86,7 @@ class PasskeyTests(unittest.TestCase):
         }""", challenge["options"])
 
     def test_real_browser_enrolment_and_login_through_the_ui(self):
-        response = self.client.post("/login", data={"username": "alice", "password": "First-secret-2026!"}, follow_redirects=False)
+        response = self.client.post("/login", data=login_form(self.client, "alice", "First-secret-2026!"), follow_redirects=False)
         self.assertEqual(303, response.status_code)
         self.context.clear_cookies()
         self.page.goto("https://sparkflow.test/settings?_anchor=passkeys")
@@ -152,7 +153,7 @@ class PasskeyTests(unittest.TestCase):
     def test_admin_can_remove_keys_from_a_disabled_user(self):
         self.register()
         users.update_web_user("alice", enabled=False)
-        self.client.post("/login", data={"username": "owner", "password": "Owner-secret-2026!"}, follow_redirects=False)
+        self.client.post("/login", data=login_form(self.client, "owner", "Owner-secret-2026!"), follow_redirects=False)
         import re
         token = re.search(r'name="csrf_token" value="([^"]+)"', self.client.get("/settings").text).group(1)
         response = self.client.post("/admin/users/alice/revoke-passkeys", data={"csrf_token": token}, follow_redirects=False)
@@ -160,7 +161,7 @@ class PasskeyTests(unittest.TestCase):
         self.assertEqual([], self.store.list_keys(self.identity))
 
     def test_enrolment_requires_password_and_csrf(self):
-        self.client.post("/login", data={"username": "alice", "password": "First-secret-2026!"})
+        self.client.post("/login", data=login_form(self.client, "alice", "First-secret-2026!"))
         self.assertEqual(403, self.client.post("/account/passkeys/options").status_code)
         import re
         token = re.search(r'name="csrf_token" value="([^"]+)"', self.client.get("/settings").text).group(1)

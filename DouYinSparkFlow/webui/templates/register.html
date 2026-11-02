@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cut"><title>注册 · SparkFlow</title><meta name="referrer" content="no-referrer"><link rel="stylesheet" href="/static/app.css?v=20261102-2"></head>
+<body>
+<main class="registration-main">
+  <section class="card form-stack">
+    <a class="brand" href="/login">续火花 <small>SparkFlow</small></a>
+    <h1>创建你的账号</h1>
+    {% if registration.mode == 'closed' %}
+    <p>管理员暂未开放注册。已有账号可以直接登录。</p>
+    {% else %}
+    <p class="muted">{% if registration.mode == 'invite' %}需要管理员提供的邀请。{% endif %}{% if registration.approval_required %}注册后需等待管理员审核。{% endif %}新账号不会自动获得他人的抖音账号权限。</p>
+    {% if registration_message %}<p class="flash flash-error" role="alert">{{ registration_message }}</p>{% endif %}
+    <form method="post" action="/register" class="form-stack" data-auth-form>
+      <input type="hidden" name="csrf_token" value="{{ registration_csrf }}">
+      <div class="registration-trap" aria-hidden="true"><label>Website<input type="text" name="website" tabindex="-1" autocomplete="off"></label></div>
+      <label class="field"><span>用户名</span><input name="username" type="text" autocomplete="username" pattern="[A-Za-z0-9_.-]{1,64}" maxlength="64" value="{{ registration_username }}" required><small>1–64 位字母、数字、下划线、点或短横线。</small></label>
+      <label class="field"><span>密码</span><input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="1024" required><small>至少 10 位，包含字母、数字、符号中的至少两种，不能包含用户名。</small></label>
+      <label class="field"><span>确认密码</span><input name="confirm_password" type="password" autocomplete="new-password" minlength="10" maxlength="1024" required></label>
+      <label class="field"><span>邀请密钥{% if registration.mode == 'public' %}（可选）{% endif %}</span><input name="invitation_token" type="password" autocomplete="off" value="{{ invitation_token }}" {% if registration.mode == 'invite' %}required{% endif %}><small>从邀请链接打开时会自动填写。</small></label>
+      <button class="button button-primary" type="submit">创建账号</button>
+    </form>
+    {% endif %}
+    <a class="button button-quiet" href="/login">返回登录</a>
+  </section>
+</main>
+<script defer src="/static/auth-forms.js?v=20261102-2"></script>
+</body></html>

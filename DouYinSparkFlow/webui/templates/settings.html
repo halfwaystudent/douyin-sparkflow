@@ -19,6 +19,7 @@
     <a href="#system"><i data-lucide="server-cog"></i>系统</a>
     <a href="#notify"><i data-lucide="bell"></i>推送通知</a>
     <a href="#users"><i data-lucide="users-round"></i>Web 用户</a>
+    <a href="#registration"><i data-lucide="user-plus"></i>注册邀请</a>
     {% if passkeys_enabled %}<a href="#passkeys"><i data-lucide="fingerprint"></i>通行密钥</a>{% endif %}
   </nav>
 
@@ -146,7 +147,7 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="form-grid">
           <label class="field"><span>Compose 根目录</span><input type="text" name="compose_root" value="{{ app_settings.compose_root }}"></label>
-          <label class="field"><span>任务日志文件</span><input type="text" name="ops_log_file" value="{{ app_settings.ops_log_file }}"></label>
+          <label class="field"><span>任务日志文件</span><input type="text" name="ops_log_file" value="{{ app_settings.ops_log_file }}"><small>仅允许应用 logs 目录内的 .log 文件。</small></label>
           <label class="field"><span>代理刷新脚本</span><input type="text" name="proxy_refresh_script" value="{{ app_settings.proxy_refresh_script }}"></label>
           <label class="field"><span>登录桌面 API</span><input type="text" name="login_desktop_api_url" value="{{ app_settings.login_desktop_api_url }}"></label>
           <label class="field">
@@ -244,6 +245,7 @@
     {% endif %}
 
     {% include 'passkeys.html' %}
+    {% if registration is defined %}{% include 'registration_settings.html' %}{% endif %}
     <section class="card settings-section" id="users">
       <div class="card-head">
         <div>
@@ -292,7 +294,7 @@
               <span class="account-avatar">{{ (web_user.username or "U")[:1] }}</span>
               <span class="account-name"><strong>{{ web_user.username }}</strong><small>{{ web_user.account_refs|length }} 个绑定账号</small></span>
             </span>
-            <span class="summary-metrics"><span class="pill {% if web_user.enabled %}success{% else %}warning{% endif %}">{% if web_user.enabled %}可登录{% else %}已停用{% endif %}</span></span>
+            <span class="summary-metrics"><span class="pill {% if web_user.enabled %}success{% else %}warning{% endif %}">{% if web_user.registration_pending %}待审核{% elif web_user.enabled %}可登录{% else %}已停用{% endif %}</span></span>
             <i class="fold-chevron" data-lucide="chevron-down"></i>
           </summary>
           <div class="fold-body">

@@ -1,0 +1,25 @@
+<section class="card settings-section" id="registration">
+  <div class="card-head"><div><h2>注册与邀请</h2><p>由你决定是否开放注册。新用户不会自动获得任何抖音账号权限。</p></div></div>
+  <p class="notice-inline">开放注册须先启用 HTTPS、安全 Cookie 和加密存储。</p>
+  <form method="post" action="/admin/registration" class="form-stack" data-auth-form>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="field"><span>注册方式</span><select name="mode"><option value="closed" {% if registration.mode == 'closed' %}selected{% endif %}>关闭注册</option><option value="invite" {% if registration.mode == 'invite' %}selected{% endif %}>仅邀请注册</option><option value="public" {% if registration.mode == 'public' %}selected{% endif %}>开放注册</option></select></label>
+    <label class="check"><input type="checkbox" name="approval_required" {% if registration.approval_required %}checked{% endif %}><span>新用户需管理员审核（建议保留）</span></label>
+    <label class="field"><span>普通用户总数上限</span><input type="number" name="max_users" min="1" max="1000" value="{{ registration.max_users }}" required></label>
+    <label class="field"><span>当前管理员密码</span><input name="current_password" type="password" autocomplete="current-password" required></label>
+    <button class="button button-primary" type="submit">保存注册设置</button>
+  </form>
+  <details class="fold" style="margin-top: 18px"><summary>创建一次性邀请</summary><div class="fold-body">
+    <form method="post" action="/admin/invitations/create" class="form-stack" data-auth-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="field"><span>有效期（小时）</span><input type="number" name="hours" min="1" max="168" value="24" required></label>
+      <button type="submit" class="button button-quiet">生成邀请链接</button>
+    </form>
+    <p class="muted">邀请只能使用一次。注册关闭时邀请也不能使用。</p>
+  </div></details>
+  {% for invitation in invitations %}
+  <form method="post" action="/admin/invitations/{{ invitation.id }}/revoke" class="form-actions" style="margin-top: 12px">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><span>未使用邀请 {{ invitation.id[:8] }}</span><button type="submit" class="button button-danger button-sm">撤销邀请</button>
+  </form>
+  {% endfor %}
+</section>

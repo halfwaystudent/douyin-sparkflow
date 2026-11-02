@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
 import os
 import re
-import tempfile
 import uuid
 from copy import deepcopy
 from pathlib import Path
@@ -14,6 +12,7 @@ from pathlib import Path
 from filelock import FileLock
 
 from utils.config import (
+    _save_json_file,
     get_app_settings,
     get_userData,
     normalize_unique_id,
@@ -22,6 +21,8 @@ from utils.config import (
     users_data_path,
 )
 from webui.auth import hash_password, verify_password
+from utils.secure_storage import read_json
+from utils.secure_storage import encryption_required, StorageError
 
 
 USERS_FILE = Path(__file__).resolve().parents[1] / "webui_users.json"
@@ -59,20 +60,7 @@ def _coerce_session_version(value) -> int:
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    finally:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
+    _save_json_file(path, payload)
 
 
 def _load_raw() -> dict:
@@ -80,8 +68,10 @@ def _load_raw() -> dict:
         return {"users": [], "auth_epoch": 0}
     text = USERS_FILE.read_text(encoding="utf-8")
     if not text.strip():
+        if encryption_required():
+            raise StorageError("Protected user storage is empty.")
         return {"users": [], "auth_epoch": 0}
-    data = json.loads(text)
+    data = read_json(USERS_FILE)
     if not isinstance(data, dict) or not isinstance(data.get("users", []), list):
         raise UserStoreError("webui_users.json must contain a users list")
     data["auth_epoch"] = _coerce_session_version(data.get("auth_epoch"))
@@ -104,6 +94,7 @@ def get_web_users(force_reload: bool = False) -> list[dict]:
                 "role": "user",
                 "password_hash": str(raw.get("password_hash", "")),
                 "enabled": bool(raw.get("enabled", True)),
+                "registration_pending": bool(raw.get("registration_pending", False)),
                 "session_version": _coerce_session_version(
                     raw.get("session_version")
                 ),
@@ -143,6 +134,7 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
                 "role": "user",
                 "password_hash": password_hash,
                 "enabled": bool(raw.get("enabled", True)),
+                "registration_pending": bool(raw.get("registration_pending", False)),
                 "session_version": _coerce_session_version(
                     raw.get("session_version")
                 ),
@@ -151,13 +143,9 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
         )
     if auth_epoch is None:
         auth_epoch = int(_load_raw().get("auth_epoch") or 0)
-    _atomic_write_json(
-        USERS_FILE,
-        {
-            "auth_epoch": max(0, int(auth_epoch)),
-            "users": normalized,
-        },
-    )
+    payload = _load_raw()
+    payload.update(auth_epoch=max(0, int(auth_epoch)), users=normalized)
+    _atomic_write_json(USERS_FILE, payload)
     try:
         os.chmod(USERS_FILE, 0o600)
     except OSError:
@@ -387,6 +375,8 @@ def update_web_user(
         if enabled is not None:
             revoke_session = True
             target["enabled"] = bool(enabled)
+            if enabled:
+                target["registration_pending"] = False
         if appended is not None:
             # A login claims only its own proven ref. Never restore an old
             # whole-session ref list after an administrator has revoked it.

@@ -453,6 +453,7 @@ fieldset > legend { padding: 0 6px; }
 
 /* ---------- login workspace ---------- */
 .login-layout { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.login-layout:not(:has(.desktop-frame-wrap)) { grid-template-columns: minmax(0, 560px); }
 /* Native mode (Windows) hides the embedded browser until it is in use. */
 .login-layout:has(> .desktop-frame-wrap[hidden]) { grid-template-columns: minmax(0, 560px); }
 .qr-card { text-align: center; display: grid; gap: 14px; justify-items: center; }
@@ -542,6 +543,12 @@ fieldset > legend { padding: 0 6px; }
 
 /* ---------- auth page ---------- */
 .auth { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); }
+.registration-main { width: min(100%, 520px); margin: 0 auto; padding: 24px 16px max(24px, env(safe-area-inset-bottom)); }
+.registration-main h1 { font-size: 26px; }
+.registration-trap { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+.password-input { position: relative; min-width: 0; }
+.password-input input { padding-right: 58px; }
+.password-toggle { position: absolute; right: 2px; top: 0; min-height: 44px; width: 48px; border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13px; cursor: pointer; }
 .auth-story {
   position: relative; overflow: hidden; padding: 48px clamp(28px, 5vw, 72px); display: flex; flex-direction: column; justify-content: space-between; gap: 40px;
   background: var(--bg-tint); border-right: 1px solid var(--line);

@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from webui import ops as web_ops
@@ -55,6 +57,34 @@ class OpsLogReadingTests(unittest.TestCase):
         with patch.object(web_ops, "read_log_tail", return_value=None):
             self.assertEqual([], web_ops.recent_trigger_lines())
             self.assertEqual(0, web_ops.summarize_log_tail()["lines"])
+
+    def test_private_files_and_symlinks_outside_logs_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "logs").mkdir()
+            private = root / "storage.key"
+            private.write_text("private-key")
+            (root / "logs" / "secret.log").symlink_to(private)
+            with patch.object(web_ops, "repo_root", return_value=root):
+                for path in (private, root / "logs" / "secret.log", root / "logs" / ".." / "storage.key"):
+                    with self.subTest(path=path), self.assertRaises(ValueError):
+                        web_ops.resolve_log_file(str(path))
+                self.assertEqual((root / "logs" / "app.log").resolve(), web_ops.resolve_log_file("logs/app.log"))
+
+    def test_large_log_preview_reads_only_a_bounded_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "app.log"
+            path.write_text("earlier\n" * 200000 + "latest-one\nlatest-two\n")
+            with patch.object(web_ops, "log_file_path", return_value=path):
+                self.assertEqual("latest-one\nlatest-two", web_ops.read_log_tail(2))
+
+    def test_rotation_between_lookup_and_open_does_not_break_the_page(self):
+        from unittest.mock import Mock
+        path = Mock()
+        path.exists.return_value = True
+        path.open.side_effect = FileNotFoundError()
+        with patch.object(web_ops, "log_file_path", return_value=path):
+            self.assertEqual("", web_ops.read_log_tail())
 
 
 if __name__ == "__main__":

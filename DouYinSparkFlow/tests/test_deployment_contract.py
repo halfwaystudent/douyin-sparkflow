@@ -193,8 +193,16 @@ class DeploymentContractTests(unittest.TestCase):
 
     def test_docker_build_context_excludes_runtime_data(self):
         dockerignore = (SOURCE_ROOT / ".dockerignore").read_text(encoding="utf-8")
-        for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json"):
+        for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json", "webui_users.json", "webui_passkeys.json", ".data-backups/", "*.key"):
             self.assertIn(entry, dockerignore)
+
+    def test_login_desktop_has_no_platform_database_or_storage_key_mount(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        desktop = compose.split("  login-desktop:", 1)[1].split("  scheduler:", 1)[0]
+        self.assertNotIn("./DouYinSparkFlow:/app", desktop)
+        self.assertNotIn("./DouYinSparkFlow/logs:/app/logs", desktop)
+        self.assertNotIn("/run/storage-key", desktop)
+        self.assertNotIn("SPARKFLOW_STORAGE_KEY_FILE", desktop)
 
     def test_login_desktop_uses_direct_first_network_route(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")

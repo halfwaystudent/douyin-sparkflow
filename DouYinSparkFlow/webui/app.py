@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from filelock import Timeout as StorageLockTimeout
 
 from core import identity as account_identity
 from core import streak_state
@@ -96,6 +97,11 @@ from webui.users import (
 )
 from webui.login_guard import LoginThrottle, password_problem
 from webui.security import SecurityMiddleware
+from webui.credentials import CredentialBusyError, credential_slot
+from utils.secure_storage import StorageError
+from utils.secure_storage import require_encrypted_files
+from webui import registration
+from webui.registration_routes import register_routes as register_registration_routes
 from webui.passkeys import PasskeyStore, login_identity as passkey_identity
 from webui.passkey_routes import register_passkey_routes
 from webui.login_lock import (
@@ -119,6 +125,7 @@ from webui.ops import (
     duplicate_display_names,
     identity_view,
     log_file_path,
+    resolve_log_file,
     read_log_tail,
     summarize_log_tail,
     run_failed_retry_now,
@@ -1280,10 +1287,18 @@ def create_app():
         "on",
     }
     app = FastAPI(title="DouYin Spark Flow Admin", lifespan=lifespan)
+    app.state.credential_gate = asyncio.Semaphore(4)
+    app.state.credential_timeout = 3
     shared = str(os.getenv("SPARKFLOW_SHARED_MODE", "")).lower() in {"1", "true", "yes", "on"}
     allowed_hosts = [host.strip() for host in os.getenv("SPARKFLOW_ALLOWED_HOSTS", "").split(",") if host.strip()]
     bootstrap_token = os.getenv("SPARKFLOW_BOOTSTRAP_TOKEN", "")
     if shared:
+        from utils import config as config_storage
+        from webui import users as user_storage, passkeys as passkey_storage, sessions as session_storage
+        require_encrypted_files([
+            config_storage.app_settings_path(), config_storage.config_path(), config_storage.users_data_path(),
+            user_storage.USERS_FILE, passkey_storage.PASSKEYS_FILE, session_storage.store_path(),
+        ])
         if not allowed_hosts or any("*" in host for host in allowed_hosts):
             raise ValueError("Shared mode requires explicit SPARKFLOW_ALLOWED_HOSTS (without wildcards).")
         if not settings.get("admin_password_hash") and len(bootstrap_token) < 24:
@@ -1317,6 +1332,16 @@ def create_app():
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.exception_handler(StorageLockTimeout)
+    @app.exception_handler(StorageError)
+    async def storage_error_handler(request: Request, exc: StorageError):
+        logger.error("Secure storage unavailable on %s: %s", request.url.path, type(exc).__name__)
+        return PlainTextResponse("暂时无法读取或保存安全数据，请稍后重试或联系管理员。", status_code=503, headers={"Cache-Control": "no-store"})
+
+    @app.exception_handler(CredentialBusyError)
+    async def credentials_busy_handler(request: Request, exc: CredentialBusyError):
+        return PlainTextResponse("当前登录或注册请求较多，请稍后重试。", status_code=503, headers={"Cache-Control": "no-store", "Retry-After": "3"})
+
     def render_template(request, template_name, context=None, status_code=200):
         base_context = dict(context or {})
         base_context.update(
@@ -1330,9 +1355,10 @@ def create_app():
                 "host_operations_enabled": False,
                 "passkeys_enabled": passkeys is not None,
                 "setup_in_progress": request.session.get("setup_in_progress", False),
+                "registration_available": registration.policy()["mode"] != "closed",
                 "app_settings": public_app_settings(),
-                "login_desktop_public_url": login_desktop_public_url(request),
-                "login_desktop_display_mode": login_desktop_display_mode(),
+                "login_desktop_public_url": controlled_login_desktop_url(request),
+                "login_desktop_display_mode": login_desktop_display_mode() if current_principal(request) and current_principal(request)["role"] == "admin" else "novnc",
             }
         )
         return templates.TemplateResponse(
@@ -1389,6 +1415,10 @@ def create_app():
 
     def principal(request):
         return current_principal(request)
+
+    def controlled_login_desktop_url(request):
+        current = principal(request)
+        return login_desktop_public_url(request) if current and current["role"] == "admin" else ""
 
     def require_user(request):
         if not principal(request):
@@ -1485,7 +1515,7 @@ def create_app():
         if principal(request):
             return redirect("/")
         if current_user(request):
-            clear_session(request)
+            clear_session(request, revoke=False)
         return render_template(
             request,
             "login.html",
@@ -1493,14 +1523,18 @@ def create_app():
                 "flash": pop_flash(request),
                 "bootstrapped": is_bootstrapped(),
                 "bootstrap_token_required": bool(bootstrap_token),
+                "login_csrf": csrf_token(request),
             },
         )
 
     @app.post("/bootstrap")
     async def bootstrap(request: Request):
         if is_bootstrapped():
-            flash(request, "Admin login is already configured.", "warning")
+            flash(request, "管理员账号已经设置，请直接登录。", "warning")
             return redirect("/login")
+
+        if shared and not bootstrap_token:
+            return PlainTextResponse("Shared setup requires the server initialization token.", status_code=403)
 
         form = await request.form()
         if bootstrap_token and not secrets.compare_digest(str(form.get("bootstrap_token", "")).encode("utf-8"), bootstrap_token.encode("utf-8")):
@@ -1513,7 +1547,7 @@ def create_app():
         password = str(form.get("password", ""))
         confirm = str(form.get("confirm_password", ""))
         if not password or password != confirm:
-            flash(request, "Password setup failed. Please enter matching passwords.", "error")
+            flash(request, "两次输入的密码不一致，请重新填写。", "error")
             return redirect("/login")
         problem = password_problem(password, username)
         if problem:
@@ -1524,17 +1558,22 @@ def create_app():
             bootstrap_admin_password(password, username=username)
         except BootstrapAlreadyConfigured:
             return PlainTextResponse("Admin login is already configured.", status_code=409)
-        flash(request, "Admin credentials created. Please log in.", "success")
+        flash(request, "管理员账号已创建，请登录。", "success")
         return redirect("/login")
 
     @app.post("/login")
     async def login_action(request: Request):
         if not is_bootstrapped():
-            flash(request, "Create the admin password first.", "warning")
+            flash(request, "请先完成管理员初始化。", "warning")
             return redirect("/login")
 
         form = await request.form()
         username = str(form.get("username", "")).strip()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return render_template(request, "login.html", {
+                "bootstrapped": True, "login_csrf": csrf_token(request), "login_username": username[:64],
+                "flash": {"message": "登录页面已更新，请重新输入密码。", "level": "error"},
+            }, status_code=403)
         password = str(form.get("password", ""))
         from webui.users import authenticate
 
@@ -1543,13 +1582,15 @@ def create_app():
         if wait:
             minutes = max(1, (wait + 59) // 60)
             logger.warning("Web login locked for ip=%s user=%r retry_after=%ss", client_ip, username[:40], wait)
-            flash(request, f"登录失败次数过多，请 {minutes} 分钟后再试。", "error")
+            interval = f"{wait} 秒" if wait < 60 else f"{minutes} 分钟"
+            flash(request, f"尝试次数过多，请 {interval}后再试。", "error")
             return redirect("/login")
-        identity = authenticate(username, password)
+        async with credential_slot(app):
+            identity = await asyncio.to_thread(authenticate, username, password)
         if not identity:
             login_throttle.record_failure(client_ip, username)
             logger.warning("Web login failed for ip=%s user=%r", client_ip, username[:40])
-            flash(request, "Invalid username or password.", "error")
+            flash(request, "用户名或密码不正确，或账号尚未启用。", "error")
             return redirect("/login")
         login_throttle.record_success(client_ip, username)
 
@@ -1560,7 +1601,7 @@ def create_app():
             account_refs=identity.get("account_refs", []),
             auth_version=identity.get("auth_version", 0),
         )
-        flash(request, "Signed in successfully.", "success")
+        flash(request, "登录成功。", "success")
         return redirect("/")
 
     @app.post("/logout")
@@ -1851,6 +1892,9 @@ def create_app():
         if maybe_redirect:
             return maybe_redirect
         context = console_context(request, with_admin_data=True)
+        if principal(request)["role"] == "admin":
+            context["registration"] = registration.policy()
+            context["invitations"] = registration.invitations()
         identity = passkey_identity(principal(request)["username"]) if passkeys else None
         context["passkey_list"] = passkeys.list_keys(identity) if identity else []
         if principal(request).get("role") == "admin":
@@ -3082,7 +3126,11 @@ def create_app():
                 flash(request, "当前密码不正确或尝试次数过多，设置未保存。", "error")
                 return redirect("/settings#system")
         settings["compose_root"] = str(form.get("compose_root", settings.get("compose_root", ""))).strip()
-        settings["ops_log_file"] = str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()
+        try:
+            settings["ops_log_file"] = str(resolve_log_file(str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()))
+        except ValueError as exc:
+            flash(request, str(exc), "error")
+            return redirect("/settings#system")
         settings["proxy_refresh_script"] = str(form.get("proxy_refresh_script", settings.get("proxy_refresh_script", ""))).strip()
         settings["login_desktop_api_url"] = str(
             form.get("login_desktop_api_url", settings.get("login_desktop_api_url", "http://127.0.0.1:18090"))
@@ -3427,7 +3475,7 @@ def create_app():
 
     @app.get("/login-desktop/proxy")
     async def login_desktop_proxy_root(request: Request):
-        maybe_redirect = require_user(request)
+        maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
         lock_error = login_lock_required(request)
@@ -3437,7 +3485,7 @@ def create_app():
 
     @app.get("/login-desktop/proxy/{asset_path:path}")
     async def login_desktop_proxy_asset(request: Request, asset_path: str):
-        maybe_redirect = require_user(request)
+        maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
         lock_error = login_lock_required(request)
@@ -3459,6 +3507,9 @@ def create_app():
         active = get_login_lock()
         if not current:
             await websocket.close(code=4401)
+            return
+        if current["role"] != "admin":
+            await websocket.close(code=4403)
             return
         if not owns_login_lock(
             active,
@@ -3725,6 +3776,8 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return JSONResponse({"redirect": "/login"}, status_code=401)
+        if principal(request)["role"] != "admin":
+            return JSONResponse({"error": "完整登录桌面仅供管理员使用。"}, status_code=403)
         lock_error = login_lock_required(request, api=True)
         if lock_error:
             return lock_error
@@ -3755,11 +3808,11 @@ def create_app():
         await _expire_login_workspace()
         try:
             payload = call_login_desktop("/status")
-            payload["public_url"] = login_desktop_public_url(request)
+            payload["public_url"] = controlled_login_desktop_url(request)
             payload["workspace"] = _workspace_payload(request)
             return JSONResponse(payload)
         except RuntimeError as exc:
-            return JSONResponse({"ok": False, "error": str(exc), "public_url": login_desktop_public_url(request), "workspace": _workspace_payload(request)}, status_code=503)
+            return JSONResponse({"ok": False, "error": str(exc), "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request)}, status_code=503)
 
     @app.get("/login-desktop/workspace-status")
     async def login_desktop_workspace_status(request: Request):
@@ -3824,7 +3877,7 @@ def create_app():
         try:
             # Off the event loop: opening takes seconds and must not stall other requests.
             await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={}, timeout=90)
-            return JSONResponse({"ok": True, "state": "active", "public_url": login_desktop_public_url(request), "workspace": _workspace_payload(request)})
+            return JSONResponse({"ok": True, "state": "active", "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request)})
         except RuntimeError as exc:
             begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=result["request"].get("ticket", ""), account_ref=account_ref)
             await _reset_and_promote()
@@ -4420,6 +4473,7 @@ def create_app():
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
+    register_registration_routes(app, render_template, flash, login_throttle, secure_cookie)
     return app
 
 

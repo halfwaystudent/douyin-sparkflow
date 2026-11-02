@@ -1,6 +1,8 @@
 """Request boundaries shared by the console and login desktop proxy."""
 
 from urllib.parse import urlsplit
+import time
+from anyio import fail_after
 
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import PlainTextResponse
@@ -32,11 +34,12 @@ def same_origin(scope, public_scheme=None):
 
 
 class SecurityMiddleware:
-    def __init__(self, app, *, shared=False, max_request_bytes=MAX_REQUEST_BYTES, public_scheme=None):
+    def __init__(self, app, *, shared=False, max_request_bytes=MAX_REQUEST_BYTES, public_scheme=None, body_timeout=30):
         self.app = app
         self.shared = shared
         self.max_request_bytes = max_request_bytes
         self.public_scheme = public_scheme
+        self.body_timeout = body_timeout
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in {"http", "websocket"}:
@@ -74,8 +77,13 @@ class SecurityMiddleware:
                 return await PlainTextResponse("Request body too large", status_code=413)(scope, receive, secured_send)
             # Bound chunked requests too, before the multipart/form parser runs.
             body = bytearray()
+            deadline = time.monotonic() + self.body_timeout
             while True:
-                message = await receive()
+                try:
+                    with fail_after(max(0, deadline - time.monotonic())):
+                        message = await receive()
+                except TimeoutError:
+                    return await PlainTextResponse("Request body timed out", status_code=408)(scope, receive, secured_send)
                 if message["type"] == "http.disconnect":
                     return
                 body.extend(message.get("body", b""))

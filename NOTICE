@@ -3,7 +3,8 @@ https://github.com/halfwaystudent/douyin-sparkflow
 
 Copyright (c) 2026 wuha-like-sleep
 Additional contributions: shared-console security, user session management,
-Passkey login, guided setup, mobile layout improvements, and installation checks.
+Passkey login, registration policy, encrypted storage, guided setup,
+mobile layout improvements, and installation checks.
 
 These contributions use the project's PolyForm Noncommercial License 1.0.0.
 The original copyright notices and third-party licenses remain in effect.

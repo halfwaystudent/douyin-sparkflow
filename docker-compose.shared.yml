@@ -4,6 +4,8 @@ services:
   web:
     environment:
       SPARKFLOW_SHARED_MODE: "1"
+      SPARKFLOW_STORAGE_KEY_FILE: /run/storage-key/storage.key
+      SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED: "1"
       SPARKFLOW_ALLOWED_HOSTS: ${SPARKFLOW_ALLOWED_HOSTS:?Set the console hostname in .env}
       SPARKFLOW_BOOTSTRAP_TOKEN: ${SPARKFLOW_BOOTSTRAP_TOKEN:-}
       SPARKFLOW_SESSION_COOKIE_SECURE: "1"
@@ -17,5 +19,14 @@ services:
       - ./state/cron:/host-spool-cron
       - ./state/login-api:/run/login-api:ro
       - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
+      - ./state/keys:/run/storage-key:ro
   login-desktop:
     ports: !reset []
+  scheduler:
+    environment:
+      SPARKFLOW_STORAGE_KEY_FILE: /run/storage-key/storage.key
+      SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED: "1"
+  task:
+    environment:
+      SPARKFLOW_STORAGE_KEY_FILE: /run/storage-key/storage.key
+      SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED: "1"

@@ -1,4 +1,5 @@
 import unittest
+from tests.auth_helpers import login_form
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -123,7 +124,7 @@ class LoginRouteThrottleTests(unittest.TestCase):
 
     def _login(self, password):
         return self.client.post(
-            "/login", data={"username": "admin", "password": password}, follow_redirects=False
+            "/login", data=login_form(self.client, "admin", password), follow_redirects=False
         )
 
     def test_sixth_attempt_is_refused_without_checking_the_password(self):
@@ -282,5 +283,5 @@ class SaturatedLoginRouteTests(unittest.TestCase):
             for i in range(login_guard.USER_SLOW_AFTER):
                 throttle.record_failure(f"10.200.0.{i}", "admin")
             self.assertGreater(throttle.retry_after("testclient", "admin"), 0)
-            response = client.post("/login", data={"username": "admin", "password": "x"}, follow_redirects=False)
+            response = client.post("/login", data=login_form(client, "admin", "x"), follow_redirects=False)
             self.assertEqual("/login", response.headers["location"])

@@ -16,6 +16,8 @@ from starlette.responses import PlainTextResponse
 from utils import config
 from webui import app as app_module, auth, users
 from webui.security import SecurityMiddleware
+from tests.auth_helpers import login_form
+from cryptography.fernet import Fernet
 
 
 class RequestBoundaryTests(unittest.TestCase):
@@ -43,6 +45,26 @@ class RequestBoundaryTests(unittest.TestCase):
         response = self.client.post("/echo", content=iter([b"x" * 20, b"y" * 20]))
         self.assertEqual(413, response.status_code)
         self.assertEqual("hello", self.client.post("/echo", content="hello").text)
+
+    def test_slow_body_has_a_total_deadline(self):
+        async def scenario():
+            messages = []
+
+            async def endpoint(scope, receive, send):
+                self.fail("A stalled body must not reach the endpoint")
+
+            async def receive():
+                await asyncio.sleep(0.015)
+                return {"type": "http.request", "body": b"x", "more_body": True}
+
+            async def send(message):
+                messages.append(message)
+
+            middleware = SecurityMiddleware(endpoint, body_timeout=0.02)
+            await middleware({"type": "http", "method": "POST", "path": "/", "scheme": "http", "headers": [(b"host", b"testserver")]}, receive, send)
+            self.assertEqual(408, messages[0]["status"])
+
+        asyncio.run(scenario())
 
     def test_private_responses_and_errors_have_security_headers(self):
         for response in (self.client.get("/echo"), self.client.post("/echo", content="x" * 40)):
@@ -83,7 +105,7 @@ class RequestBoundaryTests(unittest.TestCase):
                         yield b""
 
             socket = SimpleNamespace(headers={}, receive=wait_for_client, accept=AsyncMock(), close=AsyncMock())
-            principal = {"username": "alice", "role": "user", "session_id": "s1", "account_refs": ["a1"]}
+            principal = {"username": "owner", "role": "admin", "session_id": "s1", "account_refs": []}
             with (
                 patch.object(app_module, "current_principal", side_effect=[principal, None]),
                 patch.object(app_module, "get_login_lock", return_value={"account_ref": "a1"}),
@@ -101,7 +123,10 @@ class SharedConsoleTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        for attribute, value in (("appSettings", None), ("userData", None)):
+        key_path = root / "storage.key"
+        key_path.write_bytes(Fernet.generate_key())
+        key_path.chmod(0o600)
+        for attribute, value in (("appSettings", None), ("userData", None), ("config", None)):
             previous = getattr(config, attribute)
             setattr(config, attribute, value)
             self.addCleanup(setattr, config, attribute, previous)
@@ -109,10 +134,13 @@ class SharedConsoleTests(unittest.TestCase):
             patch.object(config, "app_settings_path", return_value=root / "settings.json"),
             patch.object(auth, "app_settings_path", return_value=root / "settings.json"),
             patch.object(config, "users_data_path", return_value=root / "accounts.json"),
+            patch.object(config, "config_path", return_value=root / "runtime-config.json"),
             patch.object(config, "get_environment", return_value=config.Environment.LOCAL),
             patch.object(users, "USERS_FILE", root / "users.json"),
             patch.dict(os.environ, {"SPARKFLOW_SHARED_MODE": "1", "SPARKFLOW_ALLOWED_HOSTS": "testserver",
                                     "SPARKFLOW_BOOTSTRAP_TOKEN": "a-private-initialization-token", "SPARKFLOW_SESSION_COOKIE_SECURE": "0"}),
+            patch.dict(os.environ, {"SPARKFLOW_STORAGE_KEY_FILE": str(key_path)}),
+            patch.dict(os.environ, {"SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED": "1"}),
         ):
             context.start()
             self.addCleanup(context.stop)
@@ -120,7 +148,7 @@ class SharedConsoleTests(unittest.TestCase):
             {"account_ref": "a1", "unique_id": "111", "username": "Alice account", "cookies": [], "targets": []},
             {"account_ref": "a2", "unique_id": "222", "username": "Bob account", "cookies": [], "targets": []},
         ]
-        (root / "accounts.json").write_text(json.dumps(self.accounts))
+        config._save_json_file(root / "accounts.json", self.accounts)
         auth.bootstrap_admin_password("Owner-secret-2026!", username="owner")
         users.create_web_user("alice", "First-secret-2026!", account_refs=["a1"])
         users.create_web_user("bob", "Second-secret-2026!", account_refs=["a2"])
@@ -129,7 +157,7 @@ class SharedConsoleTests(unittest.TestCase):
 
     def login(self, username="alice", password="First-secret-2026!"):
         client = TestClient(self.application)
-        response = client.post("/login", data={"username": username, "password": password}, follow_redirects=False)
+        response = client.post("/login", data=login_form(client, username, password), follow_redirects=False)
         self.assertEqual(303, response.status_code)
         return client
 
@@ -215,6 +243,21 @@ class SharedConsoleTests(unittest.TestCase):
         client = self.login("owner", "Owner-secret-2026!")
         token = self.token(client)
         self.assertEqual(403, client.post("/ops/proxy/restart", data={"csrf_token": token}).status_code)
+
+    def test_normal_user_cannot_open_interactive_desktop_even_with_a_lease(self):
+        client = self.login()
+        with patch.object(app_module, "owns_login_lock", return_value=True), patch.object(app_module, "fetch_login_desktop_asset") as fetch:
+            self.assertEqual(403, client.get("/login-desktop/proxy/vnc.html").status_code)
+            fetch.assert_not_called()
+        from starlette.websockets import WebSocketDisconnect
+        with self.assertRaises(WebSocketDisconnect) as raised:
+            with client.websocket_connect("/login-desktop/proxy/websockify", headers={"Origin": "http://testserver"}):
+                pass
+        self.assertEqual(4403, raised.exception.code)
+        page = client.get("/login-workspace")
+        self.assertNotIn("<iframe", page.text)
+        self.assertIn("data-login-qr", page.text)
+        self.assertIn("data-cookie-login", page.text)
 
 
 if __name__ == "__main__":

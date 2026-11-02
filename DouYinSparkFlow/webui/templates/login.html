@@ -51,7 +51,7 @@
           {% endif %}
 
           {% if not bootstrapped %}
-          <form method="post" action="/bootstrap" class="form-stack">
+          <form method="post" action="/bootstrap" class="form-stack" data-auth-form>
             {% if bootstrap_token_required %}
             <label class="field"><span>初始化密钥</span><input type="password" name="bootstrap_token" autocomplete="off" required><small>由服务器管理员提供，仅用于首次创建管理员。</small></label>
             {% endif %}
@@ -72,14 +72,15 @@
             </button>
           </form>
           {% else %}
-          <form method="post" action="/login" class="form-stack">
+          <form method="post" action="/login" class="form-stack" data-auth-form>
+            <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
             <label class="field">
               <span>用户名</span>
-              <input type="text" name="username" autocomplete="username" autofocus>
+              <input type="text" name="username" autocomplete="username" maxlength="64" value="{{ login_username or '' }}" autofocus required>
             </label>
             <label class="field">
               <span>密码</span>
-              <input type="password" name="password" autocomplete="current-password">
+              <input type="password" name="password" autocomplete="current-password" maxlength="1024" required>
             </label>
             <button class="button button-primary button-block" type="submit">
               <i data-lucide="log-in"></i><span>登录</span>
@@ -93,6 +94,8 @@
             <p class="notice-inline" data-passkey-status role="status" aria-live="polite">填写用户名后，用已绑定的设备验证。</p>
           </div>
           {% endif %}
+          {% if bootstrapped and registration_available %}<p class="auth-foot"><a href="/register">还没有账号？创建普通用户</a></p>{% endif %}
+          {% if bootstrapped %}<p class="auth-foot">忘记密码或尚未通过审核，请联系管理员。</p>{% endif %}
           <p class="auth-foot">登录页不会展示服务器凭据或任何登录态数据。</p>
         </section>
       </main>
@@ -101,5 +104,6 @@
     <script defer src="/static/lucide.min.js?v=20260710"></script>
     <script defer src="/static/app.js?v=20261102-1"></script>
     <script defer src="/static/passkeys.js?v=20261102-1"></script>
+    <script defer src="/static/auth-forms.js?v=20261102-2"></script>
   </body>
 </html>

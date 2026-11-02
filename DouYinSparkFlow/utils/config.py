@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 
 from filelock import FileLock
+from utils.secure_storage import StorageError, encryption_required, read_json, serialize_json
 
 from utils.logger import setup_logger
 
@@ -195,14 +196,16 @@ def _load_json_file(path, defaults=None):
     if not path.exists():
         if defaults is None:
             raise FileNotFoundError(path)
-        path.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_json_file(path, defaults)
         return deepcopy(defaults)
 
     text = path.read_text(encoding="utf-8")
     if not text.strip():
+        if encryption_required():
+            raise StorageError("Protected storage is empty.")
         return deepcopy(defaults) if defaults is not None else None
 
-    data = json.loads(text)
+    data = read_json(path)
     if defaults is None:
         return data
     # _merge_defaults only works with dicts; for list-shaped data
@@ -212,13 +215,14 @@ def _load_json_file(path, defaults=None):
     return _merge_defaults(data, defaults)
 
 
-def _save_json_file(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+def _save_json_file(path, data, *, allow_plaintext_migration=False):
+    temp_name = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = serialize_json(data, path, allow_plaintext_migration=allow_plaintext_migration)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
@@ -226,11 +230,16 @@ def _save_json_file(path, data):
             os.chmod(path, 0o600)
         except OSError:
             pass
+    except OSError as exc:
+        raise StorageError("Unable to save application storage.") from exc
     finally:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Could not remove a temporary storage file")
 
 
 def get_config(force_reload=False):
@@ -242,8 +251,9 @@ def get_config(force_reload=False):
 
 def save_config(new_config):
     global config
-    config = _merge_defaults(new_config, DEFAULT_CONFIG)
-    _save_json_file(config_path(), config)
+    updated = _merge_defaults(new_config, DEFAULT_CONFIG)
+    _save_json_file(config_path(), updated)
+    config = updated
     return deepcopy(config)
 
 
@@ -297,8 +307,8 @@ def get_userData(force_reload=False):
 def save_userData(accounts):
     global userData
     normalized = list(accounts)
-    userData = normalized
     _save_json_file(users_data_path(), normalized)
+    userData = normalized
     return deepcopy(userData)
 
 
@@ -315,12 +325,12 @@ def _snapshot_user_data(target: Path) -> None:
     try:
         if not target.exists():
             return
-        content = target.read_text(encoding="utf-8")
+        content = read_json(target)
         backup_dir = target.parent / DATA_BACKUP_DIR
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination = backup_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{target.name}"
         if not destination.exists():
-            destination.write_text(content, encoding="utf-8")
+            _save_json_file(destination, content)
         keep = sorted(backup_dir.glob(f"*-{target.name}"))
         for stale in keep[:-DATA_BACKUP_KEEP]:
             try:
@@ -496,15 +506,16 @@ def get_app_settings(force_reload=False):
     if appSettings is None or force_reload:
         target = app_settings_path()
         with FileLock(f"{target}.lock", timeout=30):
-            appSettings = _load_json_file(target, DEFAULT_APP_SETTINGS)
-            before = deepcopy(appSettings)
-            _migrate_legacy_app_settings(appSettings)
-            if not appSettings.get("session_secret"):
-                appSettings["session_secret"] = secrets.token_urlsafe(32)
-            if not appSettings.get("compose_root"):
-                appSettings["compose_root"] = default_compose_root()
-            if appSettings != before:
-                _save_json_file(target, appSettings)
+            updated = _load_json_file(target, DEFAULT_APP_SETTINGS)
+            before = deepcopy(updated)
+            _migrate_legacy_app_settings(updated)
+            if not updated.get("session_secret"):
+                updated["session_secret"] = secrets.token_urlsafe(32)
+            if not updated.get("compose_root"):
+                updated["compose_root"] = default_compose_root()
+            if updated != before:
+                _save_json_file(target, updated)
+            appSettings = updated
     return deepcopy(appSettings)
 
 
@@ -523,11 +534,12 @@ def douyin_proxy_url(settings=None):
 
 def save_app_settings(new_settings):
     global appSettings
-    appSettings = _merge_defaults(new_settings, DEFAULT_APP_SETTINGS)
-    if not appSettings.get("session_secret"):
-        appSettings["session_secret"] = secrets.token_urlsafe(32)
-    if not appSettings.get("compose_root"):
-        appSettings["compose_root"] = default_compose_root()
+    updated = _merge_defaults(new_settings, DEFAULT_APP_SETTINGS)
+    if not updated.get("session_secret"):
+        updated["session_secret"] = secrets.token_urlsafe(32)
+    if not updated.get("compose_root"):
+        updated["compose_root"] = default_compose_root()
     with FileLock(f"{app_settings_path()}.lock", timeout=30):
-        _save_json_file(app_settings_path(), appSettings)
+        _save_json_file(app_settings_path(), updated)
+    appSettings = updated
     return deepcopy(appSettings)

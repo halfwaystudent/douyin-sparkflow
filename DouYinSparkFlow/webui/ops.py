@@ -538,8 +538,18 @@ def read_log_tail(lines=200):
     log_path = log_file_path()
     if not log_path.exists():
         return ""
-    content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(content[-lines:])
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, 2)
+            offset = max(0, handle.tell() - 512 * 1024)
+            handle.seek(offset)
+            content = handle.read(512 * 1024).decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        logger.warning("Task log is temporarily unavailable")
+        return ""
+    if offset:
+        content = content[1:]
+    return "\n".join(content[-max(1, min(int(lines), 2000)):])
 
 
 def read_crontab():
@@ -1979,12 +1989,28 @@ def _check_image_present():
         return False
 
 
+def resolve_log_file(configured):
+    root = Path(os.getenv("SPARKFLOW_LOG_DIRECTORY") or repo_root() / "logs").resolve()
+    candidate = Path(configured or root / "douyin-sparkflow.log")
+    if candidate.is_relative_to(Path("/app/logs")):
+        candidate = root / candidate.relative_to("/app/logs")
+    elif not candidate.is_absolute():
+        candidate = repo_root() / candidate
+    candidate = candidate.resolve()
+    key_file = os.getenv("SPARKFLOW_STORAGE_KEY_FILE", "")
+    if not candidate.is_relative_to(root) or candidate.suffix != ".log" or (key_file and candidate == Path(key_file).resolve()):
+        raise ValueError("日志文件只能是应用 logs 目录内的 .log 文件。")
+    return candidate
+
+
 def log_file_path():
     """Path of the task log the panel reads and offers for download."""
     configured = str(get_app_settings().get("ops_log_file") or "").strip()
-    if configured:
-        return Path(configured)
-    return Path(CRON_LOG_PATH)
+    try:
+        return resolve_log_file(configured)
+    except ValueError:
+        logger.warning("Ignoring a log path outside the application log directory")
+        return resolve_log_file("")
 
 
 LOG_LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b")

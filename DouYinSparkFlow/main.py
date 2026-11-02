@@ -6,7 +6,6 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from core.login import userLogin
-from utils.github_action_config import print_github_action_config
 
 
 console = Console()
@@ -16,11 +15,10 @@ def interactive_cli():
     console.print("[bold green]Welcome to DouYin Spark Flow[/bold green]")
     console.print("[bold yellow]Choose an action:[/bold yellow]")
     console.print("[cyan]1.[/cyan] Add account login")
-    console.print("[cyan]2.[/cyan] Export USER_DATA for GitHub Actions")
     console.print("[cyan]3.[/cyan] Run task locally")
     console.print("[cyan]4.[/cyan] Start Web Admin UI")
 
-    choice = Prompt.ask("Enter a choice (1/2/3/4)", choices=["1", "2", "3", "4"])
+    choice = Prompt.ask("Enter a choice (1/3/4)", choices=["1", "3", "4"])
 
     if choice == "1":
         console.print("[bold blue]Starting account login...[/bold blue]")
@@ -28,8 +26,6 @@ def interactive_cli():
             asyncio.run(userLogin())
             if Prompt.ask("Continue adding accounts? (y/n)", choices=["y", "n"]) == "n":
                 break
-    elif choice == "2":
-        print_github_action_config()
     elif choice == "3":
         from core.tasks import runTasks
 

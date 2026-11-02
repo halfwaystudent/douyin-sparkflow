@@ -19,6 +19,7 @@ from webauthn.helpers.structs import (
 )
 
 from utils.config import get_app_settings, _save_json_file
+from utils.secure_storage import read_json
 from webui.users import find_web_user, normalize_username, stable_user_id
 
 
@@ -56,7 +57,7 @@ class PasskeyStore:
 
     def _change(self, operation):
         with FileLock(f"{PASSKEYS_FILE}.lock", timeout=30):
-            data = json.loads(PASSKEYS_FILE.read_text()) if PASSKEYS_FILE.exists() else {"credentials": [], "challenges": {}}
+            data = read_json(PASSKEYS_FILE) if PASSKEYS_FILE.exists() else {"credentials": [], "challenges": {}}
             now = time.time()
             data["challenges"] = {key: value for key, value in data["challenges"].items() if value["expires"] > now}
             try:
