@@ -254,24 +254,24 @@ class LazyPickerBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(await self.page.locator("*").count(), 1000)
         self.assertEqual(["1000000000"], await self.page.evaluate("new FormData(document.getElementById('form-0')).getAll('group_bind')"))
 
-    async def test_eager_comparison_builds_all_five_thousand_rows(self):
+    async def test_eager_comparison_limits_ten_accounts_to_one_hundred_rows_each(self):
         await self.load(eager=True)
-        self.assertEqual(5000, await self.page.locator(".friend-option").count())
+        self.assertEqual(1000, await self.page.locator(".friend-option").count())
         self.assertEqual(20, await self.page.evaluate("requests.length"))
-        self.assertGreater(await self.page.locator("*").count(), 15000)
+        self.assertGreater(await self.page.locator("*").count(), 3000)
 
     async def test_opening_one_account_only_initializes_once_and_preserves_group_form_values(self):
         await self.load()
         await self.page.evaluate("document.getElementById('account-0').open=true")
         await self.page.clock.run_for(1)
-        await self.page.wait_for_function("document.querySelectorAll('.friend-option').length===500")
+        await self.page.wait_for_function("document.querySelectorAll('.friend-option').length===100")
         self.assertEqual(2, await self.page.evaluate("requests.length"))
         self.assertEqual(["1000000000"], await self.page.evaluate("new FormData(document.getElementById('form-0')).getAll('group_bind')"))
         await self.page.evaluate("document.getElementById('account-0').open=false")
         await self.page.clock.run_for(1)
         await self.page.evaluate("document.getElementById('account-0').open=true")
         await self.page.clock.run_for(1)
-        self.assertEqual(500, await self.page.locator(".friend-option").count())
+        self.assertEqual(100, await self.page.locator(".friend-option").count())
         self.assertEqual(2, await self.page.evaluate("requests.length"))
         self.assertEqual(1, await self.page.locator(".group-search-input").count())
 
@@ -282,7 +282,7 @@ class LazyPickerBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.page.add_script_tag(path=str(SCRIPT))
         await self.page.clock.run_for(1)
         self.assertTrue(await self.page.locator("#account-0").evaluate("element=>element.open"))
-        self.assertEqual(500, await self.page.locator(".friend-option").count())
+        self.assertEqual(100, await self.page.locator(".friend-option").count())
         self.assertEqual(2, await self.page.evaluate("requests.length"))
 
     async def test_batch_refresh_initializes_closed_accounts_and_posts_once_per_account(self):

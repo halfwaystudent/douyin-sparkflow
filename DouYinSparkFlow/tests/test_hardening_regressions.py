@@ -82,8 +82,10 @@ class WebSessionHardeningTests(unittest.TestCase):
 
         with (
             patch.object(auth, "get_app_settings", side_effect=get_settings),
+            patch.object(auth, "read_app_settings", side_effect=get_settings),
             patch.object(auth, "save_app_settings", side_effect=save_settings),
             patch.object(user_store, "get_app_settings", side_effect=get_settings),
+            patch.object(user_store, "read_app_settings", side_effect=get_settings),
         ):
             auth.bootstrap_admin_password("old-password")
             identity = user_store.authenticate("admin", "old-password")

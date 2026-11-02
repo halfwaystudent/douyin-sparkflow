@@ -38,9 +38,11 @@
 <section class="card form-stack" data-binding-result hidden aria-live="polite" aria-atomic="true">
   <h2 data-binding-result-title>绑定结果</h2>
   <p data-binding-result-message></p>
+  <p class="notice-inline" data-save-check-status role="status" hidden></p>
   <div class="form-actions">
+    <button class="button button-primary" type="button" data-recheck-login-save hidden>重新检查保存结果</button>
     <a class="button button-primary" href="/accounts" data-binding-next>查看账号</a>
-    <a class="button button-quiet" href="/preferences/streak">设置我的时间和内容</a>
+    <a class="button button-quiet" href="/preferences/streak" data-binding-preferences>设置我的时间和内容</a>
   </div>
 </section>
 
@@ -78,12 +80,13 @@
 
     <div class="card">
       <h3 class="card-title"><i data-lucide="list-ordered"></i>怎么登录</h3>
+      <p class="notice-inline" data-login-progress role="status" aria-live="polite">第 1 步：申请登录工作区。</p>
       <ol class="step-list">
-        <li>点右上角的“{% if relogin_account %}打开登录工作区{% else %}添加新账号{% endif %}”，排到你后会自动打开登录浏览器。</li>
-        <li>用抖音 App 扫二维码；遇到验证码、短信码或密码输入，打开“登录窗口”手动完成。</li>
-        <li>登录成功后点“{% if relogin_account %}保存登录态{% else %}保存新账号{% endif %}”，好友列表会自动刷新。</li>
+        <li data-login-step="1" aria-current="step">点“{% if relogin_account %}打开登录工作区{% else %}添加新账号{% endif %}”，排到你后会自动显示二维码。</li>
+        <li data-login-step="2">用抖音 App 扫二维码；遇到验证码、短信码或密码输入，打开“登录窗口”手动完成。</li>
+        <li data-login-step="3">登录成功后点“{% if relogin_account %}保存登录态{% else %}保存新账号{% endif %}”，核对身份后再继续设置。</li>
       </ol>
-      <p class="muted compact" style="margin-top: 12px">登录过程中请停留在本页：离开或关闭页面会释放登录工作区，下一位用户就能使用。</p>
+      <p class="muted compact" style="margin-top: 12px">请保留本页。切换到抖音 App 扫码后及时返回；后台超过 2 分钟会释放工作区，离开页面也会取消排队。保存进行中请勿关闭页面。</p>
       <div class="form-actions" style="margin-top: 16px">
         <button
           class="button button-ghost button-sm login-desktop-close"
@@ -173,23 +176,26 @@
   {% else %}
   <details class="card login-interaction" data-login-interaction>
     <summary>登录窗口 · 验证码 / 密码</summary>
-    <p class="muted compact" data-interaction-status>申请工作区后，可以在这里完成手动验证。</p>
-    <button class="button button-quiet button-sm" type="button" data-interaction-expand>放大 / 还原</button>
+    <p class="muted compact" data-interaction-status role="status" aria-live="polite">申请工作区后，可以在这里完成手动验证。画面显示后再操作。</p>
+    <div class="form-actions">
+      <button class="button button-quiet button-sm" type="button" data-interaction-expand aria-expanded="false">放大窗口</button>
+      <button class="button button-quiet button-sm" type="button" data-interaction-refresh>更新画面</button>
+    </div>
     <div class="interaction-viewport">
       <img data-interaction-image alt="当前会话的抖音登录页面" width="1600" height="1000" hidden draggable="false">
     </div>
     <label class="field"><span>输入到已选中的登录输入框</span>
-      <input type="password" data-interaction-text autocomplete="off" maxlength="1024" placeholder="先点击上方窗口中的输入框">
+      <input type="password" data-interaction-text autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="1024" enterkeyhint="send" placeholder="先点击上方窗口中的输入框" disabled>
     </label>
     <div class="form-actions">
-      <button class="button button-primary button-sm" type="button" data-interaction-send>输入</button>
-      <button class="button button-quiet button-sm" type="button" data-interaction-key="Control+A">全选</button>
-      <button class="button button-quiet button-sm" type="button" data-interaction-key="Backspace">退格</button>
-      <button class="button button-quiet button-sm" type="button" data-interaction-key="Enter">确认</button>
+      <button class="button button-primary button-sm" type="button" data-interaction-send disabled>输入</button>
+      <button class="button button-quiet button-sm" type="button" data-interaction-key="Control+A" disabled>全选</button>
+      <button class="button button-quiet button-sm" type="button" data-interaction-key="Backspace" disabled>退格</button>
+      <button class="button button-quiet button-sm" type="button" data-interaction-key="Enter" disabled>确认</button>
     </div>
     <p class="muted compact">输入完成后会清空下方输入栏。登录成功后，回到页面顶部保存账号。</p>
   </details>
   {% endif %}
 </section>
-<script defer src="/static/login-interaction.js?v=20261102-3"></script>
+<script defer src="{{ asset_url('login-interaction.js') }}"></script>
 {% endblock %}

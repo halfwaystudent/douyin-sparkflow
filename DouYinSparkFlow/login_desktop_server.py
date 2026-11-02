@@ -732,14 +732,28 @@ class LoginDesktopManager:
             "logged_in": False,
         }
 
-    async def refresh_login_qr(self):
+    def workspace_guard(self, interaction_key):
+        keyed = bool(interaction_key or self.interaction.token)
+        def check(page=None):
+            if (keyed and not self.interaction.owns(interaction_key)) or (not keyed and self.interaction.token):
+                raise InteractionError("登录工作区已释放，请重新申请", 423)
+            if keyed and page is not None:
+                self.interaction.check(interaction_key, page)
+        return check
+
+    async def refresh_login_qr(self, *, interaction_key=""):
+        check = self.workspace_guard(interaction_key)
+        check()
         self.mark_activity()
         try:
             await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("login page is busy; retry shortly") from exc
         try:
-            return await self._refresh_login_qr_locked()
+            check()
+            payload = await self._refresh_login_qr_locked()
+            check(self.page)
+            return payload
         finally:
             self._page_operation_lock.release()
 
@@ -1129,9 +1143,19 @@ async def focus():
 
 
 @app.post("/refresh-qr")
-async def refresh_qr():
+async def refresh_qr(request: Request):
     try:
-        payload = await manager.refresh_login_qr()
+        raw = await request.body()
+        if len(raw) > 1024:
+            return JSONResponse({"ok": False, "error": "请求过大"}, status_code=413)
+        data = await request.json() if raw else {}
+        if not isinstance(data, dict) or set(data) - {"interaction_key"} or not isinstance(data.get("interaction_key", ""), str):
+            raise ValueError
+        payload = await manager.refresh_login_qr(interaction_key=data.get("interaction_key", ""))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "工作区凭据格式无效"}, status_code=400)
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
@@ -1199,17 +1223,28 @@ async def _probe_login_qr(page):
 
 
 @app.get("/qr")
-async def login_qr(wait: float = 0):
+async def login_qr(request: Request, wait: float = 0):
+    try:
+        return await _read_login_qr(wait, request.headers.get("X-SparkFlow-Workspace", ""))
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
+
+
+async def _read_login_qr(wait, interaction_key):
     # wait > 0 holds the request until a QR appears (up to the limit) instead of
     # making the browser poll; every page call is bounded by that deadline, so a
     # busy renderer yields "not ready" rather than hanging the request.
     loop = asyncio.get_running_loop()
+    check = manager.workspace_guard(interaction_key)
+    check()
     deadline = loop.time() + min(max(0.0, wait), QR_MAX_WAIT_SECONDS)
     while manager._page_operation_lock.locked():
+        check()
         if loop.time() >= deadline:
             code, message = QR_ERROR_SPECS["qr_page_busy"]
             return _qr_error(code, "qr_page_busy", message, retry_after=1)
         await asyncio.sleep(0.25)
+    check()
     if not manager.context or manager._context_is_closed():
         # Reading the QR code must not launch a browser (for example right
         # after /close); only opening the workspace does that.
@@ -1217,6 +1252,7 @@ async def login_qr(wait: float = 0):
         return _qr_error(code, "qr_not_ready", message, retry_after=1)
     try:
         page = await manager._get_active_page()
+        check(page)
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
@@ -1234,6 +1270,7 @@ async def login_qr(wait: float = 0):
             # The page navigated or closed mid-probe; that is "not ready yet",
             # not an upstream failure that would stop the page's QR wait.
             outcome, data = "not_ready", None
+        check(page)
         if outcome != "not_ready" or loop.time() + 0.5 >= deadline:
             break
         # A page operation (open, refresh) or a closed page ends this wait early.

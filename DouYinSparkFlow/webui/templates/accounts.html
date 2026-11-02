@@ -9,7 +9,7 @@
 {% block page_sub %}<p class="page-sub">管理每个账号要续火花的好友，以及登录态和启用状态。</p>{% endblock %}
 
 {% block topbar_actions %}
-<button class="button button-quiet" type="button" data-refresh-all-friends>
+<button class="button button-quiet" type="button" data-refresh-all-friends {% if not accounts %}hidden disabled{% endif %}>
   <i data-lucide="refresh-cw"></i><span>刷新全部好友</span>
 </button>
 <a class="button button-primary" href="/login-workspace">
@@ -78,6 +78,7 @@
         <div
           class="friend-picker"
           data-account-id="{{ account.unique_id }}"
+          data-cache-url="/accounts/{{ account.unique_id }}/picker-cache?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
           data-refresh-url="/accounts/{{ account.unique_id }}/friends/refresh"
           data-csrf-token="{{ csrf_token }}"
         >
@@ -95,7 +96,7 @@
           <input class="friend-search-input" type="search" placeholder="搜索好友昵称" aria-label="搜索好友">
           <p class="friend-picker-summary">已选 0 人</p>
           <div class="friend-picker-list"></div>
-          <script type="application/json" id="friends-cache-{{ account.unique_id }}">{{ account.friends_cache|default([], true)|tojson }}</script>
+          <script type="application/json" id="friends-cache-{{ account.unique_id }}">[]</script>
           <script type="application/json" id="selected-targets-{{ account.unique_id }}">{{ account.targets|default([], true)|tojson }}</script>
         </div>
         <label class="field">
@@ -111,10 +112,10 @@
             </div>
             <button class="button button-quiet button-sm group-refresh-button" type="button">刷新群列表</button>
           </div>
-          <div class="group-picker" data-account-id="{{ account.unique_id }}" data-refresh-url="/accounts/{{ account.unique_id }}/groups/refresh" data-csrf-token="{{ csrf_token }}">
+          <div class="group-picker" data-account-id="{{ account.unique_id }}" data-cache-url="/accounts/{{ account.unique_id }}/picker-cache?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}" data-refresh-url="/accounts/{{ account.unique_id }}/groups/refresh" data-csrf-token="{{ csrf_token }}">
             <div class="group-picker-notices">{% for target, notice in (account.group_target_notices|default({}, true)).items() %}<span class="pill {% if notice.kind == 'missing' %}danger{% else %}warning{% endif %}">{{ '未找到此群' if notice.kind == 'missing' else '已改名为 ' ~ notice.currentName }}</span>{% endfor %}</div>
             <div class="group-picker-list">{% for target, conversation_id in (account.group_target_bindings|default({}, true)).items() %}<label><input type="checkbox" name="group_bind" value="{{ conversation_id }}" checked><span>{{ target }}（{{ conversation_id }}）</span></label>{% endfor %}</div>
-            <script type="application/json" id="groups-cache-{{ account.unique_id }}">{{ account.group_cache|default([], true)|tojson }}</script>
+            <script type="application/json" id="groups-cache-{{ account.unique_id }}">[]</script>
             <script type="application/json" id="group-bindings-{{ account.unique_id }}">{{ account.group_target_bindings|default({}, true)|tojson }}</script>
           </div>
           <div class="group-target-editor-heading">

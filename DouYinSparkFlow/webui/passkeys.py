@@ -18,7 +18,7 @@ from webauthn.helpers.structs import (
     ResidentKeyRequirement, UserVerificationRequirement,
 )
 
-from utils.config import get_app_settings, _save_json_file
+from utils.config import read_app_settings, _save_json_file
 from utils.secure_storage import read_json
 from webui.users import find_web_user, normalize_username, stable_user_id
 
@@ -30,7 +30,7 @@ MAX_KEYS_PER_USER = 10
 
 
 def login_identity(username):
-    settings = get_app_settings(force_reload=True)
+    settings = read_app_settings()
     admin = str(settings.get("admin_username") or "admin")
     if normalize_username(username) == normalize_username(admin) and settings.get("admin_password_hash"):
         return {"username": admin, "role": "admin", "account_refs": [],
@@ -71,21 +71,27 @@ class PasskeyStore:
             for key in data["credentials"] if key["user_key"] == identity["user_key"]
         ])
 
-    def delete(self, identity, credential_id):
+    def delete(self, identity, credential_id, *, authorize=None):
         def change(data):
+            if authorize:
+                authorize()
             data["credentials"] = [key for key in data["credentials"]
                                    if not (key["user_key"] == identity["user_key"] and key["id"] == credential_id)]
         self._change(change)
 
-    def revoke_all(self, user_key):
+    def revoke_all(self, user_key, *, authorize=None):
         def change(data):
+            if authorize:
+                authorize()
             data["credentials"] = [key for key in data["credentials"] if key["user_key"] != user_key]
             data["challenges"] = {key: value for key, value in data["challenges"].items()
                                   if value["identity"]["user_key"] != user_key}
         self._change(change)
 
-    def begin(self, identity, binding, *, registration=False):
+    def begin(self, identity, binding, *, registration=False, authorize=None):
         def change(data):
+            if authorize:
+                authorize()
             data["challenges"] = {key: value for key, value in data["challenges"].items() if value["binding"] != binding}
             if len(data["challenges"]) >= MAX_CHALLENGES:
                 raise ValueError("尝试次数过多，请稍后重试。")
@@ -119,9 +125,11 @@ class PasskeyStore:
             return {"challenge_id": challenge_id, "options": json.loads(options_to_json(options))}
         return self._change(change)
 
-    def finish(self, challenge_id, binding, credential, *, registration=False, label="", identity=None):
+    def finish(self, challenge_id, binding, credential, *, registration=False, label="", identity=None, authorize=None):
         def change(data):
             challenge = data["challenges"].pop(challenge_id, None)
+            if authorize:
+                authorize()
             if not isinstance(credential, dict):
                 raise ValueError("Invalid credential")
             if not challenge or challenge["binding"] != binding or challenge["registration"] != registration:
@@ -138,6 +146,13 @@ class PasskeyStore:
                           expected_rp_id=self.rp_id, expected_origin=self.origin, require_user_verification=True)
             if registration:
                 result = verify_registration_response(**common)
+                if authorize:
+                    authorize()
+                # Credential or account changes during verification invalidate
+                # the result before any new credential is published.
+                live = login_identity(expected["username"])
+                if not live or any(live[key] != expected[key] for key in ("user_key", "auth_version", "role")):
+                    raise ValueError("账号状态已变化，请重新登录。")
                 credential_id = bytes_to_base64url(result.credential_id)
                 if any(key["id"] == credential_id for key in data["credentials"]):
                     raise ValueError("这个通行密钥已经绑定。")
@@ -157,6 +172,11 @@ class PasskeyStore:
                     **common, credential_public_key=base64url_to_bytes(key["public_key"]),
                     credential_current_sign_count=key["sign_count"],
                 )
+                if authorize:
+                    authorize()
+                live = login_identity(expected["username"])
+                if not live or any(live[key] != expected[key] for key in ("user_key", "auth_version", "role")):
+                    raise ValueError("账号状态已变化，请重新登录。")
                 key["sign_count"] = result.new_sign_count
             return live
         return self._change(change)

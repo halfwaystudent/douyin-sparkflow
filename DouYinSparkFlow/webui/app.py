@@ -78,6 +78,7 @@ from webui.auth import (
     is_bootstrapped,
     is_https_request,
     issue_session,
+    refreshed_identity,
     update_admin_password,
     validate_csrf,
 )
@@ -97,7 +98,7 @@ from webui.users import (
 )
 from webui.login_guard import LoginThrottle, password_problem
 from webui.security import SecurityMiddleware
-from webui.credentials import CredentialBusyError, credential_slot
+from webui.credentials import CredentialBusyError, credential_slot, run_auth_read, run_credential_work
 from utils.secure_storage import StorageError
 from utils.secure_storage import require_encrypted_files
 from webui import registration
@@ -105,7 +106,9 @@ from webui.registration_routes import register_routes as register_registration_r
 from webui.login_interaction import register_routes as register_login_interaction_routes
 from webui.personal_streak import register_routes as register_personal_streak_routes
 from webui.personal_streak import schedule_for as personal_schedule_for
-from webui.static_assets import public_assets
+from webui.static_assets import AssetVersions, public_assets
+from webui.picker_data import picker_cache
+from webui.binding_operations import BindingOperations, ID_PATTERN
 from webui.account_binding import BindingCommitError, commit_login_binding, capture_login_before_write
 from webui.account_binding import register_routes as register_account_binding_routes
 from webui.account_editing import AccountEditConflict, account_edit_revision
@@ -155,11 +158,13 @@ logger = setup_logger(level=logging.DEBUG)
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
+asset_versions = AssetVersions(STATIC_DIR)
 DEBUG_ARTIFACTS_DIR = BASE_DIR.parent / "logs" / "debug_artifacts"
 # Seconds one /login-desktop/qr request waits upstream for a QR code; the upstream
 # adds at most ~3s on top, well inside the 20s proxy timeout.
 LOGIN_QR_WAIT_SECONDS = 10
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates.env.globals["asset_url"] = asset_versions.url
 templates.env.globals["cache_age_label"] = cache_age_label
 templates.env.globals["duplicate_display_names"] = duplicate_display_names
 templates.env.globals["schedule_window_state"] = lambda: schedule_window_state(allow_host_commands=False)
@@ -823,6 +828,9 @@ def _identity_error_response(exc, current, route, *, display_id=""):
             "categoryLabel": account_identity.IDENTITY_STATE_LABELS["unverified"],
             "identityState": "unverified",
             "retryable": True,
+            # Identity checks reject before the binding write. A retryable 503
+            # here must not be mistaken for a possibly completed save.
+            "binding_pending": False,
         },
         status_code=503,
     )
@@ -1304,7 +1312,7 @@ def create_app():
             yield
         finally:
             watchdog.cancel()
-            pending = [watchdog, *login_verification_tasks]
+            pending = [watchdog, *login_verification_tasks, *[operation.task for operation in binding_operations.operations.values() if operation.task and not operation.task.done()]]
             for task in pending[1:]:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
@@ -1348,7 +1356,7 @@ def create_app():
     if allowed_hosts:
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts, www_redirect=False)
     app.add_middleware(SecurityMiddleware, shared=shared, public_scheme="https" if secure_cookie else None)
-    app.mount("/static", public_assets(STATIC_DIR), name="static")
+    app.mount("/static", public_assets(STATIC_DIR, asset_versions), name="static")
     DEBUG_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
     @app.exception_handler(Exception)
@@ -1464,16 +1472,24 @@ def create_app():
             return PlainTextResponse("Forbidden", status_code=403)
         return None
 
-    def confirm_password(request, username, password):
+    async def confirm_password(request, username, password):
         from webui.users import authenticate
         client_ip = request.client.host if request.client else ""
         if login_throttle.retry_after(client_ip, username):
             return False
-        if not authenticate(username, password):
+        async with credential_slot(app):
+            identity = await run_credential_work(authenticate, username, password)
+        if not identity or not await run_auth_read(refreshed_identity, identity):
             login_throttle.record_failure(client_ip, username)
             return False
         login_throttle.record_success(client_ip, username)
         return True
+
+    def admin_credential_change(request, function, *args, **kwargs):
+        live = principal(request)
+        if not live or live.get("role") != "admin":
+            raise UserStoreError("登录状态已变化，请重新登录。")
+        return function(*args, **kwargs)
 
     def account_for_request(request, unique_id):
         accounts, _ = ensure_account_refs(get_userData(force_reload=True))
@@ -1561,24 +1577,20 @@ def create_app():
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_page(request: Request):
-        if principal(request):
-            return redirect("/")
-        if current_user(request):
-            clear_session(request, revoke=False)
-        return render_template(
-            request,
-            "login.html",
-            {
-                "flash": pop_flash(request),
-                "bootstrapped": is_bootstrapped(),
-                "bootstrap_token_required": bool(bootstrap_token),
-                "login_csrf": csrf_token(request),
-            },
-        )
+        def page():
+            if principal(request):
+                return redirect("/")
+            if current_user(request):
+                clear_session(request, revoke=False)
+            return render_template(request, "login.html", {
+                "flash": pop_flash(request), "bootstrapped": is_bootstrapped(),
+                "bootstrap_token_required": bool(bootstrap_token), "login_csrf": csrf_token(request),
+            })
+        return await run_auth_read(page)
 
     @app.post("/bootstrap")
     async def bootstrap(request: Request):
-        if is_bootstrapped():
+        if await run_auth_read(is_bootstrapped):
             flash(request, "管理员账号已经设置，请直接登录。", "warning")
             return redirect("/login")
 
@@ -1604,7 +1616,8 @@ def create_app():
             return redirect("/login")
 
         try:
-            bootstrap_admin_password(password, username=username)
+            async with credential_slot(app):
+                await run_credential_work(bootstrap_admin_password, password, username=username)
         except BootstrapAlreadyConfigured:
             return PlainTextResponse("Admin login is already configured.", status_code=409)
         flash(request, "管理员账号已创建，请登录。", "success")
@@ -1612,14 +1625,14 @@ def create_app():
 
     @app.post("/login")
     async def login_action(request: Request):
-        if not is_bootstrapped():
+        if not await run_auth_read(is_bootstrapped):
             flash(request, "请先完成管理员初始化。", "warning")
             return redirect("/login")
 
         form = await request.form()
         username = str(form.get("username", "")).strip()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return render_template(request, "login.html", {
+            return await run_auth_read(render_template, request, "login.html", {
                 "bootstrapped": True, "login_csrf": csrf_token(request), "login_username": username[:64],
                 "flash": {"message": "登录页面已更新，请重新输入密码。", "level": "error"},
             }, status_code=403)
@@ -1635,7 +1648,8 @@ def create_app():
             flash(request, f"尝试次数过多，请 {interval}后再试。", "error")
             return redirect("/login")
         async with credential_slot(app):
-            identity = await asyncio.to_thread(authenticate, username, password)
+            identity = await run_credential_work(authenticate, username, password)
+        identity = await run_auth_read(refreshed_identity, identity) if identity else None
         if not identity:
             login_throttle.record_failure(client_ip, username)
             logger.warning("Web login failed for ip=%s user=%r", client_ip, username[:40])
@@ -1658,7 +1672,7 @@ def create_app():
         form = await request.form()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
-        clear_session(request)
+        await run_credential_work(clear_session, request)
         return redirect("/login")
 
     @app.get("/api/ops/overview")
@@ -1707,7 +1721,7 @@ def create_app():
         if current.get("role") == "admin":
             flash(request, "请在系统设置中修改管理员密码。", "info")
             return redirect("/settings#system")
-        if not confirm_password(request, current["username"], str(form.get("current_password", ""))):
+        if not await confirm_password(request, current["username"], str(form.get("current_password", ""))):
             flash(request, "当前密码不正确或尝试次数过多，请稍后重试。", "error")
             return redirect("/settings#password")
         password = str(form.get("new_password", ""))
@@ -1720,9 +1734,17 @@ def create_app():
             flash(request, problem, "error")
             return redirect("/settings#password")
         try:
-            update_web_user(current["username"], password=password)
+            def change_password():
+                from webui.users import _web_users_lock
+                with _web_users_lock():
+                    live = principal(request)
+                    if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+                        raise UserStoreError("登录状态已变化，请重新登录。")
+                    update_web_user(current["username"], password=password)
+                clear_session(request)
+            async with credential_slot(app):
+                await run_credential_work(change_password)
             flash(request, "密码已修改，请重新登录。", "success")
-            clear_session(request)
             return redirect("/login")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
@@ -1742,7 +1764,7 @@ def create_app():
             flash(request, problem, "error")
             return redirect("/settings#users")
         try:
-            create_web_user(
+            await run_credential_work(admin_credential_change, request, create_web_user,
                 str(form.get("username", "")),
                 str(form.get("password", "")),
                 enabled=str(form.get("enabled", "")) == "on",
@@ -1769,7 +1791,7 @@ def create_app():
                 flash(request, problem, "error")
                 return redirect("/settings#users")
         try:
-            update_web_user(
+            await run_credential_work(admin_credential_change, request, update_web_user,
                 username,
                 new_username=str(form.get("new_username", "")).strip() or None,
                 password=str(form.get("password", "")) or None,
@@ -1790,7 +1812,7 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         try:
-            update_web_user(username, revoke_sessions=True)
+            await run_credential_work(admin_credential_change, request, update_web_user, username, revoke_sessions=True)
             flash(request, "该用户的登录会话已撤销，下次操作需要重新登录。", "success")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
@@ -1805,7 +1827,7 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         try:
-            if delete_web_user(username):
+            if await run_credential_work(admin_credential_change, request, delete_web_user, username):
                 flash(request, "普通用户已删除，抖音账号数据未删除。", "success")
             else:
                 flash(request, "普通用户不存在。", "error")
@@ -1813,13 +1835,13 @@ def create_app():
             flash(request, str(exc), "error")
         return redirect("/settings#users")
 
-    def console_context(request, *, with_admin_data=False):
+    def console_context(request, *, with_admin_data=False, with_ops=True):
         current = principal(request)
         is_admin_user = current.get("role") == "admin"
         context = {
             "flash": pop_flash(request),
             "accounts": get_visible_accounts(current, get_userData(force_reload=True)),
-            "ops": scoped_ops_snapshot(request),
+            "ops": scoped_ops_snapshot(request) if with_ops else {},
             "principal": current,
             "is_admin": is_admin_user,
             "runtime_config": {},
@@ -1899,7 +1921,7 @@ def create_app():
         if account:
             request.session["setup_account_ref"] = account["account_ref"]
         return render_template(request, "setup.html", {
-            **state, "accounts": accounts,
+            **state, "accounts": accounts, "flash": pop_flash(request),
             "step": requested_step(request.query_params.get("step"), state),
         })
 
@@ -1912,13 +1934,22 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         from core.personal_streak import preferences
-        from webui.setup_flow import setup_state
+        from webui.setup_flow import setup_state, setup_binding_revision
         current = principal(request)
+        selected_ref = str(form.get("account_ref", "")).strip()
+        expected_revision = str(form.get("binding_revision", "")).strip()
+        revision_invalid = bool(expected_revision and (len(expected_revision) != 64 or any(char not in "0123456789abcdef" for char in expected_revision)))
+        if (shared and (not selected_ref or not expected_revision)) or revision_invalid:
+            flash(request, "这个引导页面已过期，请重新打开当前步骤后再完成。", "warning")
+            return redirect("/setup")
         state = setup_state(
             await asyncio.to_thread(get_visible_accounts, current),
             await asyncio.to_thread(preferences, current),
-            str(request.session.get("setup_account_ref", "")),
+            selected_ref or str(request.session.get("setup_account_ref", "")),
         )
+        if expected_revision and state["setup_account"] and not hmac.compare_digest(expected_revision, setup_binding_revision(state["setup_account"])):
+            flash(request, "这个账号的登录身份已更新，请重新检查当前步骤后再完成。", "warning")
+            return redirect("/setup?account=" + quote(selected_ref, safe=""))
         if not state["can_finish"]:
             flash(request, state["setup_blocked_reason"], "warning")
             return redirect("/setup?step=" + str(state["suggested_step"]))
@@ -1944,14 +1975,39 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
-        return render_template(request, "accounts.html", await asyncio.to_thread(console_context, request))
+        return render_template(request, "accounts.html", await asyncio.to_thread(console_context, request, with_ops=False))
+
+    @app.get("/accounts/{unique_id}/picker-cache")
+    async def account_picker_cache(request: Request, unique_id: str):
+        expected = {
+            "account_ref": request.query_params.get("ref", ""),
+            "login_generation": request.query_params.get("generation", ""),
+        }
+        if not principal(request):
+            return JSONResponse({"error": "请重新登录。"}, status_code=401)
+        _, account, error = await asyncio.to_thread(account_for_request, request, unique_id)
+        if error:
+            return JSONResponse({"error": "无法读取这个账号。"}, status_code=error.status_code)
+        if not account_identity.same_login_snapshot(account, expected):
+            return JSONResponse({"error": "账号登录已更新，请重新打开账号页。"}, status_code=409)
+        payload = await asyncio.to_thread(picker_cache, account)
+        # A transfer, deletion or re-login during the read must not expose the
+        # old snapshot to a principal whose access has since changed.
+        if not principal(request):
+            return JSONResponse({"error": "请重新登录。"}, status_code=401)
+        _, current, error = await asyncio.to_thread(account_for_request, request, unique_id)
+        if error:
+            return JSONResponse({"error": "无法读取这个账号。"}, status_code=error.status_code)
+        if not account_identity.same_login_snapshot(current, expected):
+            return JSONResponse({"error": "账号登录已更新，请重新打开账号页。"}, status_code=409)
+        return JSONResponse(payload)
 
     @app.get("/login-workspace", response_class=HTMLResponse)
     async def login_workspace_page(request: Request):
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
-        context = await asyncio.to_thread(console_context, request)
+        context = await asyncio.to_thread(console_context, request, with_ops=False)
         # "Re-login" on the accounts page lands here with the account preselected;
         # only accounts the current user can see are matched.
         relogin = str(request.query_params.get("relogin", "")).strip()
@@ -1970,12 +2026,19 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
+        current = principal(request)
         context = await asyncio.to_thread(console_context, request, with_admin_data=True)
+        live = await run_auth_read(principal, request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return redirect("/login")
         if principal(request)["role"] == "admin":
             context["registration"] = registration.policy()
             context["invitations"] = registration.invitations()
         identity = passkey_identity(principal(request)["username"]) if passkeys else None
-        context["passkey_list"] = passkeys.list_keys(identity) if identity else []
+        context["passkey_list"] = await run_credential_work(passkeys.list_keys, identity) if identity else []
+        live = await run_auth_read(principal, request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return redirect("/login")
         if principal(request).get("role") == "admin":
             context["notify"] = notify.notifications_view(
                 get_config(force_reload=True).get("notifications")
@@ -3249,41 +3312,55 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        settings = get_app_settings(force_reload=True)
+        current = await run_auth_read(principal, request)
+        if not current or current.get("role") != "admin":
+            return PlainTextResponse("Forbidden", status_code=403)
         if str(form.get("new_password", "")):
-            if not confirm_password(request, principal(request)["username"], str(form.get("current_password", ""))):
+            if not await confirm_password(request, current["username"], str(form.get("current_password", ""))):
                 flash(request, "当前密码不正确或尝试次数过多，设置未保存。", "error")
                 return redirect("/settings#system")
-        settings["compose_root"] = str(form.get("compose_root", settings.get("compose_root", ""))).strip()
-        try:
-            settings["ops_log_file"] = str(resolve_log_file(str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()))
-        except ValueError as exc:
-            flash(request, str(exc), "error")
-            return redirect("/settings#system")
-        settings["proxy_refresh_script"] = str(form.get("proxy_refresh_script", settings.get("proxy_refresh_script", ""))).strip()
-        settings["login_desktop_api_url"] = str(
-            form.get("login_desktop_api_url", settings.get("login_desktop_api_url", "http://127.0.0.1:18090"))
-        ).strip()
-        network_mode = str(form.get("douyin_network_mode", settings.get("douyin_network_mode", "direct"))).strip().lower()
-        settings["douyin_network_mode"] = network_mode if network_mode in {"direct", "mihomo"} else "direct"
-        settings["douyin_proxy_url"] = str(form.get("douyin_proxy_url", settings.get("douyin_proxy_url", "http://proxy:7890"))).strip()
-        settings["ui_port"] = int(form.get("ui_port", settings.get("ui_port", 8787)))
-        save_app_settings(settings)
 
-        new_password = str(form.get("new_password", ""))
-        confirm_password = str(form.get("confirm_password", ""))
-        if new_password:
-            if new_password != confirm_password:
-                flash(request, "Admin password was not updated because the confirmation did not match.", "error")
-                return redirect("/settings#system")
-            problem = password_problem(new_password, settings.get("admin_username", "admin"))
-            if problem:
-                flash(request, f"管理员密码未修改：{problem}", "error")
-                return redirect("/settings#system")
-            update_admin_password(new_password)
+        def save_settings():
+            from filelock import FileLock
+            from utils.config import app_settings_path
+            with FileLock(f"{app_settings_path()}.admin-change.lock", timeout=30):
+                live = principal(request)
+                if not live or live.get("role") != "admin" or any(live.get(key) != current.get(key) for key in ("username", "session_id")):
+                    return PlainTextResponse("登录状态已变化，请重新登录。", status_code=403)
+                settings = get_app_settings(force_reload=True)
+                settings["compose_root"] = str(form.get("compose_root", settings.get("compose_root", ""))).strip()
+                try:
+                    settings["ops_log_file"] = str(resolve_log_file(str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()))
+                except ValueError as exc:
+                    flash(request, str(exc), "error")
+                    return redirect("/settings#system")
+                settings["proxy_refresh_script"] = str(form.get("proxy_refresh_script", settings.get("proxy_refresh_script", ""))).strip()
+                settings["login_desktop_api_url"] = str(
+                    form.get("login_desktop_api_url", settings.get("login_desktop_api_url", "http://127.0.0.1:18090"))
+                ).strip()
+                network_mode = str(form.get("douyin_network_mode", settings.get("douyin_network_mode", "direct"))).strip().lower()
+                settings["douyin_network_mode"] = network_mode if network_mode in {"direct", "mihomo"} else "direct"
+                settings["douyin_proxy_url"] = str(form.get("douyin_proxy_url", settings.get("douyin_proxy_url", "http://proxy:7890"))).strip()
+                settings["ui_port"] = int(form.get("ui_port", settings.get("ui_port", 8787)))
+                new_password = str(form.get("new_password", ""))
+                confirm_new_password = str(form.get("confirm_password", ""))
+                if new_password:
+                    if new_password != confirm_new_password:
+                        flash(request, "Admin password was not updated because the confirmation did not match.", "error")
+                        return redirect("/settings#system")
+                    problem = password_problem(new_password, settings.get("admin_username", "admin"))
+                    if problem:
+                        flash(request, f"管理员密码未修改：{problem}", "error")
+                        return redirect("/settings#system")
+                save_app_settings(settings)
+                if new_password:
+                    update_admin_password(new_password)
 
-        flash(request, "Panel settings saved.", "success")
-        return redirect("/settings#system")
+                flash(request, "Panel settings saved.", "success")
+                return redirect("/settings#system")
+
+        async with credential_slot(app):
+            return await run_credential_work(save_settings)
 
     @app.post("/settings/notifications")
     async def save_notifications(request: Request):
@@ -3500,6 +3577,8 @@ def create_app():
 
     login_transition_lock = asyncio.Lock()
     login_save_lock = asyncio.Lock()
+    binding_operations = BindingOperations()
+    app.state.binding_operations = binding_operations
     cookie_verification_lock = asyncio.Lock()
 
     def _workspace_payload(request):
@@ -3716,6 +3795,23 @@ def create_app():
             if not accepted:
                 await websocket.close(code=1011)
 
+    def qr_workspace_snapshot(request, submitted):
+        current = principal(request)
+        active = get_login_lock()
+        if not current or not owns_login_lock(active, username=current["username"], session_id=current.get("session_id", "")):
+            return None
+        ticket = str((active or {}).get("ticket") or "")
+        if not submitted.isascii() or len(submitted) > 128 or (shared and not submitted) or (submitted and not secrets.compare_digest(submitted, ticket)):
+            return None
+        return current, ticket
+
+    def qr_workspace_current(request, current, ticket):
+        snapshot = qr_workspace_snapshot(request, ticket)
+        return bool(snapshot and snapshot[1] == ticket and all(snapshot[0].get(key) == current.get(key) for key in ("username", "role", "session_id")))
+
+    def qr_workspace_lost():
+        return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请", "state": "workspace_released"}, status_code=423, headers={"Cache-Control": "no-store"})
+
     @app.get("/login-desktop/qr")
     async def login_desktop_qr(request: Request):
         maybe_redirect = require_user(request)
@@ -3724,6 +3820,10 @@ def create_app():
         lock_error = login_lock_required(request)
         if lock_error:
             return lock_error
+        snapshot = qr_workspace_snapshot(request, request.headers.get("X-SparkFlow-Workspace", ""))
+        if snapshot is None:
+            return qr_workspace_lost()
+        current, ticket = snapshot
         # The login service holds the request until a QR code shows up (bounded),
         # so the page does not have to poll in a tight loop.
         url = f"{login_desktop_api_url()}/qr?wait={LOGIN_QR_WAIT_SECONDS}"
@@ -3731,7 +3831,7 @@ def create_app():
             upstream_request = urllib.request.Request(
                 url,
                 method="GET",
-                headers=login_desktop_api_headers(),
+                headers={**login_desktop_api_headers(), "X-SparkFlow-Workspace": ticket},
             )
             def read_qr_response():
                 upstream = urllib.request.urlopen(upstream_request, timeout=20)
@@ -3747,6 +3847,8 @@ def create_app():
                     if close:
                         close()
             upstream_status, upstream_headers, content = await asyncio.to_thread(read_qr_response)
+            if not qr_workspace_current(request, current, ticket):
+                return qr_workspace_lost()
             upstream_content_type = _header_value(upstream_headers, "Content-Type")
             if upstream_status == 202 or "application/json" in upstream_content_type:
                 # JSON bodies carry a machine-readable QR state (not-generated,
@@ -3765,6 +3867,8 @@ def create_app():
                 return _qr_state_response(content, state="retrying", status_code=upstream_status)
             return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store, max-age=0"})
         except urllib.error.HTTPError as exc:
+            if not qr_workspace_current(request, current, ticket) or exc.code == 423:
+                return qr_workspace_lost()
             if exc.code in {202, 409, 503}:
                 return _qr_state_response(
                     _safe_json_bytes(exc),
@@ -3784,6 +3888,8 @@ def create_app():
                 headers={"Cache-Control": "no-store"},
             )
         except (urllib.error.URLError, TimeoutError) as exc:
+            if not qr_workspace_current(request, current, ticket):
+                return qr_workspace_lost()
             reason = getattr(exc, "reason", exc)
             if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
                 # login-desktop is reachable but its single page lock is held
@@ -3865,20 +3971,24 @@ def create_app():
         form = await request.form()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
-        heartbeat_login(
-            username=principal(request)["username"],
-            session_id=principal(request).get("session_id", ""),
-            ticket=str(form.get("ticket", "")),
-        )
+        snapshot = qr_workspace_snapshot(request, str(form.get("ticket", "")))
+        if snapshot is None:
+            return qr_workspace_lost()
+        current, ticket = snapshot
+        renewed = heartbeat_login(username=current["username"], session_id=current.get("session_id", ""), ticket=ticket)
+        if not renewed:
+            return qr_workspace_lost()
         try:
             status, payload = await asyncio.to_thread(
                 call_login_desktop_json,
                 "/refresh-qr",
                 method="POST",
-                payload={},
+                payload={"interaction_key": ticket},
                 timeout=90,
             )
         except RuntimeError as exc:
+            if not qr_workspace_current(request, current, ticket):
+                return qr_workspace_lost()
             return JSONResponse(
                 {
                     "ok": False,
@@ -3891,6 +4001,8 @@ def create_app():
                 status_code=503,
                 headers={"Retry-After": "3", "Cache-Control": "no-store"},
             )
+        if not qr_workspace_current(request, current, ticket) or status == 423:
+            return qr_workspace_lost()
         if status >= 400 or not payload.get("ok", False):
             # 202-qr_not_ready and any ok:false payload are real failures; the UI
             # must not report a successful refresh when no QR code was produced.
@@ -4053,7 +4165,7 @@ def create_app():
 
     @app.post("/login-desktop/release")
     async def login_desktop_release(request: Request):
-        """Owner-only, non-forcing release used when the page goes away.
+        """Cancel this page's exact active lease or queued request.
 
         Unlike /close this must never force-reset the shared workspace: an admin
         tab closing is not an admin asking to reset everyone's session.
@@ -4065,24 +4177,22 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
         current = principal(request)
-        active = get_login_lock()
-        if not owns_login_lock(
-            active,
-            username=current.get("username", ""),
-            session_id=current.get("session_id", ""),
-        ):
-            return JSONResponse({"ok": True, "released": False})
+        if not current:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
         ticket = str(form.get("ticket", "")).strip()
-        if ticket and str(active.get("ticket", "")) != ticket:
+        if not ticket or not ticket.isascii() or len(ticket) > 128:
             return JSONResponse({"ok": True, "released": False})
-        begin_login_release(
+        # Matching and removal happen together under the workspace mutex. A
+        # queued request can be promoted while its page-leave beacon is in
+        # flight, and an older ticket must never cancel its replacement.
+        kind, _ = cancel_login_request(
             username=current["username"],
             session_id=current.get("session_id", ""),
-            ticket=active.get("ticket", ""),
-            account_ref=active.get("account_ref", ""),
+            ticket=ticket,
         )
-        await _reset_and_promote()
-        return JSONResponse({"ok": True, "released": True})
+        if kind == "active":
+            await _reset_and_promote()
+        return JSONResponse({"ok": True, "released": kind in {"active", "queued"}, "cancelled": kind == "queued"})
 
     @app.post("/login-desktop/reset")
     async def login_desktop_reset(request: Request):
@@ -4350,6 +4460,38 @@ def create_app():
             }
         )
 
+    async def checked_binding_operation(request, current, operation, *, status_code=200):
+        payload = operation.payload()
+        result = payload.get("result") or {}
+        account = result.get("account") or {}
+        candidates = list(result.get("duplicate_candidates") or [])
+        if result.get("duplicate_candidate"):
+            candidates.append(result["duplicate_candidate"])
+        confirmation = result.get("identity_confirmation") or {}
+        references = [row for row in [account, *candidates, confirmation] if row.get("account_ref")]
+        accounts = await asyncio.to_thread(get_userData, force_reload=True) if references else []
+        live = await run_auth_read(principal, request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return JSONResponse({"ok": False, "error": "登录状态已变化，请重新登录。"}, status_code=401)
+        for row in references:
+            saved = account_by_ref(accounts, row["account_ref"])
+            permitted = may_claim_account(live, saved) if row is confirmation and saved else can_access_account(live, saved) if saved else False
+            if not permitted:
+                return JSONResponse({"ok": False, "error": "账号权限或归属已变化，请到账号页核对。"}, status_code=403)
+            if row is account and str(saved.get("login_generation") or "") != str(account.get("login_generation") or ""):
+                return JSONResponse({"ok": False, "error": "这个账号的登录已更新，请到账号页查看最新结果。", "binding_pending": True}, status_code=409)
+        return JSONResponse(payload, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @app.get("/login-desktop/save/status")
+    async def login_save_status(request: Request):
+        current = await run_auth_read(principal, request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "请重新登录。"}, status_code=401)
+        operation = binding_operations.find(current, str(request.query_params.get("operation_id", "")))
+        if operation is None:
+            return JSONResponse({"ok": False, "error": "找不到这次保存记录；请先核对账号，再决定是否重试。", "binding_pending": True}, status_code=404)
+        return await checked_binding_operation(request, current, operation)
+
     @app.post("/login-desktop/save")
     async def login_desktop_save(request: Request):
         maybe_redirect = require_user(request)
@@ -4360,6 +4502,23 @@ def create_app():
             return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
 
         current = principal(request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "登录状态已变化，请重新登录。", "binding_pending": False}, status_code=401)
+        asynchronous = str(form.get("async_save", "")) == "1"
+        operation_id = str(form.get("request_id", ""))
+        if asynchronous:
+            if not ID_PATTERN.fullmatch(operation_id):
+                return JSONResponse({"ok": False, "error": "保存请求已失效，请重新打开页面。", "binding_pending": False}, status_code=400)
+            existing_operation = binding_operations.find(current, operation_id)
+            if existing_operation:
+                if str(form.get("ticket", "")) != existing_operation.ticket:
+                    return JSONResponse({"ok": False, "error": "保存请求与工作区不一致。"}, status_code=409)
+                return await checked_binding_operation(request, current, existing_operation, status_code=202)
+            running = binding_operations.running(current)
+            if running:
+                return JSONResponse({"ok": False, "error": "上一笔保存仍在处理，请先检查它的结果。", "operation_id": running.operation_id,
+                                     "status_url": "/login-desktop/save/status?operation_id=" + running.operation_id,
+                                     "binding_pending": True}, status_code=409)
         active = get_login_lock()
         if not owns_login_lock(active, username=current["username"], session_id=current.get("session_id", "")):
             return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请"}, status_code=423)
@@ -4369,10 +4528,19 @@ def create_app():
             return JSONResponse({"ok": False, "error": "登录工作区已更新，请重新申请后再保存"}, status_code=423)
         if login_save_lock.locked():
             return JSONResponse({"ok": False, "error": "正在处理上一次保存，请稍候", "category": "login_save_in_progress", "retryable": True}, status_code=409)
+        if asynchronous:
+            async def save_operation(operation):
+                async with login_save_lock:
+                    return await _save_owned_login(request, form, current, active, ticket, receipt=operation)
+            try:
+                operation = binding_operations.start(current, operation_id, ticket, save_operation)
+            except RuntimeError:
+                return JSONResponse({"ok": False, "error": "保存请求较多，请稍后重试。", "binding_pending": False}, status_code=503, headers={"Retry-After": "3"})
+            return binding_operations.response(operation)
         async with login_save_lock:
             return await _save_owned_login(request, form, current, active, ticket)
 
-    async def _save_owned_login(request, form, current, active, ticket):
+    async def _save_owned_login(request, form, current, active, ticket, *, receipt=None):
         class WorkspaceChanged(RuntimeError):
             pass
 
@@ -4605,6 +4773,8 @@ def create_app():
             if current.get("role") == "user":
                 claim = lambda account: update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
             try:
+                if receipt is not None:
+                    receipt.begin_write()
                 account, action = await asyncio.to_thread(
                     commit_login_binding,
                     persist_workspace_login,
@@ -4613,12 +4783,15 @@ def create_app():
                     owner_username=current.get("username", ""),
                 )
             except BindingCommitError as exc:
+                logger.error("Workspace binding commit failed; uncertain=%s cause=%s", exc.uncertain, type(exc.__cause__).__name__, exc_info=True)
                 return JSONResponse({"ok": False, "error": str(exc), "binding_pending": exc.uncertain}, status_code=503)
             except LoginSavePermissionDenied as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
             except IDENTITY_SAVE_ERRORS as exc:
                 # Nothing was written and the workspace is kept for a retry.
                 return _identity_error_response(exc, current, "login-desktop", display_id=display_id)
+            if receipt is not None:
+                receipt.record_saved(account, action)
             normalized_saved = normalize_unique_id(account.get("unique_id"))
             friend_refresh_state = "queued" if verified is None else "skipped"
             # Without this trail a wrong match is invisible: a duplicate account

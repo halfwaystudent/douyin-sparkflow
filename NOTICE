@@ -14,3 +14,5 @@ The authentication pages inline a small SVG subset from the vendored Lucide
 icons. The original Lucide/Feather notices are retained in
 DouYinSparkFlow/webui/templates/_auth-icon-license.html and
 DouYinSparkFlow/webui/static/lucide-LICENSE.txt.
+The page-specific icons.js subset is generated from the same vendored library;
+its original ISC and Feather MIT licenses remain in lucide-LICENSE.txt.

@@ -104,8 +104,8 @@
     </div>
 
     {% if bootstrapped and passkeys_enabled %}
-    <script defer src="/static/passkeys.js?v=20261102-1"></script>
+    <script defer src="{{ asset_url('passkeys.js') }}"></script>
     {% endif %}
-    <script defer src="/static/auth-forms.js?v=20261102-5"></script>
+    <script defer src="{{ asset_url('auth-forms.js') }}"></script>
   </body>
 </html>

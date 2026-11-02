@@ -15,6 +15,7 @@ from filelock import FileLock
 from utils.config import (
     _save_json_file,
     get_app_settings,
+    read_app_settings,
     get_userData,
     normalize_unique_id,
     save_userData,
@@ -78,7 +79,7 @@ def _load_raw() -> dict:
         if encryption_required():
             raise StorageError("Protected user storage is empty.")
         return {"users": [], "auth_epoch": 0}
-    data = read_json(USERS_FILE)
+    data = read_json(USERS_FILE, text=text)
     if not isinstance(data, dict) or not isinstance(data.get("users", []), list):
         raise UserStoreError("webui_users.json must contain a users list")
     data["auth_epoch"] = _coerce_session_version(data.get("auth_epoch"))
@@ -117,10 +118,12 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
     normalized = []
     seen = set()
     assigned = set()
+    settings = read_app_settings()
+    reserved = {"admin", normalize_username(settings.get("admin_username") or "admin")}
     for raw in users:
         username = str(raw.get("username", "")).strip()
         key = normalize_username(username)
-        if not username or _reserved_username(username) or key in seen:
+        if not username or key in reserved or key in seen:
             raise UserStoreError("invalid or duplicate Web user")
         if not USERNAME_RE.fullmatch(username):
             raise UserStoreError("Web username may contain only letters, digits, _, ., and -")
@@ -182,7 +185,7 @@ def find_web_user(username: str) -> dict | None:
 
 
 def authenticate(username: str, password: str) -> dict | None:
-    settings = get_app_settings(force_reload=True)
+    settings = read_app_settings()
     admin_username = str(settings.get("admin_username", "admin")).strip() or "admin"
     if normalize_username(username) == normalize_username(admin_username):
         if verify_password(password, settings.get("admin_password_hash", "")):

@@ -1,7 +1,18 @@
 """Derive setup progress from the current account and personal preferences."""
 
-from core.identity import account_uid, identity_state
+import hashlib
+import json
+
+from core.identity import account_login_generation, account_uid, identity_state
 from core.streak_state import LOGIN_FAILURE_CATEGORIES
+
+
+def setup_binding_revision(account):
+    """Identify the binding shown by a wizard tab without including credentials."""
+    if not account:
+        return ""
+    value = [str(account.get("account_ref") or ""), account_login_generation(account), account_uid(account), identity_state(account)]
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def setup_state(accounts, preferences, selected_ref=""):
@@ -23,8 +34,14 @@ def setup_state(accounts, preferences, selected_ref=""):
     bound = bool(account and account_uid(account) and account.get("cookies"))
     ready = bound and not conflict and not login_failed
     pending = bool(ready and (verification in {"verifying", "unverified"} or account.get("pending_login_verification")))
-    has_targets = bool(ready and (account.get("targets") or account.get("group_targets")))
-    has_messages = bool(preferences.get("messages"))
+    targets = {
+        value.strip() for field in ("targets", "group_targets")
+        for value in ((account or {}).get(field) or [])
+        if isinstance(value, str) and value.strip()
+    }
+    messages = [value for value in (preferences.get("messages") or []) if isinstance(value, str) and value.strip()]
+    has_targets = bool(ready and targets)
+    has_messages = bool(messages)
     can_finish = bool(ready and has_targets and has_messages)
     if not account:
         reason = "之前选择的账号已移除或权限已变化，请重新选择自己的账号。" if selection_missing else "先添加自己的抖音账号。"
@@ -46,6 +63,8 @@ def setup_state(accounts, preferences, selected_ref=""):
         "login_pending": pending, "login_verification_state": verification,
         "login_reason": str(check.get("reason") or ""), "setup_blocked_reason": reason,
         "automatic_enabled": bool(preferences.get("enabled")),
+        "target_count": len(targets), "message_count": len(messages),
+        "setup_binding_revision": setup_binding_revision(account),
         "suggested_step": 1 if not ready else (2 if not has_targets else (3 if not has_messages else 4)),
     }
 

@@ -549,6 +549,21 @@
   const qrStatus = document.querySelector("[data-login-qr-status]");
   let timer = null;
   let heartbeatTimer = null;
+  let pageActive = true, lifecycleVersion = 0, resumeChecking = false;
+  let statusController = null, statusAgain = false, statusFailures = 0;
+  let qrController = null, qrRequestPending = false, qrManualPending = false, qrVersion = 0;
+  let lastHeartbeatAt = 0, browserLoginLabel = "";
+  const transientRequests = new Set();
+  const canUseWorkspace = () => pageActive && !resumeChecking && !bindingBusy && !bindingNeedsReview && document.visibilityState === "visible";
+  const publishWorkspace = () => {
+    root.dataset.workspaceTicket = workspace.ticket || "";
+    root.dataset.workspaceActive = workspace.state === "active" && workspace.active && canUseWorkspace() ? "1" : "0";
+  };
+  const cancelQr = () => {
+    qrVersion += 1;
+    window.clearTimeout(qrRefreshTimer);
+    qrController?.abort();
+  };
   let countdownTimer = null;
   // Until this time the routine lines (lease countdown, status poll) leave the
   // status text alone, so "saving..." or a save error stays readable.
@@ -569,9 +584,15 @@
   const workspaceRequest = () => requestedRelogin ? { mode: "relogin", relogin_unique_id: requestedRelogin } : { mode: "add" };
   const bindingResult = document.querySelector("[data-binding-result]");
   let bindingResultVersion = 0;
+  let saveOperation = null, saveReadVersion = 0;
+  const saveCheckButton = bindingResult?.querySelector("[data-recheck-login-save]");
+  const saveCheckStatus = bindingResult?.querySelector("[data-save-check-status]");
   const setBindingBusy = (busy, { uncertain = false } = {}) => {
     bindingBusy = busy;
     bindingNeedsReview = bindingNeedsReview || uncertain;
+    publishWorkspace();
+    if (busy || uncertain) cancelQr();
+    if (!busy && !bindingNeedsReview) scheduleHiddenRelease();
     document.querySelectorAll(".login-desktop-open, .login-desktop-save, [data-cookie-login-submit], [data-refresh-login-qr], .login-desktop-close, .login-desktop-reset").forEach((button) => {
       button.disabled = bindingBusy || bindingNeedsReview;
     });
@@ -582,12 +603,17 @@
     bindingResult.querySelector("[data-binding-result-title]").textContent = uncertain ? "保存结果待核对" : pending ? "账号已保存，登录待确认" : "账号已保存";
     bindingResult.querySelector("[data-binding-result-message]").textContent = message;
     const next = bindingResult.querySelector("[data-binding-next]");
+    next.hidden = false;
+    if (saveCheckButton) { saveCheckButton.hidden = !(uncertain && saveOperation); saveCheckButton.disabled = false; }
+    if (saveCheckStatus) saveCheckStatus.hidden = true;
+    const preferences = bindingResult.querySelector("[data-binding-preferences]");
+    if (preferences) preferences.hidden = uncertain;
     const ref = account?.account_ref || "";
     const id = account?.unique_id || "";
     next.href = !uncertain && ref && root.dataset.setupInProgress === "1"
       ? `/setup?account=${encodeURIComponent(ref)}`
       : id ? `/accounts?_anchor=account-${encodeURIComponent(id)}` : "/accounts";
-    next.textContent = uncertain ? "先核对账号，再决定是否重试" : root.dataset.setupInProgress === "1" ? "继续设置" : "选择好友和群";
+    next.textContent = uncertain ? "查看账号列表" : root.dataset.setupInProgress === "1" ? "继续设置" : "选择好友和群";
     bindingResult.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
   const followBindingVerification = async (account) => {
@@ -641,6 +667,7 @@
   }
 
   const setStatus = (text, tone = "") => {
+    if (!pageActive) return;
     if (statusText) statusText.textContent = text;
     if (runtimeState) {
       runtimeState.className = `pill${tone ? ` ${tone}` : ""}`;
@@ -665,12 +692,14 @@
     formData.set("csrf_token", csrfToken);
     Object.entries(payload).forEach(([key, value]) => formData.set(key, String(value ?? "")));
     const controller = new AbortController();
+    const version = lifecycleVersion;
     const binding = url === "/login-desktop/save" || url === "/accounts/cookies";
-    const timeout = url === "/accounts/cookies" ? 210000 : url === "/login-desktop/save" ? 120000 : url.endsWith("/open") ? 100000 : 20000;
+    if (!binding) transientRequests.add(controller);
+    const timeout = url === "/accounts/cookies" ? 210000 : url === "/login-desktop/save" ? (payload.async_save ? 12000 : 120000) : url.endsWith("/open") ? 100000 : 20000;
     const deadline = window.setTimeout(() => controller.abort(), timeout);
     let response, data;
     try {
-      response = await fetch(url, { method: "POST", body: formData, credentials: "same-origin", signal: controller.signal });
+      response = await fetch(url, { method: "POST", body: formData, credentials: "same-origin", cache: "no-store", signal: controller.signal });
       data = await response.json().catch((error) => {
         if (error.name === "AbortError") throw error;
         if (binding) throw error;
@@ -683,7 +712,8 @@
         throw uncertain;
       }
       throw error;
-    } finally { window.clearTimeout(deadline); }
+    } finally { window.clearTimeout(deadline); transientRequests.delete(controller); }
+    if (!binding && (!pageActive || version !== lifecycleVersion)) throw new DOMException("页面已离开", "AbortError");
     if (!response.ok || data.ok === false) {
       const error = new Error(data.error || `请求失败：${response.status}`);
       // Keep the server's grading (category / categoryLabel / retryable) so
@@ -735,6 +765,7 @@
   };
 
   const closeFrame = () => {
+    cancelQr();
     if (nativePanel) nativePanel.hidden = true;
     if (frameWrap) {
       frameWrap.classList.remove("native-login-mode");
@@ -753,12 +784,25 @@
   };
 
   const renderWorkspace = (next) => {
+    if (!pageActive) return;
     const previousState = workspace.state;
     const previousTicket = workspace.ticket;
     workspace = next || { state: "closed", active: false, position: 0, ticket: "" };
     if (workspace.state !== previousState || workspace.ticket !== previousTicket) workspaceVersion += 1;
-    root.dataset.workspaceTicket = workspace.ticket || "";
-    root.dataset.workspaceActive = workspace.state === "active" && workspace.active ? "1" : "0";
+    publishWorkspace();
+    if (workspace.state !== previousState || workspace.ticket !== previousTicket) {
+      cancelQr();
+      browserLoginLabel = "";
+      scheduleStatus(workspace.state === "queued" || workspace.state === "resetting" ? 4000 : workspace.state === "active" ? 20000 : 30000);
+    }
+    const progress = root.querySelector("[data-login-progress]");
+    if (progress) progress.textContent = workspace.state === "queued" ? "第 1 步：排队等待，轮到你后自动显示二维码。"
+      : workspace.state === "active" && workspace.active ? "第 2 步：扫码，按提示完成验证码或密码验证。"
+      : "第 1 步：申请登录工作区。";
+    document.querySelectorAll("[data-login-step]").forEach((item) => {
+      if (Number(item.dataset.loginStep) === (workspace.state === "active" && workspace.active ? 2 : 1)) item.setAttribute("aria-current", "step");
+      else item.removeAttribute("aria-current");
+    });
     if (workspace.state === "queued") {
       setStatus(`登录工作区排队中，前面还有 ${Math.max(0, Number(workspace.position || 1) - 1)} 人。`, "warning");
       if (qrStatus) qrStatus.textContent = "排队成功，轮到你后会自动打开登录二维码。";
@@ -782,10 +826,10 @@
         // A new workspace starts a fresh QR wait, whichever path granted it
         // (user click or automatic recovery).
         if (section && !section.open) section.open = true;
-        loadFrame(true);
+        if (canUseWorkspace()) loadFrame(true);
         qrPollStartedAt = Date.now();
         setQrButtons("读取中…", { busy: true });
-        refreshLoginQr(500);
+        if (canUseWorkspace()) refreshLoginQr(100);
       }
       if (displayMode === "native") {
         if (nativePanel) nativePanel.hidden = false;
@@ -862,7 +906,7 @@
     openingTimer = null;
     openingStartedAt = 0;
     document.querySelectorAll(".login-desktop-open").forEach((button) => {
-      button.disabled = false;
+      button.disabled = bindingBusy || bindingNeedsReview;
     });
     if (qrPlaceholder) qrPlaceholder.textContent = qrPlaceholderText;
     if (frameWrap) delete frameWrap.dataset.progress;
@@ -883,11 +927,19 @@
   };
 
   const refreshLoginQr = async (delay = 0, retries = 40) => {
-    if (!qrImage || workspace.state !== "active" || !workspace.active) return;
+    if (!qrImage || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview) return;
     window.clearTimeout(qrRefreshTimer);
+    const heldTicket = workspace.ticket, heldVersion = qrVersion;
+    const current = () => canUseWorkspace() && heldTicket === workspace.ticket && heldVersion === qrVersion;
     qrRefreshTimer = window.setTimeout(async () => {
+      if (!current() || qrRequestPending || qrManualPending) return;
+      qrRequestPending = true;
+      const controller = new AbortController();
+      qrController = controller;
+      const deadline = window.setTimeout(() => controller.abort(), 25000);
       if (qrStatus) qrStatus.textContent = `正在读取登录二维码…${qrWaitLabel()}`;
       const retryLater = (message, delayMs = 3000) => {
+        if (!current()) return;
         if (retries > 1 && workspace.state === "active") {
           if (qrStatus) qrStatus.textContent = `${message} 继续等待…${qrWaitLabel()}`;
           refreshLoginQr(delayMs, retries - 1);
@@ -897,7 +949,8 @@
         }
       };
       try {
-        const response = await fetch(`/login-desktop/qr?t=${Date.now()}`, { credentials: "same-origin", cache: "no-store" });
+        const response = await fetch(`/login-desktop/qr?t=${Date.now()}`, { credentials: "same-origin", cache: "no-store", headers: { "X-SparkFlow-Workspace": heldTicket }, signal: controller.signal });
+        if (!current()) return;
         if (response.status === 423) {
           recoverLease();
           return;
@@ -975,6 +1028,7 @@
             return;
           }
         }
+        if (!current()) return;
         const previous = qrImage.dataset.objectUrl || "";
         const objectUrl = URL.createObjectURL(blob);
         qrImage.src = objectUrl;
@@ -983,23 +1037,37 @@
         if (previous) URL.revokeObjectURL(previous);
         if (qrStatus) qrStatus.textContent = `二维码已加载。如果过期，点击刷新。${qrWaitLabel()}`;
         setQrButtons("刷新二维码");
-      } catch {
-        retryLater("登录页正在加载");
+      } catch (error) {
+        if (current()) retryLater(error.name === "AbortError" ? "二维码读取超时" : "登录页正在加载");
+      } finally {
+        window.clearTimeout(deadline);
+        qrRequestPending = false;
+        if (qrController === controller) qrController = null;
+        if (heldVersion !== qrVersion && canUseWorkspace() && workspace.active && qrImage.hidden && !qrManualPending && !bindingNeedsReview) refreshLoginQr(100);
       }
     }, delay);
   };
 
+  const scheduleStatus = (delay) => {
+    window.clearTimeout(timer);
+    timer = pageActive && document.visibilityState === "visible" ? window.setTimeout(pollStatus, delay) : null;
+  };
   let statusPolling = false;
   const pollStatus = async () => {
-    if (document.visibilityState !== "visible" || statusPolling) return;
+    if (!pageActive || document.visibilityState !== "visible" || bindingBusy) { scheduleStatus(5000); return; }
+    if (statusPolling) { statusAgain = statusAgain || resumeChecking; return; }
+    window.clearTimeout(timer);
     statusPolling = true;
     const controller = new AbortController();
+    statusController = controller;
+    const version = lifecycleVersion;
+    const ownershipOnly = resumeChecking;
     const deadline = window.setTimeout(() => controller.abort(), 10000);
     const heldTicket = workspace.ticket;
     try {
-      const statusUrl = workspace.state === "active" ? "/login-desktop/status" : "/login-desktop/workspace-status";
+      const statusUrl = workspace.state === "active" && !ownershipOnly ? "/login-desktop/status" : "/login-desktop/workspace-status";
       const response = await fetch(statusUrl, { credentials: "same-origin", cache: "no-store", signal: controller.signal });
-      if (heldTicket !== workspace.ticket) return;
+      if (heldTicket !== workspace.ticket || version !== lifecycleVersion || !pageActive || document.visibilityState !== "visible") return;
       if (response.status === 423) {
         // The lease is not held by this session any more. Showing "check the
         // login-desktop service" here pointed operators at a container that was
@@ -1021,7 +1089,7 @@
         return;
       }
       const data = await response.json();
-      if (heldTicket !== workspace.ticket) return;
+      if (heldTicket !== workspace.ticket || version !== lifecycleVersion || !pageActive || document.visibilityState !== "visible") return;
       if (!response.ok || data.ok === false) {
         setStatus(data.error || "登录工作区暂时不可用，请稍后重试。", "danger");
         return;
@@ -1029,13 +1097,24 @@
       if (data.workspace && data.workspace.state === "active" && data.workspace.active) {
         setRecoverVisible(false);
       }
+      statusFailures = 0;
+      resumeChecking = false;
       renderWorkspace(data.workspace);
       if (workspace.state === "active" && workspace.active) {
+        if (Object.prototype.hasOwnProperty.call(data, "logged_in") && !data.logged_in) browserLoginLabel = "";
         loadFrame();
+        if (qrImage?.hidden && !qrRequestPending && !bindingNeedsReview) refreshLoginQr(100);
         if (statusHeld()) {
           // An in-progress save or its error owns the status line.
         } else if (data.logged_in) {
-          setStatus(`当前浏览器已登录：${data.username}，请保存登录态。`, "success");
+          browserLoginLabel = data.username || "当前账号";
+          const progress = root.querySelector("[data-login-progress]");
+          if (progress) progress.textContent = "第 3 步：浏览器已登录，保存后还会核对账号身份。";
+          document.querySelectorAll("[data-login-step]").forEach((item) => {
+            if (item.dataset.loginStep === "3") item.setAttribute("aria-current", "step");
+            else item.removeAttribute("aria-current");
+          });
+          setStatus(`当前浏览器已登录：${browserLoginLabel}，请保存登录态。`, "success");
         } else if (data.login_state === "unknown") {
           // The page was mid-operation, so "not logged in" would be a guess.
           setStatus("正在检查登录状态…（页面正忙，请稍候再保存）", "warning");
@@ -1044,16 +1123,32 @@
         closeFrame();
       }
     } catch (error) {
-      if (heldTicket === workspace.ticket) setStatus(error.name === "AbortError" ? "状态检查响应较慢，将自动重试。" : `状态检查失败：${error.message}`, "warning");
-    } finally { window.clearTimeout(deadline); statusPolling = false; }
+      if (version === lifecycleVersion && pageActive && document.visibilityState === "visible") {
+        statusFailures += 1;
+        setStatus(error.name === "AbortError" ? "状态检查响应较慢，将自动重试。" : `状态检查失败：${error.message}`, "warning");
+        if (resumeChecking) setRecoverVisible(true);
+      }
+    } finally {
+      window.clearTimeout(deadline);
+      if (statusController === controller) statusController = null;
+      statusPolling = false;
+      const delay = statusAgain || (ownershipOnly && !resumeChecking) ? 100
+        : statusFailures ? Math.min(60000, 5000 * 2 ** Math.min(statusFailures - 1, 4))
+        : workspace.state === "queued" || workspace.state === "resetting" ? 4000
+        : workspace.state === "active" ? 20000 : 30000;
+      statusAgain = false;
+      scheduleStatus(delay);
+    }
   };
 
   let heartbeatPending = false;
   const heartbeat = async () => {
-    if (heartbeatPending || workspace.state !== "active" || !workspace.active || !workspace.ticket) return;
+    if (!pageActive || resumeChecking || heartbeatPending || workspace.state !== "active" || !workspace.active || !workspace.ticket) return;
+    if (Date.now() - lastHeartbeatAt < 25000) return;
     const heldTicket = workspace.ticket;
     const version = workspaceVersion;
     heartbeatPending = true;
+    lastHeartbeatAt = Date.now();
     try {
       const data = await postForm("/login-desktop/heartbeat", { ticket: heldTicket });
       if (heldTicket !== workspace.ticket || version !== workspaceVersion) return;
@@ -1071,7 +1166,8 @@
 
   document.querySelectorAll(".login-desktop-open").forEach((button) => {
     button.addEventListener("click", async () => {
-      if (bindingBusy || bindingNeedsReview) return;
+      if (!pageActive || acquiringWorkspace || bindingBusy || bindingNeedsReview) return;
+      acquiringWorkspace = true;
       bindingResultVersion += 1;
       if (bindingResult) bindingResult.hidden = true;
       if (section) section.open = true;
@@ -1102,7 +1198,7 @@
       } catch (error) {
         stopOpening();
         setStatus(`申请登录工作区失败：${error.message}`, "danger");
-      }
+      } finally { acquiringWorkspace = false; }
     });
   });
 
@@ -1127,16 +1223,33 @@
   // Only the manual "刷新二维码" button calls this: the POST reloads the shared
   // login page, so it must never be triggered automatically.
   const requestQrRefresh = async () => {
+    if (qrManualPending) return;
+    if (!canUseWorkspace() || !workspace.active || !workspace.ticket) {
+      if (qrStatus) qrStatus.textContent = "请先申请自己的登录工作区，再刷新二维码。";
+      return;
+    }
+    qrManualPending = true;
+    cancelQr();
+    const heldTicket = workspace.ticket, heldVersion = qrVersion;
+    const controller = new AbortController();
+    qrController = controller;
+    const deadline = window.setTimeout(() => controller.abort(), 25000);
     qrPollStartedAt = Date.now();
     const refreshForm = new FormData();
     refreshForm.set("csrf_token", csrfToken);
     refreshForm.set("ticket", workspace.ticket);
-    const response = await fetch("/login-desktop/qr/refresh", {
-      method: "POST",
-      body: refreshForm,
-      credentials: "same-origin",
-    });
-    const data = await response.json().catch(() => ({}));
+    let response, data;
+    try {
+      response = await fetch("/login-desktop/qr/refresh", {
+        method: "POST", body: refreshForm, credentials: "same-origin", cache: "no-store", signal: controller.signal,
+      });
+      data = await response.json().catch((error) => { if (error.name === "AbortError") throw error; return {}; });
+    } finally {
+      window.clearTimeout(deadline);
+      if (qrController === controller) qrController = null;
+      qrManualPending = false;
+    }
+    if (!pageActive || !canUseWorkspace() || heldTicket !== workspace.ticket || heldVersion !== qrVersion) return;
     if (response.status === 401) {
       if (qrStatus) qrStatus.textContent = "登录状态已失效，请重新登录控制台。";
       setQrButtons("已停止，点此重试", { stopped: true });
@@ -1168,13 +1281,16 @@
     button.addEventListener("click", async () => {
       if (bindingBusy || bindingNeedsReview) return;
       button.disabled = true;
+      const heldTicket = workspace.ticket, version = lifecycleVersion;
       try {
         resetRecoveryBudget();
         await requestQrRefresh();
       } catch (error) {
-        if (qrStatus) qrStatus.textContent = `刷新二维码失败：${error.message}`;
+        if (pageActive && version === lifecycleVersion && heldTicket === workspace.ticket && qrStatus) qrStatus.textContent = error.name === "AbortError"
+          ? "刷新请求超时，页面可能仍在生成二维码。请先更新画面核对，再决定是否重新刷新。"
+          : `刷新二维码失败：${error.message}`;
       } finally {
-        button.disabled = false;
+        button.disabled = bindingBusy || bindingNeedsReview;
       }
     });
   });
@@ -1268,139 +1384,232 @@
     const startedAt = Date.now();
     const render = () => {
       const seconds = Math.round((Date.now() - startedAt) / 1000);
-      setStatus(`正在保存登录账号…已等待 ${seconds} 秒（通常几秒，请不要重复点击）`, "warning");
+      setStatus(`正在核对保存结果…已等待 ${seconds} 秒，请不要重复保存。`, "warning");
     };
     render();
     savingTimer = window.setInterval(render, 1000);
   };
-  document.querySelectorAll(".login-desktop-save").forEach((button) => {
-    button.addEventListener("click", async () => {
-      if (button.disabled || bindingBusy || bindingNeedsReview) return;
-      const saveTicket = workspace.ticket;
-      if (!saveTicket) {
-        setStatus("请先申请自己的登录工作区，完成登录后再保存。", "warning");
-        return;
+  const saveUncertain = (message) => {
+    const error = new Error(message);
+    error.bindingUncertain = true;
+    return error;
+  };
+  const saveError = (payload, status) => {
+    const error = new Error(payload.error || `保存未完成（HTTP ${status}）`);
+    error.payload = { ...payload, leaseLost: Number(status) === 423 };
+    return error;
+  };
+  const showSaveUncertain = (operation, message) => {
+    if (operation !== saveOperation || !pageActive) return;
+    setSaving(false, { keepDisabled: true });
+    setBindingBusy(false, { uncertain: true });
+    const text = message + " 账号列表里暂时没有记录，也不代表保存失败。可以点“重新检查保存结果”，只查询这次操作，不会重复保存。";
+    setStatus(message, "warning");
+    showBindingResult(null, text, { uncertain: true });
+  };
+  const showSaveProgress = (operation, detail) => {
+    if (operation !== saveOperation || !pageActive || !bindingResult) return;
+    bindingResult.hidden = false;
+    bindingResult.querySelector("[data-binding-result-title]").textContent = "正在核对保存结果";
+    bindingResult.querySelector("[data-binding-result-message]").textContent = "保存任务已发出，正在核对登录信息和账号身份。请保留本页，不必重复保存。";
+    bindingResult.querySelector("[data-binding-next]").hidden = true;
+    const preferences = bindingResult.querySelector("[data-binding-preferences]");
+    if (preferences) preferences.hidden = true;
+    if (saveCheckButton) { saveCheckButton.hidden = false; saveCheckButton.disabled = true; }
+    if (saveCheckStatus) { saveCheckStatus.hidden = false; if (saveCheckStatus.textContent !== detail) saveCheckStatus.textContent = detail; }
+  };
+  const observeSave = async (operation) => {
+    if (operation.checking) return operation.checking;
+    const version = saveReadVersion;
+    const until = Date.now() + 180000;
+    const valid = () => operation === saveOperation && pageActive && version === saveReadVersion;
+    const checkCurrent = () => {
+      if (!valid()) {
+        const error = new Error("页面已离开，返回后可以继续检查这次保存。");
+        error.saveSuspended = true;
+        throw error;
       }
-      const postSave = (extra = {}) =>
-        postForm("/login-desktop/save", {
-          ticket: saveTicket,
-          relogin_unique_id: button.dataset.reloginUniqueId || "",
-          ...extra,
-        });
-      const saveLogin = (extra = {}) =>
-        postSave(extra).catch((error) => {
-          const info = error.payload && error.payload.identity_confirmation;
-          if (!info) throw error;
-          setSaving(false);
-          if (!confirmIdentityMigration(info)) {
-            const cancelled = new Error("已取消保存：没有改动任何账号。");
-            cancelled.cancelled = true;
-            throw cancelled;
-          }
-          setSaving(true);
-          return postSave({ ...extra, confirm_identity: info.token });
-        });
-      setSaving(true);
-      try {
-        resetRecoveryBudget();
-        let data;
+      if (workspace.ticket && workspace.ticket !== operation.ticket) throw saveUncertain("工作区已切换，这次保存的结果需要单独核对。");
+    };
+    const check = async () => {
+      let failures = 0;
+      while (Date.now() < until) {
+        checkCurrent();
+        const controller = new AbortController();
+        operation.controller = controller;
+        const deadline = window.setTimeout(() => controller.abort(), Math.min(12000, until - Date.now()));
         try {
-          data = await saveLogin();
+          const response = await fetch(`/login-desktop/save/status?operation_id=${encodeURIComponent(operation.id)}`, {
+            credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          });
+          const data = await response.json();
+          checkCurrent();
+          if (response.status === 401 || response.status === 403) throw saveUncertain("平台会话或权限已变化，请重新登录平台后核对保存结果。");
+          if (response.status === 404) throw saveUncertain("暂未查到这次保存的任务记录，可能尚未接收或记录已过期。请稍后重新检查。");
+          if (response.status === 409 && data.binding_pending) throw saveUncertain(data.error || "账号登录状态已更新，请核对最新结果。");
+          if (!response.ok || data.ok === false) throw new Error(data.error || `检查响应 ${response.status}`);
+          if (data.ticket && data.ticket !== operation.ticket) throw saveUncertain("这条保存记录属于之前的工作区，请在账号页单独核对。");
+          if (data.operation_id && data.operation_id !== operation.id) throw saveUncertain("保存任务编号不一致，请重新检查这次保存。");
+          if (data.state === "done" || data.state === "failed") {
+            if (!data.result || typeof data.result !== "object" || Array.isArray(data.result)) throw saveUncertain("服务器没有返回完整的保存结果。");
+            if (data.state === "failed" || data.result.ok === false) throw saveError(data.result, data.http_status || 400);
+            return data.result;
+          }
+          if (data.state === "uncertain") throw saveUncertain(data.result?.error || data.message || "服务器暂时无法确认最终保存结果。");
+          if (data.state !== "running") throw saveUncertain("保存任务返回了未知状态，请重新检查。");
+          failures = 0;
+          showSaveProgress(operation, "服务器仍在处理，请保留当前页面。");
         } catch (error) {
-          const candidate = error.payload && error.payload.duplicate_candidate;
-          if (!candidate) throw error;
-          const candidates =
-            (error.payload && error.payload.duplicate_candidates) || [candidate];
-          if (candidates.length > 1) {
-            // Guessing here could merge the login into the wrong account, so the
-            // operator is asked to resolve the duplicates first.
-            setSaving(false);
-            setStatus(
-              `有 ${candidates.length} 个同名账号（${candidates
-                .map((item) => item.unique_id || item.account_ref)
-                .join("、")}）：请先在账号管理里确认要更新的是哪一个（删除多余的那条或先改昵称）再保存。`,
-              "danger",
-            );
-            return;
-          }
-          // "Cancel" must mean "do nothing": binding it to "create a duplicate
-          // anyway" is the opposite of what the button suggests and is how a
-          // second identical account gets created by accident.
-          setSaving(false);
-          const update = window.confirm(
-            `已有一个同名账号（${candidate.username || "未命名"}）。\n\n` +
-              "点“确定”＝更新这个已有账号，保留它的目标与发送记录；\n" +
-              "点“取消”＝放弃本次保存，不做任何改动。",
-          );
-          if (!update) {
-            // The dialog may have stayed open longer than the hold; restart it.
-            statusHeldUntil = Date.now() + 8000;
-            setStatus("已取消保存：没有改动任何账号。若确实要新建一个同名账号，请先确认它和已有账号不是同一个人。");
-            return;
-          }
-          setSaving(true);
-          data = await saveLogin({ merge_with: candidate.account_ref });
+          if (!valid() || error.saveSuspended || error.bindingUncertain || error.payload) throw error;
+          failures += 1;
+          showSaveProgress(operation, error.name === "AbortError"
+            ? "本次结果检查超时，正在继续核对；不会再次提交保存。"
+            : "暂时没有收到检查回应，正在重试查询；不会再次提交保存。");
+        } finally {
+          window.clearTimeout(deadline);
+          if (operation.controller === controller) operation.controller = null;
         }
-        setSaving(false, { keepDisabled: true });
-        renderWorkspace(data.workspace);
-        if (data.verified === false) {
-          // The cookies were stored, but the login state is not usable: show the
-          // reason instead of a success toast.
-          setStatus(
-            `已保存登录态，但验证未通过：${data.verification_error || "登录态不可用"}`,
-            "danger",
-          );
-          closeFrame();
-          showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true });
-          return;
-        }
-        // A login save starts a friend refresh; when it could not start, say why
-        // instead of leaving the operator waiting for a list that never updates.
-        // The login state is re-checked after the save, in the background.
-        const refreshNote =
-          data.verification === "pending"
-            ? "，正在后台验证登录态并刷新好友列表（账号页会显示“登录态验证中”）"
-            : data.friend_refresh === "started"
-            ? ""
-            : data.friend_refresh === "busy"
-              ? "（发送任务正在运行，好友列表稍后会自动刷新）"
-              : data.friend_refresh === "running"
-                ? "（好友列表正在刷新中）"
-                : "（好友列表未自动刷新，可手动点刷新）";
-        const identityNote = data.identityLabel ? `（${data.identityLabel}）` : "";
-        setStatus(
-          `已保存登录账号：${data.account?.username || ""}${identityNote}${refreshNote}`,
-          data.verification === "pending" || data.friend_refresh === "started" ? "success" : "warning",
-        );
-        closeFrame();
-        showBindingResult(data.account, `已保存账号 ${data.account?.username || ""}${refreshNote}。接下来选择好友或群，再设置自己的发送内容。`, { pending: data.verification === "pending" });
-        if (data.verification === "pending") followBindingVerification(data.account);
-      } catch (error) {
-        setSaving(false, { keepDisabled: Boolean(error.bindingUncertain) });
-        if (error.bindingUncertain) {
-          setBindingBusy(false, { uncertain: true });
-          setStatus(error.message, "warning");
-          showBindingResult(null, error.message, { uncertain: true });
-          return;
-        }
-        if (error.payload && error.payload.leaseLost) {
-          // The workspace moved on while the operator was finishing the scan;
-          // report the real condition instead of a generic save failure.
-          setStatus("保存时本会话已不再持有登录工作区：请重新申请工作区后再保存。", "warning");
-          recoverLease();
-          return;
-        }
-        if (error.cancelled) {
-          statusHeldUntil = Date.now() + 8000;
-          setStatus(error.message);
-          return;
-        }
-        if (error.payload && error.payload.identityState) {
-          setStatus(`登录未保存：${identityFailureText(error)}`, error.payload.retryable ? "warning" : "danger");
-          return;
-        }
-        setStatus(`保存登录账号失败：${error.message}`, "danger");
+        checkCurrent();
+        await new Promise((resolve) => {
+          operation.cancelWait = () => { window.clearTimeout(operation.waitTimer); resolve(); };
+          operation.waitTimer = window.setTimeout(resolve, Math.min(until - Date.now(), failures ? Math.min(10000, 2500 * failures) : document.visibilityState === "visible" ? 2000 : 5000));
+        });
+        operation.cancelWait = null;
       }
+      throw saveUncertain("已等待 3 分钟，尚未收到最终保存结果。后台可能仍在处理。");
+    };
+    operation.checking = check().finally(() => {
+      operation.checking = null;
+      if (operation === saveOperation && saveCheckButton) saveCheckButton.disabled = false;
+    });
+    return operation.checking;
+  };
+  const finishSavedLogin = (operation, data) => {
+    if (operation !== saveOperation || !pageActive) return;
+    if (!data.account || (!data.account.account_ref && !data.account.unique_id)) throw saveUncertain("保存响应缺少账号信息，请重新检查最终结果。");
+    saveOperation = null;
+    bindingNeedsReview = false;
+    setSaving(false, { keepDisabled: true });
+    renderWorkspace(data.workspace);
+    if (data.verified === false) {
+      // The cookies were stored, but the login state is not usable: show the
+      // reason instead of a success toast.
+      setStatus(
+        `已保存登录态，但验证未通过：${data.verification_error || "登录态不可用"}`,
+        "danger",
+      );
+      closeFrame();
+      showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true });
+      return;
+    }
+    // A login save starts a friend refresh; when it could not start, say why
+    // instead of leaving the operator waiting for a list that never updates.
+    // The login state is re-checked after the save, in the background.
+    const refreshNote =
+      data.verification === "pending"
+        ? "，正在后台验证登录态并刷新好友列表（账号页会显示“登录态验证中”）"
+        : data.friend_refresh === "started"
+        ? ""
+        : data.friend_refresh === "busy"
+          ? "（发送任务正在运行，好友列表稍后会自动刷新）"
+          : data.friend_refresh === "running"
+            ? "（好友列表正在刷新中）"
+            : "（好友列表未自动刷新，可手动点刷新）";
+    const identityNote = data.identityLabel ? `（${data.identityLabel}）` : "";
+    setStatus(
+      `已保存登录账号：${data.account?.username || ""}${identityNote}${refreshNote}`,
+      data.verification === "pending" || data.friend_refresh === "started" ? "success" : "warning",
+    );
+    closeFrame();
+    showBindingResult(data.account, `已保存账号 ${data.account?.username || ""}${refreshNote}。接下来选择好友或群，再设置自己的发送内容。`, { pending: data.verification === "pending" });
+    if (data.verification === "pending") followBindingVerification(data.account);
+  };
+  const settleSave = async (operation, read) => {
+    const version = saveReadVersion;
+    try {
+      const data = await read();
+      if (version !== saveReadVersion) { const error = new Error("页面已离开"); error.saveSuspended = true; throw error; }
+      if (workspace.ticket && workspace.ticket !== operation.ticket) throw saveUncertain("工作区已切换，原保存结果仍需单独核对。");
+      if (operation === saveOperation && pageActive) finishSavedLogin(operation, data);
+    } catch (error) {
+      if (operation !== saveOperation || !pageActive) return;
+      if (error.saveSuspended || version !== saveReadVersion) { showSaveUncertain(operation, "页面已返回，可以继续检查上一次保存。"); return; }
+      if (error.bindingUncertain) { showSaveUncertain(operation, error.message); return; }
+      bindingNeedsReview = false;
+      setSaving(false);
+      const info = error.payload?.identity_confirmation;
+      const candidates = error.payload?.duplicate_candidates || (error.payload?.duplicate_candidate ? [error.payload.duplicate_candidate] : []);
+      if ((info || candidates.length) && operation.confirmations < 3) {
+        let extra = null;
+        if (info && confirmIdentityMigration(info)) extra = { confirm_identity: info.token };
+        else if (!info && candidates.length === 1 && window.confirm(
+          `已有一个同名账号（${candidates[0].username || "未命名"}）。\n\n点“确定”＝更新这个已有账号，保留目标和发送记录；\n点“取消”＝放弃保存，不做任何改动。`,
+        )) extra = { merge_with: candidates[0].account_ref };
+        if (extra) { startSave({ ...operation.payload, ...extra }, operation.confirmations + 1); return; }
+        if (candidates.length > 1) error.message = "有多个同名账号，请先到账号页确认要更新哪一个，再重新保存。";
+        else { error.cancelled = true; error.message = "已取消保存，没有改动任何账号。"; }
+      }
+      saveOperation = null;
+      if (saveCheckButton) saveCheckButton.hidden = true;
+      if (saveCheckStatus) saveCheckStatus.hidden = true;
+      if (bindingResult) {
+        bindingResult.hidden = false;
+        bindingResult.querySelector("[data-binding-result-title]").textContent = error.cancelled ? "已取消保存" : "保存未完成";
+        bindingResult.querySelector("[data-binding-result-message]").textContent = error.payload?.identityState ? identityFailureText(error) : error.message;
+        const next = bindingResult.querySelector("[data-binding-next]");
+        next.hidden = false; next.href = "/accounts"; next.textContent = "查看账号列表";
+        const preferences = bindingResult.querySelector("[data-binding-preferences]");
+        if (preferences) preferences.hidden = true;
+      }
+      statusHeldUntil = Date.now() + 10000;
+      setStatus(error.cancelled ? error.message : `登录账号未保存：${error.message}`, error.cancelled ? "" : "warning");
+      if (error.payload?.leaseLost) recoverLease();
+      else pollStatus();
+    }
+  };
+  const startSave = (payload, confirmations = 0) => {
+    let id;
+    try { id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, "0")).join(""); }
+    catch { setStatus("浏览器无法生成安全的保存编号，请使用 HTTPS 重新打开本页。", "warning"); return; }
+    const operation = { id, ticket: payload.ticket, payload, confirmations, startedAt: Date.now(), checking: null };
+    saveReadVersion += 1;
+    saveOperation = operation;
+    bindingNeedsReview = false;
+    setSaving(true);
+    showSaveProgress(operation, "正在提交保存任务…");
+    resetRecoveryBudget();
+    settleSave(operation, async () => {
+      let data;
+      try { data = await postForm("/login-desktop/save", { ...payload, async_save: "1", request_id: id }); }
+      catch (error) {
+        if (error.payload?.operation_id && /^[A-Za-z0-9_-]{16,128}$/.test(error.payload.operation_id)) {
+          operation.id = error.payload.operation_id;
+          showSaveProgress(operation, "服务器已有正在处理的保存，正在检查它的结果；不会重新保存。");
+          return observeSave(operation);
+        }
+        if (!error.bindingUncertain) throw error;
+        showSaveProgress(operation, "保存提交没有返回完整回应，正在按任务编号核对；不会重复提交。");
+        return observeSave(operation);
+      }
+      if (!pageActive) { const error = new Error("页面已离开"); error.saveSuspended = true; throw error; }
+      if (data.ticket && data.ticket !== operation.ticket) throw saveUncertain("保存记录与当前工作区不一致，请重新核对。");
+      if (data.operation_id && data.operation_id !== id) throw saveUncertain("服务器返回的保存编号不一致，请重新检查。");
+      if (data.state === "running" || data.operation_id) return observeSave(operation);
+      return data;
+    });
+  };
+  saveCheckButton?.addEventListener("click", () => {
+    const operation = saveOperation;
+    if (!operation || operation.checking || !pageActive) return;
+    setSaving(true);
+    showSaveProgress(operation, "正在重新检查同一次保存，仅查询结果…");
+    settleSave(operation, () => observeSave(operation));
+  });
+  document.querySelectorAll(".login-desktop-save").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.disabled || bindingBusy || bindingNeedsReview) return;
+      if (!workspace.ticket) { setStatus("请先申请自己的登录工作区，完成登录后再保存。", "warning"); return; }
+      startSave({ ticket: workspace.ticket, relogin_unique_id: button.dataset.reloginUniqueId || "" });
     });
   });
 
@@ -1451,16 +1660,13 @@
     return next;
   };
   const applyWorkspace = (data, { openFrame = false, pollQr = false } = {}) => {
-    workspace = trackWorkspace(data.workspace);
-    // Granting a workspace starts a fresh QR wait even though this path
-    // assigns `workspace` first (so renderWorkspace's promote branch is skipped).
-    if (workspace.state === "active" && workspace.active) qrPollStartedAt = Date.now();
-    renderWorkspace(workspace);
-    if (openFrame && data.state !== "queued") loadFrame(true);
-    if (pollQr && data.state !== "queued" && workspace.active) refreshLoginQr(500);
+    const previousTicket = workspace.ticket;
+    renderWorkspace(trackWorkspace(data.workspace));
+    if (openFrame && data.state !== "queued" && canUseWorkspace()) loadFrame();
+    if (pollQr && data.state !== "queued" && workspace.active && previousTicket === workspace.ticket && qrImage?.hidden) refreshLoginQr(100);
   };
   const acquireWorkspace = async () => {
-    if (bindingBusy || bindingNeedsReview) return;
+    if (!pageActive || acquiringWorkspace || bindingBusy || bindingNeedsReview) return;
     const wasAcquiring = acquiringWorkspace;
     acquiringWorkspace = true;
     try {
@@ -1481,7 +1687,7 @@
       // Always report the failure: an automatic attempt that fails must not
       // leave the stale "正在重新检查状态并尝试重新申请…" line on screen.
       if (qrStatus) qrStatus.textContent = `重新申请登录工作区失败：${error.message}`;
-    }
+    } finally { acquiringWorkspace = false; }
   };
   // Any deliberate user action starts a fresh recovery budget; only this resets
   // it, so an automatic loop can never renew its own budget.
@@ -1492,12 +1698,12 @@
     recoveringLease = false;
   };
   const recoverLease = ({ acquire = true } = {}) => {
-    if (bindingBusy || bindingNeedsReview) return;
+    if (!pageActive || document.visibilityState !== "visible" || bindingBusy || bindingNeedsReview) return;
     // The status poll calls back into this function when the workspace is not
     // ours, so a server that keeps contradicting itself must not recurse here.
     if (recoveringLease) return;
     recoveringLease = true;
-    window.clearTimeout(qrRefreshTimer);
+    cancelQr();
     window.clearTimeout(recoveryTimer);
     recoveryTimer = null;
     workspace = { state: "closed", active: false, position: 0, ticket: "" };
@@ -1554,55 +1760,105 @@
   root.addEventListener("login-interaction-lease-lost", () => recoverLease());
 
   if (section) section.addEventListener("toggle", () => { if (section.open) pollStatus(); });
-  pollStatus();
-  timer = window.setInterval(pollStatus, 10000);
-  heartbeatTimer = window.setInterval(heartbeat, 10000);
-  countdownTimer = window.setInterval(() => {
-    if (workspace.state !== "active" || !workspace.active) return;
+  const countdown = () => {
+    if (!pageActive || document.visibilityState !== "visible" || workspace.state !== "active" || !workspace.active) return;
     workspace.remaining_seconds = Math.max(0, Number(workspace.remaining_seconds || 0) - 1);
     const remaining = workspace.remaining_seconds;
-    if (statusHeld()) return;
-    setStatus(`登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`, remaining <= 60 ? "warning" : "success");
-  }, 1000);
-  // Releasing the workspace when the page goes away lets the next operator in
-  // immediately. Switching tabs only counts after a grace period, because a
-  // quick glance elsewhere should not drop the lease.
-  let hiddenReleaseTimer = null;
+    if (statusHeld() || resumeChecking) return;
+    setStatus(browserLoginLabel
+      ? `当前浏览器已登录：${browserLoginLabel}，请保存登录态。`
+      : `登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`, remaining <= 60 ? "warning" : "success");
+  };
+  const startTimers = () => {
+    window.clearInterval(heartbeatTimer);
+    window.clearInterval(countdownTimer);
+    // The server lease lasts 180s. Renew every 30s, including the 120s grace
+    // while hidden; frames and upstream status checks pause immediately.
+    heartbeatTimer = window.setInterval(heartbeat, 30000);
+    countdownTimer = window.setInterval(countdown, 1000);
+  };
+  let hiddenReleaseTimer = null, hiddenSince = 0;
+  const scheduleHiddenRelease = () => {
+    window.clearTimeout(hiddenReleaseTimer);
+    hiddenReleaseTimer = null;
+    if (!pageActive || !hiddenSince || document.visibilityState !== "hidden" || bindingNeedsReview) return;
+    hiddenReleaseTimer = window.setTimeout(releaseWorkspace, Math.max(0, 120000 - (Date.now() - hiddenSince)));
+  };
   const releaseWorkspace = () => {
-    if (!workspace.ticket || workspace.state !== "active") return;
+    if (bindingBusy || bindingNeedsReview || !workspace.ticket || !["active", "queued"].includes(workspace.state)) return;
     const body = new FormData();
     body.set("csrf_token", csrfToken);
     body.set("ticket", workspace.ticket);
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon("/login-desktop/release", body);
-    } else {
-      fetch("/login-desktop/release", {
-        method: "POST",
-        body,
-        credentials: "same-origin",
-        keepalive: true,
-      }).catch(() => {});
+    if (!navigator.sendBeacon || !navigator.sendBeacon("/login-desktop/release", body)) {
+      fetch("/login-desktop/release", { method: "POST", body, credentials: "same-origin", keepalive: true }).catch(() => {});
     }
+    workspaceVersion += 1;
+    workspace = { state: "closed", active: false, position: 0, ticket: "" };
+    publishWorkspace();
+    closeFrame();
+    setRecoverVisible(true);
+    if (pageActive) {
+      setStatus("离开页面较久，已释放登录工作区。回来后点“添加新账号”重新申请。", "warning");
+      if (qrStatus) qrStatus.textContent = "未保存的登录窗口已关闭，其他用户可以继续使用工作区。";
+    }
+  };
+  const pauseReads = () => {
+    lifecycleVersion += 1;
+    window.clearTimeout(timer);
+    cancelQr();
+    statusController?.abort();
+    publishWorkspace();
+  };
+  const checkOwnership = () => {
+    resumeChecking = true;
+    publishWorkspace();
+    setStatus("正在重新检查工作区归属，请稍候…");
+    pollStatus();
   };
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
-      hiddenReleaseTimer = window.setTimeout(releaseWorkspace, 120000);
-    } else if (hiddenReleaseTimer) {
+      if (!hiddenSince) hiddenSince = Date.now();
+      pauseReads();
+      scheduleHiddenRelease();
+    } else {
       window.clearTimeout(hiddenReleaseTimer);
       hiddenReleaseTimer = null;
+      hiddenSince = 0;
+      checkOwnership();
     }
   });
   window.addEventListener("pagehide", () => {
     bindingResultVersion += 1;
-    window.clearInterval(timer);
+    saveReadVersion += 1;
+    saveOperation?.controller?.abort();
+    saveOperation?.cancelWait?.();
+    pageActive = false;
+    pauseReads();
     window.clearInterval(heartbeatTimer);
     window.clearInterval(countdownTimer);
-    if (hiddenReleaseTimer) {
-      window.clearTimeout(hiddenReleaseTimer);
-      hiddenReleaseTimer = null;
-    }
+    stopOpening();
+    window.clearInterval(savingTimer);
+    window.clearTimeout(recoveryTimer);
+    recoveryTimer = null;
+    transientRequests.forEach((controller) => controller.abort());
+    document.querySelectorAll("[data-cookie-input]").forEach((input) => { input.value = ""; });
+    window.clearTimeout(hiddenReleaseTimer);
+    hiddenReleaseTimer = null;
+    hiddenSince = 0;
     releaseWorkspace();
   });
+  window.addEventListener("pageshow", (event) => {
+    if (!event.persisted) return;
+    pageActive = true;
+    lifecycleVersion += 1;
+    recoveringLease = false;
+    acquiringWorkspace = false;
+    startTimers();
+    if (saveOperation) showSaveUncertain(saveOperation, "页面已返回，请继续检查上一次保存的结果。");
+    checkOwnership();
+  });
+  startTimers();
+  pollStatus();
 })();
 
 (() => {
@@ -1756,6 +2012,78 @@
     return run;
   };
 
+  // Two pickers in one account share a single read, never a browser refresh.
+  const cacheReads = new Map();
+  const cacheControllers = new Set();
+  let cacheStopped = false;
+  window.addEventListener("pagehide", () => {
+    cacheStopped = true;
+    cacheControllers.forEach((controller) => controller.abort());
+    cacheReads.clear();
+  });
+  window.addEventListener("pageshow", () => { cacheStopped = false; });
+  const readCache = (url) => {
+    if (cacheReads.has(url)) return cacheReads.get(url);
+    const controller = new AbortController();
+    cacheControllers.add(controller);
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    const pending = (async () => {
+      const response = await fetch(url, {credentials: "same-origin", cache: "no-store", signal: controller.signal});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "列表暂时无法加载，请重试。");
+      return result;
+    })().catch((error) => {
+      if (cacheReads.get(url) === pending) cacheReads.delete(url);
+      throw error;
+    }).finally(() => {
+      window.clearTimeout(timeout);
+      cacheControllers.delete(controller);
+    });
+    cacheReads.set(url, pending);
+    return pending;
+  };
+  const mountCache = (picker, apply) => {
+    const url = picker.dataset.cacheUrl;
+    if (!url) return () => {};
+    const message = document.createElement("p"), retry = document.createElement("button");
+    message.className = "notice-inline";
+    message.dataset.cacheState = "";
+    message.setAttribute("role", "status");
+    retry.type = "button";
+    retry.className = "button button-quiet button-sm";
+    retry.textContent = "重新加载列表";
+    let superseded = false, loading = false;
+    const load = async () => {
+      if (superseded || loading || cacheStopped) return;
+      loading = true;
+      message.textContent = "正在加载已缓存的列表…";
+      picker.append(message);
+      try {
+        const data = await readCache(url);
+        if (!superseded && !cacheStopped) apply(data);
+        message.remove();
+      } catch (error) {
+        if (!superseded && !cacheStopped) {
+          message.textContent = error.name === "AbortError" ? "列表加载超时，当前选择已保留。" : error.message;
+          message.append(" ", retry);
+        }
+      } finally { loading = false; }
+    };
+    retry.addEventListener("click", load);
+    window.addEventListener("pageshow", (event) => { if (event.persisted && !superseded) load(); });
+    load();
+    return () => { superseded = true; message.remove(); };
+  };
+  const pageControls = (list) => {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "button button-quiet button-sm";
+    more.dataset.pickerMore = "";
+    more.hidden = true;
+    list.after(more);
+    return more;
+  };
+
   const initializeWhenVisible = (picker, initialize) => {
     const folds = [];
     for (let node = picker.parentElement; node; node = node.parentElement) {
@@ -1779,12 +2107,17 @@
       let friends = parseJson(`friends-cache-${accountId}`);
       const isGroupTarget = (value) => /^群聊[:：]/.test(String(value || "").trim());
       let selected = new Set(parseJson(`selected-targets-${accountId}`).filter((target) => !isGroupTarget(target)));
-      let lastRender = "", searchTimer = null;
+      let lastRender = "", searchTimer = null, visibleCount = 100;
+      const more = pageControls(list);
+      let finishCache = () => {};
       const updateSummary = () => { if (summary) summary.textContent = `已选 ${selected.size} 人`; };
       const render = () => {
         const query = String(search?.value || "").trim().toLowerCase();
         const all = [...new Set([...selected, ...friends])];
-        const names = all.filter((name) => name.toLowerCase().includes(query));
+        const matches = all.filter((name) => name.toLowerCase().includes(query));
+        const names = matches.slice(0, visibleCount);
+        more.hidden = matches.length <= visibleCount;
+        more.textContent = `再显示 ${Math.min(100, Math.max(0, matches.length - visibleCount))} 人（共 ${matches.length} 人）`;
         updateSummary();
         const signature = JSON.stringify([names, names.map((name) => selected.has(name))]);
         if (signature === lastRender) return;
@@ -1825,17 +2158,20 @@
       });
       search?.addEventListener("input", () => {
         window.clearTimeout(searchTimer);
+        visibleCount = 100;
         searchTimer = window.setTimeout(render, 80);
       });
+      more.addEventListener("click", () => { visibleCount += 100; render(); });
       search?.addEventListener("keydown", (event) => { if (event.key === "Enter") event.preventDefault(); });
       render();
       refresh = refreshController({
         button: picker.querySelector(".friend-refresh-button"), status: picker.querySelector(".friend-picker-status"),
         url: picker.dataset.refreshUrl, csrf: picker.dataset.csrfToken,
-        apply: (job) => { friends = job.friends || friends; render(); },
+        apply: (job) => { finishCache(); friends = job.friends || friends; render(); },
         progress: (job) => job.stage === "collecting" ? `正在读取好友列表…已采集 ${job.collected || 0} 个` : "正在启动并读取好友列表…",
         autoCheck,
       });
+      finishCache = mountCache(picker, (data) => { friends = data.friends || []; render(); });
       return refresh;
     };
     picker.refreshFriends = () => initialize(false)(true);
@@ -1846,6 +2182,10 @@
   const batchSummary = document.querySelector("[data-refresh-all-friends-summary]");
   batchButton?.addEventListener("click", async () => {
     const pickers = [...document.querySelectorAll(".friend-picker")];
+    if (!pickers.length) {
+      if (batchSummary) { batchSummary.hidden = false; batchSummary.textContent = "还没有账号，请先完成登录绑定。"; }
+      return;
+    }
     const results = [];
     batchButton.disabled = true;
     if (batchSummary) { batchSummary.hidden = false; batchSummary.textContent = `正在刷新 ${pickers.length} 个账号…`; }
@@ -1884,7 +2224,9 @@
       const submittedSelection = document.createElement("div");
       submittedSelection.hidden = true;
       list.before(search, summary, submittedSelection);
-      let searchTimer = null;
+      let searchTimer = null, visibleCount = 100;
+      const more = pageControls(list);
+      let finishCache = () => {};
       const updateSummary = () => {
         summary.textContent = `已选 ${selected.size} 个群`;
         submittedSelection.textContent = "";
@@ -1912,8 +2254,10 @@
         });
         const query = search.value.trim().toLowerCase();
         const fragment = document.createDocumentFragment();
-        known.forEach((group) => {
-          if (query && !`${group.name} ${group.conversationId}`.toLowerCase().includes(query)) return;
+        const matches = [...known.values()].filter((group) => !query || `${group.name} ${group.conversationId}`.toLowerCase().includes(query));
+        more.hidden = matches.length <= visibleCount;
+        more.textContent = `再显示 ${Math.min(100, Math.max(0, matches.length - visibleCount))} 个群（共 ${matches.length} 个群）`;
+        matches.slice(0, visibleCount).forEach((group) => {
           const label = document.createElement("label"), box = document.createElement("input"), text = document.createElement("span");
           box.type = "checkbox";
           box.dataset.groupChoice = "";
@@ -1943,14 +2287,17 @@
       };
       search.addEventListener("input", () => {
         window.clearTimeout(searchTimer);
+        visibleCount = 100;
         searchTimer = window.setTimeout(render, 80);
       });
+      more.addEventListener("click", () => { visibleCount += 100; render(); });
       search.addEventListener("keydown", (event) => { if (event.key === "Enter") event.preventDefault(); });
       render();
       refresh = refreshController({
         button: editor?.querySelector(".group-refresh-button"), status: editor?.querySelector("[data-group-status]"),
         url: picker.dataset.refreshUrl, csrf: picker.dataset.csrfToken,
         apply: (job) => {
+          finishCache();
           groups = job.groups || groups;
           const notices = picker.querySelector(".group-picker-notices");
           if (notices) {
@@ -1966,6 +2313,7 @@
         },
         progress: () => "正在读取群列表…当前选择已保留。",
       });
+      finishCache = mountCache(picker, (data) => { groups = data.groups || []; render(); });
       return refresh;
     };
     initializeWhenVisible(picker, initialize);

@@ -293,7 +293,7 @@ def cancel_request(*, username: str, session_id: str, ticket: str = "") -> tuple
             if str(item.get("username")) == str(username) and str(item.get("session_id")) == str(session_id) and (not ticket or str(item.get("ticket")) == str(ticket)):
                 removed = queue.pop(index)
                 state["queue"] = queue
-                if queue or state.get("active"):
+                if queue or state.get("active") or state.get("phase") == "resetting":
                     _write_state(state)
                 else:
                     _delete_state()

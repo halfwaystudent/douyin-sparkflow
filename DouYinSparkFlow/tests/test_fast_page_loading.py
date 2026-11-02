@@ -41,7 +41,7 @@ class AsyncIconLoadingTests(unittest.IsolatedAsyncioTestCase):
             url = route.request.url
             if not url.startswith("http://sparkflow.test/"):
                 return await route.abort()
-            if "/static/lucide.min.js" in url:
+            if "/static/icons.js" in url:
                 requested.set()
                 await released.wait()
             response = fixture.client.get(url.replace("http://sparkflow.test", ""), follow_redirects=False)

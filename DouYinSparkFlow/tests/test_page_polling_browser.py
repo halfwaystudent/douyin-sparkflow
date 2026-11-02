@@ -47,7 +47,9 @@ class PagePollingBrowserTests(unittest.IsolatedAsyncioTestCase):
           });
         }""")
         await self.page.add_script_tag(path=str(STATIC / "login-interaction.js"))
-        await self.page.locator("input").fill("temporary-secret")
+        # A stale browser-restored value must be cleared even while the first
+        # frame is loading and the input is deliberately disabled.
+        await self.page.locator("input").evaluate("element => { element.value = 'temporary-secret'; }")
         await self.page.evaluate("document.getElementById('login-desktop-controls').dataset.workspaceActive = '0'")
         await self.page.wait_for_function("aborted === 1 && document.querySelector('input').value === ''")
         self.assertTrue(await self.page.locator("img").is_hidden())

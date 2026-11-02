@@ -38,9 +38,9 @@ def encryption_required():
     return os.getenv("SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED", "").lower() in {"1", "true", "yes", "on"}
 
 
-def read_json(path, *, allow_plaintext=False):
+def read_json(path, *, allow_plaintext=False, text=None):
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8") if text is None else text)
     except (OSError, ValueError, UnicodeError) as exc:
         raise StorageError("Unable to read JSON storage.") from exc
     if not encrypted_payload(data):

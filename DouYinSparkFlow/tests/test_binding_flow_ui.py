@@ -4,7 +4,7 @@ from core.identity import bind_identity
 from core.personal_streak import save_preferences
 from tests import test_shared_security as fixtures
 from utils import config
-from webui.setup_flow import requested_step, setup_state
+from webui.setup_flow import requested_step, setup_state, setup_binding_revision
 
 
 class SetupFlowTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class SetupFlowTests(unittest.TestCase):
         config.save_userData(self.accounts)
 
     def finish(self):
-        return self.client.post("/setup/finish", data={"csrf_token": self.csrf}, follow_redirects=False)
+        return self.client.post("/setup/finish", data={"csrf_token": self.csrf, "account_ref": "a1", "binding_revision": setup_binding_revision(self.account)}, follow_redirects=False)
 
     def test_cookies_alone_are_not_a_verified_binding(self):
         self.account.pop("identity_binding")

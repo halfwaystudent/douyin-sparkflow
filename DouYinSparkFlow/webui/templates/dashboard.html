@@ -244,4 +244,4 @@
   </div>
 </div>
 {% endblock %}
-{% block scripts %}{% if is_admin %}<script defer src="/static/host-status.js?v=20261102-5"></script>{% endif %}{% endblock %}
+{% block scripts %}{% if is_admin %}<script defer src="{{ asset_url('host-status.js') }}"></script>{% endif %}{% endblock %}

@@ -205,7 +205,7 @@ def _load_json_file(path, defaults=None):
             raise StorageError("Protected storage is empty.")
         return deepcopy(defaults) if defaults is not None else None
 
-    data = read_json(path)
+    data = read_json(path, text=text)
     if defaults is None:
         return data
     # _merge_defaults only works with dicts; for list-shaped data
@@ -517,6 +517,25 @@ def get_app_settings(force_reload=False):
                 _save_json_file(target, updated)
             appSettings = updated
     return deepcopy(appSettings)
+
+
+def read_app_settings():
+    """Read a fresh atomic snapshot; initialization still owns the write lock."""
+    target = app_settings_path()
+    if not target.exists():
+        return get_app_settings(force_reload=True)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise StorageError("Unable to read application settings.") from exc
+    if not text.strip():
+        return get_app_settings(force_reload=True)
+    settings = read_json(target, text=text)
+    if not isinstance(settings, dict):
+        raise StorageError("Invalid application settings.")
+    if not settings.get("session_secret") or not settings.get("compose_root") or settings.get("ops_log_file") == LEGACY_OPS_LOG_FILE:
+        return get_app_settings(force_reload=True)
+    return _merge_defaults(settings, DEFAULT_APP_SETTINGS)
 
 
 def douyin_proxy_url(settings=None):

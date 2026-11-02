@@ -5,7 +5,7 @@ import time
 
 from filelock import FileLock
 
-from utils.config import app_settings_path, get_app_settings, save_app_settings
+from utils.config import app_settings_path, get_app_settings, read_app_settings, save_app_settings
 from webui import sessions
 
 
@@ -35,7 +35,7 @@ def verify_password(password, stored_hash):
 
 
 def is_bootstrapped():
-    return bool(get_app_settings(force_reload=True).get("admin_password_hash"))
+    return bool(read_app_settings().get("admin_password_hash"))
 
 
 def _session_version(value):
@@ -86,6 +86,20 @@ def current_user(request):
     return request.session.get("user")
 
 
+def refreshed_identity(identity):
+    """Recheck the live credential version after asynchronous verification."""
+    if not identity:
+        return None
+    from webui.passkeys import login_identity
+    live = login_identity(identity["username"])
+    keys = ("username", "role", "auth_version")
+    if "user_key" in identity:
+        keys += ("user_key",)
+    if not live or any(live.get(key) != identity.get(key) for key in keys):
+        return None
+    return live
+
+
 def current_principal(request):
     """Resolve the current session to live role and account assignments."""
     username = current_user(request)
@@ -97,8 +111,11 @@ def current_principal(request):
         return None
     role = request.session.get("role")
     session_version = _session_version(request.session.get("auth_version"))
-    settings = get_app_settings(force_reload=True)
-    admin_username = str(settings.get("admin_username", "admin")).strip() or "admin"
+    if role in {"admin", None}:
+        settings = read_app_settings()
+        admin_username = str(settings.get("admin_username", "admin")).strip() or "admin"
+    else:
+        settings, admin_username = {}, ""
     if role == "admin" or (role is None and username.casefold() == admin_username.casefold()):
         if username.casefold() != admin_username.casefold() or session_version != _session_version(settings.get("admin_session_version")):
             return None

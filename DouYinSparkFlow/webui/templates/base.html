@@ -32,7 +32,7 @@
         }
       })();
     </script>
-    <link rel="stylesheet" href="/static/app.css?v=20261102-5">
+    <link rel="stylesheet" href="{{ asset_url('app.css') }}">
   </head>
   <body data-page="{% block page_key %}dashboard{% endblock %}">
     <div class="shell">
@@ -132,11 +132,13 @@
       </div>
     </dialog>
 
-    <script async src="/static/lucide.min.js?v=20260710" data-icon-library></script>
-    <script defer src="/static/app.js?v=20261102-5"></script>
-    <script defer src="/static/passkeys.js?v=20261102-1"></script>
-    <script defer src="/static/auth-forms.js?v=20261102-2"></script>
-    <script defer src="/static/editing.js?v=20261102-5"></script>
+    <script async src="{{ asset_url('icons.js') }}" data-icon-library></script>
+    <script defer src="{{ asset_url('app-shell.js') }}"></script>
+    {% if nav == 'accounts' %}<script defer src="{{ asset_url('account-pickers.js') }}"></script>{% endif %}
+    {% if nav == 'login_workspace' %}<script defer src="{{ asset_url('login-workspace.js') }}"></script>{% endif %}
+    {% if nav == 'settings' %}<script defer src="{{ asset_url('passkeys.js') }}"></script>
+    <script defer src="{{ asset_url('auth-forms.js') }}"></script>{% endif %}
+    {% if nav in ['accounts', 'personal_streak'] %}<script defer src="{{ asset_url('editing.js') }}"></script>{% endif %}
     {% block scripts %}{% endblock %}
   </body>
 </html>

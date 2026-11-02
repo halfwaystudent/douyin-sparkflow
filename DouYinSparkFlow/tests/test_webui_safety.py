@@ -483,35 +483,8 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertIn("retries - 1", script)
         self.assertIn('/login-desktop/qr/refresh', script)
 
-    def test_saving_a_login_shows_progress_and_blocks_a_second_click(self):
-        # A second click while the first save was still running raced its
-        # release and failed with a 400; the save must look busy until it ends.
-        script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
-        start = script.index('document.querySelectorAll(".login-desktop-save").forEach((button) =>')
-        block = script[start:script.index('document.querySelectorAll(".login-desktop-close")', start)]
-        self.assertIn("if (button.disabled || bindingBusy || bindingNeedsReview) return;", block)
-        self.assertLess(block.index("setSaving(true);"), block.index("try {"))
-        catch = block[block.rindex("} catch (error) {"):]
-        self.assertIn("setSaving(false, { keepDisabled: Boolean(error.bindingUncertain) });", catch)
-        self.assertIn("showBindingResult(null, error.message, { uncertain: true });", catch)
-        # Every early return before the result must end the busy state too.
-        duplicates = block[block.index("if (candidates.length > 1) {"):block.index("const update = window.confirm(")]
-        self.assertGreaterEqual(duplicates.count("setSaving(false);"), 2)
-        saving = script[script.index("const setSaving = "):start]
-        self.assertIn("item.disabled = saving || keepDisabled;", saving)
-        self.assertIn("已等待", saving)
-        # The lease countdown and the status poll must not overwrite the save
-        # progress or its error: they flickered with it every second.
-        self.assertIn("statusHeldUntil = saving ? Infinity : Date.now() + 8000;", saving)
-        countdown = script[script.index("countdownTimer = window.setInterval"):]
-        countdown = countdown[: countdown.index("}, 1000);")]
-        self.assertLess(countdown.index("if (statusHeld()) return;"), countdown.index("setStatus("))
-        poll = script[script.index("const pollStatus = async"):script.index("const heartbeat = async")]
-        self.assertLess(poll.index("if (statusHeld())"), poll.index("当前浏览器已登录"))
-        # A saved login keeps its result and next step visible, without a reload.
-        self.assertIn("setSaving(false, { keepDisabled: true });", block)
-        self.assertIn("showBindingResult(data.account", block)
-        self.assertNotIn("window.location.reload()", block)
+    # Save progress, confirmation, duplicate clicks and interrupted-result
+    # recovery are exercised through Chromium in test_async_save_browser.py.
 
     def test_save_and_close_do_not_wait_for_the_next_workspace(self):
         source = Path(app_module.__file__).read_text(encoding="utf-8")
@@ -609,11 +582,12 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertIn("response.status === 423", qr_poll)
         self.assertIn("recoverLease()", qr_poll)
         self.assertLess(qr_poll.index("response.status === 423"), qr_poll.index("recoverLease()"))
-        self.assertLess(qr_poll.index("recoverLease()"), qr_poll.index('retryLater("登录页正在加载")'))
+        self.assertLess(qr_poll.index("recoverLease()"), qr_poll.index('二维码读取超时'))
         # The other lease-gated calls must recover instead of printing a bare error.
         for handler in (".login-desktop-save", "data-focus-native-browser"):
             self.assertIn(handler, script)
-        self.assertGreaterEqual(script.count("payload.leaseLost"), 4)
+        self.assertGreaterEqual(script.count("payload.leaseLost"), 3)
+        self.assertIn("error.payload?.leaseLost", script)
         self.assertIn("if (error.payload && error.payload.leaseLost)", script)
         # A never-ready QR code must stop polling and hand control back to the
         # operator; it must not keep POSTing /qr/refresh, because every refresh
@@ -683,7 +657,7 @@ class WebUiSafetyTests(unittest.TestCase):
         promote_block = script[script.index("if (promoted) {"):script.index("if (displayMode === \"native\") {")]
         self.assertIn("qrPollStartedAt = Date.now()", promote_block)
         apply_fn = script[script.index("const applyWorkspace"):script.index("const acquireWorkspace")]
-        self.assertIn("qrPollStartedAt = Date.now()", apply_fn)
+        self.assertIn("renderWorkspace(trackWorkspace(data.workspace))", apply_fn)
         # Every deliberate user action renews the budget.
         self.assertGreaterEqual(script.count("resetRecoveryBudget()"), 4)
         self.assertNotIn("requestQrRefresh({", script)

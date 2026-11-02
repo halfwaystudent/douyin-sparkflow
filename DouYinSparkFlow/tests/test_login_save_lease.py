@@ -144,6 +144,33 @@ class LoginSaveLeaseTests(unittest.TestCase):
             export.assert_not_called()
         self.unchanged()
 
+    def test_revocation_while_form_is_read_is_rejected_before_export(self):
+        session_id = login_lock.get_lock()["session_id"]
+        def revoke_after_form(*args):
+            sessions.revoke(session_id, time.time() + 3600)
+            return True
+        with patch.object(app_module, "validate_csrf", side_effect=revoke_after_form), patch.object(app_module, "call_login_desktop") as export:
+            response = self.post(async_save="1", request_id="revoked-request-123456")
+        self.assertEqual(401, response.status_code)
+        self.assertFalse(response.json()["binding_pending"])
+        export.assert_not_called()
+        self.unchanged()
+
+    def test_unavailable_identity_is_explicitly_unsaved_and_same_workspace_can_retry(self):
+        unavailable = app_module.account_identity.IdentityUnavailable("身份接口暂时不可用，请完成验证后重试")
+        with patch.object(app_module, "call_login_desktop", return_value={"ok": True, "result": deepcopy(EXPORT)}), patch.object(app_module.account_identity, "fetch_trusted_identity", side_effect=unavailable):
+            rejected = self.post()
+        self.assertEqual(503, rejected.status_code)
+        self.assertFalse(rejected.json()["binding_pending"])
+        self.assertEqual("unverified", rejected.json()["identityState"])
+        self.assertTrue(rejected.json()["retryable"])
+        self.assertEqual(self.ticket, login_lock.get_lock()["ticket"])
+        self.unchanged()
+        with patch.object(app_module, "call_login_desktop", return_value={"ok": True, "result": deepcopy(EXPORT)}), patch.object(app_module.account_identity, "fetch_trusted_identity", return_value=TRUSTED), patch.object(app_module, "task_run_lock_status", return_value={"running": True}):
+            saved = self.post()
+        self.assertEqual(200, saved.status_code, saved.text)
+        self.assertEqual(1, len([row for row in config.get_userData(force_reload=True) if row.get("platform_uid") == "333"]))
+
     def test_handoff_during_export_keeps_next_users_workspace_and_cookies_private(self):
         next_lease = {}
         def export(*args, **kwargs):

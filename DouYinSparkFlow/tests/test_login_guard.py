@@ -106,9 +106,13 @@ class LoginRouteThrottleTests(unittest.TestCase):
         from webui import app as app_module
 
         self.app_module = app_module
+        self.live_identity = {"username": "admin", "role": "admin", "account_refs": [], "auth_version": 0}
         patches = [
             patch.object(app_module, "is_bootstrapped", return_value=True),
             patch("webui.users.authenticate", side_effect=self._auth),
+            # The fake password verifier and the live identity lookup describe
+            # the same account; refreshed_identity itself remains real.
+            patch("webui.passkeys.login_identity", side_effect=lambda username: dict(self.live_identity) if username == "admin" else None),
         ]
         for item in patches:
             item.start()
@@ -146,6 +150,12 @@ class LoginRouteThrottleTests(unittest.TestCase):
         response = self._login("right-password-1")
 
         self.assertEqual("/", response.headers["location"])
+
+    def test_correct_password_with_a_stale_credential_version_does_not_sign_in(self):
+        self.live_identity["auth_version"] = 1
+        response = self._login("right-password-1")
+        self.assertEqual("/login", response.headers["location"])
+        self.assertEqual(1, self.calls)
 
 
 class PasswordPolicyRouteTests(unittest.TestCase):
