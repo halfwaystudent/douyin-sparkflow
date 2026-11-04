@@ -1,9 +1,13 @@
 import asyncio
+import tempfile
 import unittest
+from copy import deepcopy
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from core import friends as friends_module
 from core import browser as browser_module
+from core import profile_cookies
 from scripts import clean_friend_junk
 
 
@@ -307,9 +311,15 @@ class _StubContext:
     async def add_cookies(self, cookies):
         self.added.extend(cookies)
 
+    async def clear_cookies(self, *args, **kwargs):
+        del args, kwargs
+
     async def cookies(self, *args, **kwargs):
         if self._auth_cookies:
-            return [{"name": "sessionid", "value": "from-profile"}]
+            return [{
+                "name": "sessionid", "value": "from-profile",
+                "domain": ".douyin.com", "path": "/",
+            }]
         return []
 
     async def new_page(self):
@@ -334,15 +344,39 @@ PROFILE_CONFIG = {
 }
 
 
+class _ProfileStore:
+    """Synthetic locked account store used by the real cookie-sync module."""
+
+    def __init__(self, accounts):
+        self.accounts = deepcopy(accounts)
+
+    def read(self, **kwargs):
+        del kwargs
+        return deepcopy(self.accounts)
+
+    def update(self, mutate, **kwargs):
+        del kwargs
+        result = mutate(self.accounts)
+        if isinstance(result, tuple):
+            result = result[0]
+        return deepcopy(result)
+
+
 class PersistentProfileRefreshTests(unittest.TestCase):
     """The refresh must share the sender's profile, lock and cookie policy."""
 
     def _run(self, profile_config, context, lock_calls):
         account = {
+            "account_ref": "refresh-account",
             "unique_id": "123",
             "username": "Tester",
-            "cookies": [{"name": "sessionid", "value": "from-store"}],
+            "login_generation": "refresh-generation",
+            "cookies": [{
+                "name": "sessionid", "value": "from-store",
+                "domain": ".douyin.com", "path": "/",
+            }],
         }
+        store = _ProfileStore([account])
 
         async def fake_acquire(user, account_name, **kwargs):
             del user, kwargs
@@ -352,37 +386,42 @@ class PersistentProfileRefreshTests(unittest.TestCase):
         def fake_release(handle, lock_path, token, account_name):
             lock_calls.append(("release", handle, lock_path, token, account_name))
 
-        async def fake_context(*args, **kwargs):
-            del args, kwargs
-            return _StubPlaywright(), context, "/tmp/profiles/uid-123"
+        with tempfile.TemporaryDirectory() as directory:
+            config = dict(profile_config, root=directory)
 
-        with (
-            patch.object(
-                friends_module,
-                "normalize_persistent_profile_config",
-                return_value=profile_config,
-            ),
-            patch.object(
-                friends_module, "acquire_browser_account_lock", fake_acquire
-            ),
-            patch.object(
-                friends_module, "release_browser_account_lock", fake_release
-            ),
-            patch.object(
-                friends_module, "get_persistent_browser_context", fake_context
-            ),
-            patch.object(
-                friends_module,
-                "collect_friend_names",
-                new=AsyncMock(return_value=friends_module.FriendScanResult(
-                    ["林恩"], complete=True
-                )),
-            ),
-            patch.object(friends_module.asyncio, "sleep", new=AsyncMock()),
-        ):
-            return asyncio.run(
-                friends_module._fetch_account_friends_once(account, "direct")
-            )
+            async def fake_context(*args, **kwargs):
+                del args, kwargs
+                return _StubPlaywright(), context, Path(directory)
+
+            with (
+                patch.object(
+                    friends_module,
+                    "normalize_persistent_profile_config",
+                    return_value=config,
+                ),
+                patch.object(
+                    friends_module, "acquire_browser_account_lock", fake_acquire
+                ),
+                patch.object(
+                    friends_module, "release_browser_account_lock", fake_release
+                ),
+                patch.object(
+                    friends_module, "get_persistent_browser_context", fake_context
+                ),
+                patch.object(
+                    friends_module,
+                    "collect_friend_names",
+                    new=AsyncMock(return_value=friends_module.FriendScanResult(
+                        ["林恩"], complete=True
+                    )),
+                ),
+                patch.object(friends_module.asyncio, "sleep", new=AsyncMock()),
+                patch.object(profile_cookies, "get_userData", store.read),
+                patch.object(profile_cookies, "update_user_data", store.update),
+            ):
+                return asyncio.run(
+                    friends_module._fetch_account_friends_once(account, "direct")
+                )
 
     def test_holds_the_same_account_lock_as_the_sender(self):
         context = _StubContext()
@@ -394,14 +433,12 @@ class PersistentProfileRefreshTests(unittest.TestCase):
         self.assertEqual(["acquire", "release"], [call[0] for call in lock_calls])
         self.assertTrue(context.closed)
 
-    def test_stored_cookies_are_synced_when_configured(self):
+    def test_existing_profile_auth_is_preserved_when_sync_is_configured(self):
         context = _StubContext()
 
         self._run(PROFILE_CONFIG, context, [])
 
-        self.assertEqual(
-            [{"name": "sessionid", "value": "from-store"}], context.added
-        )
+        self.assertEqual([], context.added)
 
     def test_profile_session_is_kept_when_sync_is_disabled(self):
         context = _StubContext(auth_cookies=True)
@@ -418,7 +455,8 @@ class PersistentProfileRefreshTests(unittest.TestCase):
         self._run(config, empty_context, [])
 
         self.assertEqual(
-            [{"name": "sessionid", "value": "from-store"}], empty_context.added
+            [{"name": "sessionid", "value": "from-store", "domain": ".douyin.com", "path": "/"}],
+            empty_context.added,
         )
 
 

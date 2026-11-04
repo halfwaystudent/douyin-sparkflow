@@ -39,4 +39,4 @@ class PagePerformanceTests(unittest.TestCase):
         with patch.object(app_module, "get_overview_snapshot", return_value={"schedule": {"label": "global"}}):
             response = fixture.login().get("/api/ops/overview")
         self.assertEqual(200, response.status_code)
-        self.assertEqual("每天 09:15 · Asia/Shanghai", response.json()["schedule"]["label"])
+        self.assertEqual("每天 09:15–24:00 · Asia/Shanghai", response.json()["schedule"]["label"])

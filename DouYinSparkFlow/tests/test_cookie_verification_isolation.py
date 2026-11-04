@@ -30,18 +30,19 @@ def browser_fixture():
 
 
 class FreshCookieBrowserTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pasted_cookies_skip_persistent_profile_and_account_lock(self):
+    async def test_pasted_cookies_skip_persistent_profile_but_keep_account_lock(self):
         runtime, browser, context, page = browser_fixture()
         account = {"cookies": deepcopy(COOKIES), "unique_id": "", "account_ref": "", "_fresh_login_verification": True}
         before = deepcopy(account)
-        with patch.object(friends, "get_browser", new_callable=AsyncMock, return_value=(runtime, browser)), patch.object(friends, "get_persistent_browser_context", new_callable=AsyncMock) as persistent, patch.object(friends, "acquire_browser_account_lock", new_callable=AsyncMock) as lock, patch.object(friends, "get_config") as config, patch.object(friends, "collect_login_result", new_callable=AsyncMock, return_value=PAGE_IDENTITY), patch.object(friends, "_wait_for_chat_or_login", new_callable=AsyncMock):
+        with patch.object(friends, "get_browser", new_callable=AsyncMock, return_value=(runtime, browser)), patch.object(friends, "get_persistent_browser_context", new_callable=AsyncMock) as persistent, patch.object(friends, "acquire_browser_account_lock", new_callable=AsyncMock, return_value=("guard", "lock-path", "token")) as lock, patch.object(friends, "release_browser_account_lock") as release, patch.object(friends, "get_config") as config, patch.object(friends, "collect_login_result", new_callable=AsyncMock, return_value=PAGE_IDENTITY), patch.object(friends, "_wait_for_chat_or_login", new_callable=AsyncMock):
             result = await friends._fetch_account_friends_once(account, "direct", auth_only=True)
         self.assertEqual(PAGE_IDENTITY, result)
         self.assertEqual(before, account)
         browser.new_context.assert_awaited_once_with(service_workers="block", accept_downloads=False)
         context.add_cookies.assert_awaited_once_with(COOKIES)
         persistent.assert_not_awaited()
-        lock.assert_not_awaited()
+        lock.assert_awaited_once()
+        release.assert_called_once_with("guard", "lock-path", "token", "")
         config.assert_not_called()
         context.close.assert_awaited_once()
         browser.close.assert_awaited_once()
@@ -51,13 +52,14 @@ class FreshCookieBrowserTests(unittest.IsolatedAsyncioTestCase):
         runtime, browser, context, page = browser_fixture()
         policy = {"enabled": True, "root": "/private/profiles", "syncStoredCookiesBeforeRun": True, "seedCookiesWhenEmpty": True}
         account = {"cookies": deepcopy(COOKIES), "unique_id": "1234567890", "platform_uid": "1234567890"}
-        with patch.object(friends, "get_config", return_value={}), patch.object(friends, "normalize_persistent_profile_config", return_value=policy), patch.object(friends, "get_browser", new_callable=AsyncMock) as ephemeral, patch.object(friends, "get_persistent_browser_context", new_callable=AsyncMock, return_value=(runtime, context, "/private/profiles/uid-1234567890")) as persistent, patch.object(friends, "acquire_browser_account_lock", new_callable=AsyncMock, return_value=("guard", "lock-path", "token")) as lock, patch.object(friends, "release_browser_account_lock") as release, patch.object(friends, "collect_login_result", new_callable=AsyncMock, return_value=PAGE_IDENTITY), patch.object(friends, "_wait_for_chat_or_login", new_callable=AsyncMock):
+        with patch.object(friends, "get_config", return_value={}), patch.object(friends, "normalize_persistent_profile_config", return_value=policy), patch.object(friends, "get_browser", new_callable=AsyncMock) as ephemeral, patch.object(friends, "get_persistent_browser_context", new_callable=AsyncMock, return_value=(runtime, context, "/private/profiles/uid-1234567890")) as persistent, patch.object(friends, "acquire_browser_account_lock", new_callable=AsyncMock, return_value=("guard", "lock-path", "token")) as lock, patch.object(friends, "release_browser_account_lock") as release, patch("core.profile_cookies.prepare_profile_cookies", new_callable=AsyncMock, return_value=None) as prepare, patch.object(friends, "collect_login_result", new_callable=AsyncMock, return_value=PAGE_IDENTITY), patch.object(friends, "_wait_for_chat_or_login", new_callable=AsyncMock):
             await friends._fetch_account_friends_once(account, "direct", auth_only=True)
         ephemeral.assert_not_awaited()
         persistent.assert_awaited_once_with("uid-1234567890", root="/private/profiles", network_mode="direct")
         lock.assert_awaited_once()
         release.assert_called_once()
-        context.add_cookies.assert_awaited_once_with(COOKIES)
+        prepare.assert_awaited_once_with(context, account, policy, "/private/profiles/uid-1234567890")
+        context.add_cookies.assert_not_awaited()
 
     async def test_simultaneous_candidates_get_separate_contexts_and_only_their_cookies(self):
         first = browser_fixture()

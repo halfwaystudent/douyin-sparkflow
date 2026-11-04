@@ -6,6 +6,11 @@
   const delay = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
   const refreshController = ({ button, status, url, csrf, apply, progress, autoCheck = true }) => {
+    const jobUrl = (suffix) => {
+      const boundary = url.search(/[?#]/);
+      return boundary < 0 ? `${url}/${suffix}`
+        : `${url.slice(0, boundary)}/${suffix}${url.slice(boundary)}`;
+    };
     let pending = null, checkAgain = false, stopped = false, version = 0;
     const requests = new Set();
     const initialStatus = String(status?.textContent || "").trim();
@@ -63,13 +68,13 @@
       if (button) { button.disabled = true; button.setAttribute("aria-busy", "true"); }
       let started = false;
       try {
-        let job = await request(`${url}/status`);
+        let job = await request(jobUrl("status"));
         if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
         if (start && job.state !== "running" && !checkAgain) {
           show("正在启动刷新…");
           const body = new FormData();
           body.set("csrf_token", csrf);
-          const data = await request(`${url}/async`, body);
+          const data = await request(jobUrl("async"), body);
           job = data.job || data;
           started = true;
         }
@@ -86,7 +91,7 @@
           }
           await delay(2000);
           if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
-          job = await request(`${url}/status`);
+          job = await request(jobUrl("status"));
         }
         if (stopped || heldVersion !== version) return { ok: false, pending: true, started, message: "页面已关闭，未继续检查" };
         if (job.state === "done") {
@@ -235,15 +240,15 @@
     let refresh = null;
     const initialize = (autoCheck = true) => {
       if (refresh) return refresh;
-      const accountId = picker.dataset.accountId;
+      const recordKey = picker.dataset.recordKey || picker.dataset.accountId;
       const form = picker.closest("form");
       const textarea = form?.querySelector(".targets-textarea");
       const search = picker.querySelector(".friend-search-input");
       const list = picker.querySelector(".friend-picker-list");
       const summary = picker.querySelector(".friend-picker-summary");
-      let friends = parseJson(`friends-cache-${accountId}`);
+      let friends = parseJson(`friends-cache-${recordKey}`);
       const isGroupTarget = (value) => /^群聊[:：]/.test(String(value || "").trim());
-      let selected = new Set(parseJson(`selected-targets-${accountId}`).filter((target) => !isGroupTarget(target)));
+      let selected = new Set(parseJson(`selected-targets-${recordKey}`).filter((target) => !isGroupTarget(target)));
       let lastRender = "", searchTimer = null, visibleCount = 100;
       const more = pageControls(list);
       let finishCache = () => {};
@@ -344,11 +349,11 @@
     let refresh = null;
     const initialize = () => {
       if (refresh) return refresh;
-      const id = picker.dataset.accountId;
+      const recordKey = picker.dataset.recordKey || picker.dataset.accountId;
       const list = picker.querySelector(".group-picker-list");
       const editor = picker.closest(".group-target-editor");
-      const bindings = parseJson(`group-bindings-${id}`, {});
-      let groups = parseJson(`groups-cache-${id}`);
+      const bindings = parseJson(`group-bindings-${recordKey}`, {});
+      let groups = parseJson(`groups-cache-${recordKey}`);
       const selected = new Set(Object.values(bindings).map(String));
       const names = new Map(Object.entries(bindings).map(([target, conversationId]) => [String(conversationId), target.replace(/^群聊[:：]/, "")]));
       const search = document.createElement("input");

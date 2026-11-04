@@ -466,7 +466,8 @@ class WebUiSafetyTests(unittest.TestCase):
         page = (Path(app_module.TEMPLATES_DIR) / "login_workspace.html").read_text(encoding="utf-8")
         self.assertIn("data-login-qr", page)
         self.assertIn("data-refresh-login-qr", page)
-        self.assertIn("/login-desktop/qr", page)
+        self.assertIn('data-open-login-qr hidden', page)
+        self.assertNotIn('href="/login-desktop/qr"', page)
 
     def test_login_workspace_loads_inside_dashboard_frame(self):
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")

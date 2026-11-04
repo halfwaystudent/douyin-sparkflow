@@ -107,6 +107,10 @@ class WorkspaceLifecycleBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.page.evaluate("changeVisibility('hidden')")
 
     async def test_idle_and_active_status_checks_are_bounded_and_queue_is_faster(self):
+        # Freeze wall-clock drift while advancing the synthetic scheduler.
+        # Otherwise host/renderer load can push the third 4s poll a few ms
+        # beyond run_for(12050), even though the production interval is right.
+        await self.page.clock.pause_at(await self.page.evaluate("Date.now() + 100"))
         await self.app()
         await self.page.clock.run_for(60050)
         self.assertEqual(3, len(await self.calls("/workspace-status")))

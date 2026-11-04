@@ -19,7 +19,14 @@ class PersonalDispatcher:
             if code is None:
                 renew_claim(self.job)
                 return
-            finish_claim(self.job, busy=code == 75)
+            if code == 75:
+                finish_claim(self.job, busy=True)
+            elif code == 0:
+                finish_claim(self.job)
+            else:
+                # A child existed, so it may have submitted work before failing.
+                # Never turn this into an automatic second send.
+                finish_claim(self.job, outcome="unknown")
             self.process = self.job = None
         job = claim_due()
         if not job:
@@ -36,5 +43,6 @@ class PersonalDispatcher:
             self.process = subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent.parent), env=environment)
             self.job = job
         except OSError:
-            finish_claim(job, busy=True)
+            # Popen did not return, so no child could have sent anything.
+            finish_claim(job, outcome="failed")
             raise

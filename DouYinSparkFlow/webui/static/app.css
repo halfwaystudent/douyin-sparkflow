@@ -416,6 +416,15 @@ input::placeholder, textarea::placeholder { color: var(--ink-3); }
 .check { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; color: var(--ink); min-height: 32px; }
 .check input { width: 18px; height: 18px; accent-color: var(--flame); flex: none; margin: 0; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+/* Native time pickers keep their behavior, but use the same shell as text fields. */
+.personal-schedule-grid { align-items: start; }
+.personal-schedule-grid .field { align-content: start; }
+.personal-schedule-grid input[type="time"] {
+  appearance: none; -webkit-appearance: none;
+  display: block; min-width: 0; max-width: 100%; text-align: left;
+}
+.personal-schedule-grid input[type="time"]::-webkit-date-and-time-value { min-width: 0; text-align: left; }
+.personal-schedule-grid input[type="time"]::-webkit-datetime-edit { padding: 0; }
 .detail-filters { display: grid; grid-template-columns: minmax(140px, .7fr) minmax(160px, 1fr) minmax(180px, 1.3fr) auto; gap: 10px; align-items: end; margin: 0 0 14px; padding: 14px; border-radius: var(--radius-sm); background: var(--surface-sunk); }
 .form-stack { display: grid; gap: 16px; }
 .form-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }

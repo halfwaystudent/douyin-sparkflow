@@ -930,6 +930,8 @@ class PageIdentityTests(unittest.TestCase):
 
     def test_www_fallback_derives_no_account_id_from_cookies(self):
         class Page:
+            url = login_desktop_server.REMOTE_LOGIN_URL
+
             async def goto(self, *_args, **_kwargs):
                 return None
 
@@ -943,11 +945,64 @@ class PageIdentityTests(unittest.TestCase):
         with patch.object(
             login_desktop_server,
             "collect_www_identity_from_page",
-            new=AsyncMock(return_value={"candidates": [{"text": "火花号"}]}),
+            new=AsyncMock(return_value={"url": login_desktop_server.WWW_SELF_URL, "candidates": [{"text": "火花号"}]}),
         ):
             result = asyncio.run(login_desktop_server.collect_www_login_result(Page(), Context()))
         self.assertEqual("", result["unique_id"])
+        self.assertEqual("火花号", result["username"])
         self.assertNotIn("fragment123", json.dumps({k: v for k, v in result.items() if k != "cookies"}))
+
+    def test_www_fallback_does_not_use_creator_title_as_nickname(self):
+        class Page:
+            url = login_desktop_server.WWW_SELF_URL
+
+            async def goto(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+        class Context:
+            async def cookies(self):
+                return cookies()
+
+        with patch.object(
+            login_desktop_server,
+            "collect_www_identity_from_page",
+            new=AsyncMock(return_value={
+                "url": login_desktop_server.WWW_SELF_URL,
+                "candidates": [{"text": "抖音创作者中心", "source": "document-title"}],
+            }),
+        ):
+            result = asyncio.run(login_desktop_server.collect_www_login_result(Page(), Context()))
+
+        self.assertEqual("抖音官网账号", result["username"])
+
+    def test_www_fallback_does_not_use_a_title_from_an_unrelated_page(self):
+        class Page:
+            url = "https://example.invalid/account"
+
+            async def goto(self, *_args, **_kwargs):
+                raise RuntimeError("navigation left the existing page open")
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                raise AssertionError("must not wait after a failed navigation")
+
+        class Context:
+            async def cookies(self):
+                return cookies()
+
+        with patch.object(
+            login_desktop_server,
+            "collect_www_identity_from_page",
+            new=AsyncMock(return_value={
+                "url": Page.url,
+                "candidates": [{"text": "Account Settings", "source": "document-title"}],
+            }),
+        ):
+            result = asyncio.run(login_desktop_server.collect_www_login_result(Page(), Context()))
+
+        self.assertEqual("抖音官网账号", result["username"])
 
 
 class TemplateIdentityTests(unittest.TestCase):

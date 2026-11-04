@@ -65,6 +65,73 @@ class PickerCacheApiTests(unittest.TestCase):
                     self.assertEqual(409, self.get(**changes).status_code)
             projection.assert_not_called()
 
+    def test_duplicate_unique_id_selects_the_owned_record_by_ref_and_rejects_mismatch_or_stale_generation(self):
+        def duplicate(accounts):
+            accounts.append({
+                "account_ref": "a3",
+                "unique_id": "111",
+                "username": "Alice second record",
+                "cookies": [],
+                "targets": ["second saved target", "second saved target"],
+                "friends_cache": ["second private friend"],
+                "login_generation": "generation-a3",
+            })
+        config.update_user_data(duplicate, force_reload=True)
+        people = users.get_web_users()
+        alice_user = next(person for person in people if person["username"] == "alice")
+        alice_user["account_refs"] = ["a3"]
+        users.save_web_users(people)
+        alice = self.fixture.login()
+
+        response = self.get(client=alice, ref="a3", generation="generation-a3")
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(["second private friend"], response.json()["friends"])
+
+        for ref, generation, status in (("a1", "generation-a1", 403), ("a3", "expired", 409)):
+            with self.subTest(ref=ref, generation=generation):
+                denied = self.get(client=alice, ref=ref, generation=generation)
+                self.assertEqual(status, denied.status_code)
+                self.assertNotIn("second private friend", denied.text)
+
+    def test_duplicate_unique_id_form_round_trip_saves_the_selected_record(self):
+        def duplicate(accounts):
+            accounts.append({
+                "account_ref": "a3",
+                "unique_id": "111",
+                "username": "Alice second record",
+                "cookies": [],
+                "targets": ["old"],
+                "login_generation": "generation-a3",
+            })
+        config.update_user_data(duplicate, force_reload=True)
+        people = users.get_web_users()
+        alice_user = next(person for person in people if person["username"] == "alice")
+        alice_user["account_refs"] = ["a3"]
+        users.save_web_users(people)
+        alice = self.fixture.login()
+        page = alice.get("/accounts")
+        self.assertIn('name="account_ref" value="a3"', page.text)
+        self.assertIn('name="login_generation" value="generation-a3"', page.text)
+        record = next(account for account in config.get_userData(force_reload=True) if account["account_ref"] == "a3")
+        response = alice.post(
+            "/accounts/111/update",
+            data={
+                "csrf_token": self.fixture.token(alice),
+                "account_ref": "a3",
+                "login_generation": "generation-a3",
+                "edit_revision": app_module.account_edit_revision(record),
+                "username": "updated second record",
+                "targets": "second target",
+                "enabled": "on",
+            },
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        stored = {account["account_ref"]: account for account in config.get_userData(force_reload=True)}
+        self.assertEqual("updated second record", stored["a3"]["username"])
+        self.assertEqual(["second target"], stored["a3"]["targets"])
+        self.assertEqual("Alice account", stored["a1"]["username"])
+
     def race(self, mutation):
         def projected(account):
             result = picker_cache(account)

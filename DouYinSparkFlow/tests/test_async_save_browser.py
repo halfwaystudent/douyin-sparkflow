@@ -58,7 +58,7 @@ class AsyncSaveBrowserTests(unittest.IsolatedAsyncioTestCase):
         posts = await self.posts()
         self.assertEqual('1', posts[0]['asyncSave'])
         self.assertRegex(posts[0]['requestId'], r'^[a-f0-9]{32}$')
-        self.assertEqual('/accounts?_anchor=account-111', await self.page.locator('[data-binding-next]').get_attribute('href'))
+        self.assertEqual('/accounts?_anchor=account-a1', await self.page.locator('[data-binding-next]').get_attribute('href'))
         self.assertTrue(await self.page.locator('[data-recheck-login-save]').is_hidden())
         checks = await self.fixture.calls('/login-desktop/save/status?')
         self.assertTrue(all('operation_id='+posts[0]['requestId'] in event['url'] for event in checks))
@@ -198,6 +198,8 @@ class AsyncSaveBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(await self.posts()))
 
     async def test_status_timeout_is_bounded_and_manual_recheck_can_finish(self):
+        # Keep deliberate run_for advances independent from driver wall time.
+        await self.page.clock.pause_at(await self.page.evaluate("Date.now() + 100"))
         await self.page.evaluate("pending['/login-desktop/save/status?']=[]")
         await self.save()
         await self.page.clock.run_for(11999)

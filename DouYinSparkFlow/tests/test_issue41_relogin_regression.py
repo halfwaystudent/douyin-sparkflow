@@ -119,7 +119,15 @@ class Issue41ReloginRegressionTests(unittest.TestCase):
     def _relogin(self, exported, uid_for_cookie):
         """Save a scan re-login into acc-1, as the operator's re-login button does."""
         row = next(item for item in self._rows() if item["account_ref"] == "acc-1")
-        active = {"mode": "relogin", "account_ref": "acc-1", "ticket": "t1", "username": "admin", "session_id": "s-1"}
+        generation = str(row.get("login_generation", ""))
+        active = {
+            "mode": "relogin",
+            "account_ref": row["account_ref"],
+            "login_generation": generation,
+            "ticket": "t1",
+            "username": "admin",
+            "session_id": "s-1",
+        }
         opener = _FakeOpener(uid_for_cookie)
         with (
             patch.object(app_module, "current_user", return_value="admin"),
@@ -135,7 +143,13 @@ class Issue41ReloginRegressionTests(unittest.TestCase):
         ):
             response = self.client.post(
                 "/login-desktop/save",
-                data={"csrf_token": "t", "relogin_unique_id": row["unique_id"]},
+                data={
+                    "csrf_token": "t",
+                    "ticket": "t1",
+                    "relogin_unique_id": row["unique_id"],
+                    "relogin_account_ref": row["account_ref"],
+                    "login_generation": generation,
+                },
             )
         return response
 

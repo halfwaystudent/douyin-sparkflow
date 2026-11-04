@@ -103,7 +103,7 @@ def binding_progress(account):
         check.update(state="login_required", category=str(health.get("category") or "login_required"), reason=str(health.get("reason") or check.get("reason") or "账号需要重新登录"))
     elif not check.get("state"):
         check["state"] = "unverified" if account.get("pending_login_verification") or state != "verified" else "verified"
-    key = quote(str(account.get("unique_id") or ""), safe="")
+    key = quote(str(account.get("account_ref") or account.get("unique_id") or ""), safe="")
     return {
         "account_ref": str(account.get("account_ref") or ""),
         "unique_id": str(account.get("unique_id") or ""),

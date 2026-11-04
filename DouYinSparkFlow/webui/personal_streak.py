@@ -17,13 +17,16 @@ def schedule_for(principal):
         profile = personal_streak.preferences(principal)
     except ValueError:
         return None
-    if principal.get("role") == "admin" and not profile.get("messages"):
+    # Empty messages with a revision are an explicit choice to inherit global
+    # templates.  Old saved literal profiles may predate revisions, so retain
+    # their existing overview card too.
+    if not (profile.get("revision") or profile.get("messages")):
         return None
     enabled = bool(profile.get("enabled"))
     timestamp = profile.get("next_run_at") if enabled else ""
     display = datetime.fromisoformat(timestamp).astimezone(ZoneInfo(profile["timezone"])).strftime("%m-%d %H:%M") if timestamp else ""
     return {
-        "personal": True, "enabled": enabled, "label": f"每天 {profile['time']} · {profile['timezone']}" if profile.get("messages") else "尚未设置",
+        "personal": True, "enabled": enabled, "label": f"每天 {profile['time']}–{profile['end_time']} · {profile['timezone']}",
         "nextTriggerAt": timestamp or "", "nextTriggerDisplay": display or "自动发送已暂停", "hasWorkNextTrigger": enabled,
     }
 
@@ -63,12 +66,14 @@ def register_routes(app, *, principal, csrf_valid, render, flash):
             return JSONResponse({"error": "页面已更新，请刷新后重试"}, status_code=403)
         asynchronous = request.headers.get("x-requested-with") == "XMLHttpRequest"
         messages = [line.strip() for line in str(form.get("messages", "")).splitlines() if line.strip()]
+        entered_end = "24:00" if form.get("end_midnight") == "on" else form.get("end_time")
         try:
-            if os.getenv("SPARKFLOW_SHARED_MODE", "").lower() in {"1", "true", "yes", "on"} and "edit_revision" not in form:
+            if "edit_revision" not in form:
                 raise personal_streak.PreferenceConflict("页面版本已更新。输入已保留，请先重新打开设置页核对。")
             saved = await asyncio.to_thread(with_current_session, request, current, lambda live: personal_streak.save_preferences(
                 live, enabled=form.get("enabled") == "on",
-                at_time=str(form.get("time", "")), timezone_name=str(form.get("timezone", "")), messages=messages,
+                at_time=str(form.get("time", "")), end_time=entered_end,
+                timezone_name=str(form.get("timezone", "")), messages=messages,
                 expected_revision=str(form.get("edit_revision", "")) if "edit_revision" in form else None,
             ))
         except PermissionError as exc:
@@ -78,7 +83,7 @@ def register_routes(app, *, principal, csrf_valid, render, flash):
         except ValueError as exc:
             if asynchronous:
                 return JSONResponse({"ok": False, "error": str(exc), "category": "edit_conflict" if isinstance(exc, personal_streak.PreferenceConflict) else "validation"}, status_code=409 if isinstance(exc, personal_streak.PreferenceConflict) else 400)
-            entered = {"enabled": form.get("enabled") == "on", "time": str(form.get("time", ""))[:5], "timezone": str(form.get("timezone", ""))[:64], "messages": messages[:20], "revision": str(form.get("edit_revision", ""))}
+            entered = {"enabled": form.get("enabled") == "on", "time": str(form.get("time", ""))[:5], "end_time": str(entered_end or "24:00")[:5], "timezone": str(form.get("timezone", ""))[:64], "messages": messages[:20], "revision": str(form.get("edit_revision", ""))}
             return render(request, "personal_streak.html", {**context(entered), "flash": {"message": str(exc), "level": "error"}, "edit_conflict": isinstance(exc, personal_streak.PreferenceConflict), "unsaved_input": True}, status_code=409 if isinstance(exc, personal_streak.PreferenceConflict) else 400)
         if asynchronous:
             return JSONResponse({"ok": True, "message": "你的续火花设置已保存。", "edit_revision": saved.get("revision", ""), "next_run_display": context(saved)["next_personal_run"], "automatic_enabled": bool(saved.get("enabled"))})

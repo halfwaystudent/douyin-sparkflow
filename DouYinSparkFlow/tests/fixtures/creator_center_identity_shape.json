@@ -1,0 +1,781 @@
+{
+ "source": "creator center chat, one read-only inspection 2026-11-01",
+ "note": "sanitized structure only: class suffixes and ids replaced; no account data",
+ "before": {
+  "activeRows": [],
+  "headers": [],
+  "inputs": [],
+  "sampleRows": [
+   {
+    "tag": "LI",
+    "classes": "semi-list-item",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   },
+   {
+    "tag": "LI",
+    "classes": "semi-list-item",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   },
+   {
+    "tag": "LI",
+    "classes": "semi-list-item",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   }
+  ]
+ },
+ "after": {
+  "activeRows": [
+   {
+    "tag": "LI",
+    "classes": "semi-list-item active-<suffix>",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   }
+  ],
+  "headers": [
+   {
+    "tag": "DIV",
+    "classes": "box-header-<suffix>",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "object",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "object",
+      "paths": [
+       "value.conversation.id",
+       "value.conversation.secUid",
+       "value.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 7,
+      "type": "L",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "v",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "component",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "object",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "Router",
+      "paths": []
+     }
+    ]
+   },
+   {
+    "tag": "DIV",
+    "classes": "box-header-tail-<suffix>",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 2,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "object",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "object",
+      "paths": [
+       "value.conversation.id",
+       "value.conversation.secUid",
+       "value.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 8,
+      "type": "L",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "v",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "component",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   }
+  ],
+  "inputs": [
+   {
+    "tag": "DIV",
+    "classes": "chat-input-<suffix>",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 2,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "object",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "object",
+      "paths": [
+       "value.conversation.id",
+       "value.conversation.secUid",
+       "value.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 10,
+      "type": "L",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "v",
+      "paths": []
+     }
+    ]
+   }
+  ],
+  "sampleRows": [
+   {
+    "tag": "LI",
+    "classes": "semi-list-item",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   },
+   {
+    "tag": "LI",
+    "classes": "semi-list-item",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   },
+   {
+    "tag": "LI",
+    "classes": "semi-list-item active-<suffix>",
+    "attrs": [],
+    "fiber": [
+     {
+      "depth": 0,
+      "type": "li",
+      "paths": []
+     },
+     {
+      "depth": 1,
+      "type": "Hh",
+      "paths": [
+       "header.props.conversation.id",
+       "header.props.conversation.secUid",
+       "header.props.conversation.shortId"
+      ]
+     },
+     {
+      "depth": 2,
+      "type": "function",
+      "paths": []
+     },
+     {
+      "depth": 3,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 4,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 5,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 6,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 7,
+      "type": "t",
+      "paths": []
+     },
+     {
+      "depth": 8,
+      "type": "ul",
+      "paths": []
+     },
+     {
+      "depth": 9,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 10,
+      "type": "div",
+      "paths": []
+     },
+     {
+      "depth": 11,
+      "type": "Ms",
+      "paths": []
+     },
+     {
+      "depth": 12,
+      "type": "object",
+      "paths": []
+     }
+    ]
+   }
+  ]
+ }
+}

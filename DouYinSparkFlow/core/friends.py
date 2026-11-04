@@ -36,6 +36,7 @@ CATEGORY_NETWORK_UNAVAILABLE = "network_unavailable"
 CATEGORY_STRUCTURE_CHANGED = "structure_changed"
 CATEGORY_EMPTY_RESULT = "empty_result"
 CATEGORY_INCOMPLETE_SCAN = "incomplete_scan"
+CATEGORY_BROWSER_CLEANUP_BLOCKED = "browser_cleanup_blocked"
 
 CATEGORY_LABELS = {
     CATEGORY_LOGIN_REQUIRED: "登录失效",
@@ -163,6 +164,89 @@ SCROLL_SETTLE_SECONDS = 1.5
 UID_DRAIN_TIMEOUT_SECONDS = 5
 
 
+def browser_account_cleanup_blocked(account):
+    """Whether a prior browser reader still owns this account's profile lock."""
+    # tasks owns the fail-closed registry.  This lazy import avoids importing the
+    # sender while module initialization is still resolving its browser helpers.
+    from core import tasks
+
+    return bool(account.get("browser_cleanup_blocked")) or (
+        account_profile_name(account) in tasks._BLOCKED_BROWSER_LOCKS
+    )
+
+
+def retain_browser_account_lock_for_cleanup(account, lock_handle, lock_path, lock_token, account_name):
+    """Fail closed when a passive response reader did not acknowledge exit."""
+    from datetime import datetime, timezone
+
+    from core import tasks
+
+    lock_key = account_profile_name(account)
+    tasks._BLOCKED_BROWSER_LOCKS[lock_key] = (lock_handle, lock_path, lock_token)
+    tasks._persist_account_send_failure(
+        account,
+        CATEGORY_BROWSER_CLEANUP_BLOCKED,
+        "browser cleanup not proven complete",
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        list(account.get("targets") or []),
+    )
+
+
+async def close_uid_collectors(*collectors):
+    """Detach and bound-close collectors without losing cancellation cleanup.
+
+    ``False`` means a reader remains alive and its account lock must stay held.
+    Callers still close every browser handle and re-raise cancellation afterward.
+    """
+    complete = True
+    cancelled = False
+    for collector in collectors:
+        if collector is None:
+            continue
+        try:
+            from core import tasks
+            for reader in collector.pending_tasks():
+                tasks._track_browser_operation(reader)
+            closed = await collector.aclose()
+            if not closed:
+                complete = False
+        except asyncio.CancelledError:
+            cancelled = True
+            complete = False
+        except Exception:
+            logger.debug("Failed to close uid collector", exc_info=True)
+            complete = False
+        try:
+            if collector.pending_tasks():
+                complete = False
+        except Exception:
+            complete = False
+    return complete, cancelled
+
+
+async def _close_friend_refresh_resources(page, context, browser, playwright):
+    """Return (complete, cancelled) after attempting every owned close."""
+    complete = True
+    cancelled = False
+    for resource, method, label in (
+        (page, "close", "page"),
+        (context, "close", "context"),
+        (browser, "close", "browser"),
+        (playwright, "stop", "Playwright"),
+    ):
+        if resource is None:
+            continue
+        try:
+            await getattr(resource, method)()
+        except asyncio.CancelledError:
+            complete = False
+            cancelled = True
+        except Exception:
+            complete = False
+            logger.debug("Failed to close friend refresh %s", label, exc_info=True)
+    return complete, cancelled
+
+
 def update_collection_progress(new_names_count, no_more_visible, scroll_moved, idle_rounds, stuck_rounds, idle_limit=5, stuck_limit=2):
     next_idle_rounds = 0 if new_names_count > 0 else idle_rounds + 1
     next_stuck_rounds = 0 if scroll_moved else stuck_rounds + 1
@@ -186,26 +270,13 @@ async def _ensure_logged_in(page):
 
 
 async def _dismiss_non_login_dialogs(page):
-    for text in NON_LOGIN_DIALOG_DISMISS_TEXTS:
-        try:
-            locator = page.get_by_text(text, exact=False).first
-            if await locator.count() > 0 and await locator.is_visible():
-                await locator.click(timeout=3000)
-                await asyncio.sleep(1)
-                return True
-        except Exception:
-            continue
-
-    for selector in NON_LOGIN_DIALOG_CLOSE_SELECTORS:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count() > 0 and await locator.is_visible():
-                await locator.click(timeout=3000)
-                await asyncio.sleep(1)
-                return True
-        except Exception:
-            continue
-    return False
+    # Share the sender's scoped, fail-closed policy. Never click page-wide text
+    # that could be a chat message rather than an actual dialog control.
+    from core.tasks import BrowserDialogBlocked, _dismiss_non_login_dialogs as inspect_dialogs
+    try:
+        return bool(await inspect_dialogs(page, "friend-refresh", "friend_list"))
+    except BrowserDialogBlocked as exc:
+        raise FriendRefreshError(str(exc), category=exc.category) from exc
 
 
 async def _click_friends_tab(page):
@@ -443,37 +514,50 @@ async def _fetch_account_friends_once(
     playwright = browser = context = page = None
     lock_handle = lock_path = lock_token = None
     uid_collector = None
+    cookie_session = None
+    from core import tasks
+
+    cookie_operations = set()
+    cookie_owner_token = tasks._BROWSER_OPERATION_OWNER.set(cookie_operations)
     try:
+        if browser_account_cleanup_blocked(account):
+            raise FriendRefreshError(
+                "浏览器清理尚未确认完成，账号已暂停刷新",
+                category=CATEGORY_BROWSER_CLEANUP_BLOCKED,
+            )
         # Reuse the account's persistent profile so the read drives the same
         # browser identity as the sender instead of a throwaway cookie context.
-        # The per-account lock is the same one the sender takes, so a send run
-        # that starts mid-refresh waits instead of fighting over the profile.
+        # A pasted-cookie verification is intentionally isolated from that
+        # profile, but it still holds the same account lock until all readers
+        # and browser resources have acknowledged cleanup.
         fresh_login = auth_only and account.get("_fresh_login_verification") is True
         if fresh_login:
             profile_config = {"enabled": False}
         else:
-            profile_config = normalize_persistent_profile_config(get_config(force_reload=True) or {})
-        if profile_config["enabled"]:
-            lock_handle, lock_path, lock_token = await acquire_browser_account_lock(
-                account, account_name
+            profile_config = normalize_persistent_profile_config(
+                get_config(force_reload=True) or {}
             )
+        # Non-persistent contexts can still leave a response-body task reading
+        # from this account. They use the same lock as profiles so a second
+        # refresh never starts an unlocked browser while cleanup is uncertain.
+        lock_handle, lock_path, lock_token = await acquire_browser_account_lock(
+            account, account_name
+        )
+        if profile_config["enabled"]:
             playwright, context, _profile_dir = await get_persistent_browser_context(
                 account_profile_name(account),
                 root=profile_config["root"],
                 network_mode=network_mode,
             )
-            # Mirror the sender's cookie policy instead of always overwriting
-            # whatever session the profile already holds.
-            if profile_config["syncStoredCookiesBeforeRun"]:
-                await context.add_cookies(cookies)
-            elif profile_config["seedCookiesWhenEmpty"]:
-                current = await context.cookies(
-                    ["https://creator.douyin.com/", "https://www.douyin.com/"]
-                )
-                if not any(
-                    cookie.get("name") in AUTH_COOKIE_NAMES for cookie in current
-                ):
-                    await context.add_cookies(cookies)
+            # The profile helper owns generation-aware adoption/import. Do not
+            # overwrite a normal persistent session with this call's stale row.
+            from core.profile_cookies import prepare_profile_cookies
+            from core.tasks import _run_browser_stage
+
+            cookie_session = await _run_browser_stage(
+                "seed_cookies",
+                prepare_profile_cookies(context, account, profile_config, _profile_dir),
+            )
         else:
             playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
             if fresh_login:
@@ -611,7 +695,7 @@ async def _fetch_account_friends_once(
 
         # Listen (never request) for the page's own friend-profile responses so
         # the read also learns each friend's uid.
-        uid_collector = UserDetailCollector(account_name).attach(page)
+        uid_collector = UserDetailCollector(account_name, purpose="refresh").attach(page)
         await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
         await asyncio.sleep(1)
 
@@ -629,41 +713,41 @@ async def _fetch_account_friends_once(
             len(friends.uid_entries),
             friends.uid_summary.get("errors") or "-",
         )
+        # A list read does not prove the current account UID. Preserve browser
+        # rotations in the profile, but do not publish this unverified snapshot.
         return friends
     except RuntimeError:
         raise
     except Exception as exc:
         raise RuntimeError(f"刷新好友列表失败，请重试：{exc}") from exc
     finally:
-        if uid_collector is not None:
-            uid_collector.detach()
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                logger.debug("Failed to close friend refresh page", exc_info=True)
-        if context:
-            try:
-                await context.close()
-            except Exception:
-                logger.debug("Failed to close friend refresh context", exc_info=True)
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                logger.debug("Failed to close friend refresh browser", exc_info=True)
-        if playwright:
-            try:
-                await playwright.stop()
-            except Exception:
-                logger.debug("Failed to stop friend refresh Playwright", exc_info=True)
-        if lock_handle is not None:
-            try:
-                release_browser_account_lock(
-                    lock_handle, lock_path, lock_token, account_name
+        try:
+            collector_complete, collector_cancelled = await close_uid_collectors(uid_collector)
+            resources_complete, resource_cancelled = await _close_friend_refresh_resources(
+                page, context, browser, playwright
+            )
+            pending_cookie_operations = any(not task.done() for task in cookie_operations)
+            if lock_handle is not None:
+                if collector_complete and resources_complete and not resource_cancelled and not pending_cookie_operations:
+                    try:
+                        release_browser_account_lock(
+                            lock_handle, lock_path, lock_token, account_name
+                        )
+                    except Exception:
+                        logger.debug("Failed to release friend refresh account lock", exc_info=True)
+                else:
+                    retain_browser_account_lock_for_cleanup(
+                        account, lock_handle, lock_path, lock_token, account_name
+                    )
+            if collector_cancelled or resource_cancelled:
+                raise asyncio.CancelledError
+            if not collector_complete:
+                raise FriendRefreshError(
+                    "浏览器 UID 读取器未停止，账号已暂停刷新",
+                    category=CATEGORY_BROWSER_CLEANUP_BLOCKED,
                 )
-            except Exception:
-                logger.debug("Failed to release friend refresh account lock", exc_info=True)
+        finally:
+            tasks._BROWSER_OPERATION_OWNER.reset(cookie_owner_token)
 
 
 async def verify_account_session(account, *, auth_only=False, network_mode=None):
@@ -692,7 +776,7 @@ async def verify_account_session(account, *, auth_only=False, network_mode=None)
                 auth_only=auth_only,
             )
         except FriendRefreshError as exc:
-            if exc.category == CATEGORY_LOGIN_REQUIRED:
+            if exc.category in {CATEGORY_LOGIN_REQUIRED, CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
                 raise
             if exc.category == CATEGORY_STRUCTURE_CHANGED:
                 # The page loaded on the creator host but its DOM never rendered
@@ -880,7 +964,7 @@ async def fetch_account_friends(account, on_progress=None):
                 network_mode,
             )
         except FriendRefreshError as exc:
-            if exc.category == CATEGORY_LOGIN_REQUIRED:
+            if exc.category in {CATEGORY_LOGIN_REQUIRED, CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
                 raise
             last_error = exc
             logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)

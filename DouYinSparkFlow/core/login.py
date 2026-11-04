@@ -10,6 +10,7 @@ from core.identity import (
     BINDING_NEW,
     FIELD_DISPLAY_ID,
     FIELD_LOGIN_GENERATION,
+    FIELD_COOKIE_IMPORT_GENERATION,
     AccountChangedConcurrently,
     account_uid,
     accounts_bound_to,
@@ -237,6 +238,7 @@ def save_cli_login(identity, login_result, targets, *, expected_records=None):
             if display_id:
                 account[FIELD_DISPLAY_ID] = display_id
             account[FIELD_LOGIN_GENERATION] = login_generation
+            account[FIELD_COOKIE_IMPORT_GENERATION] = login_generation
             # A fresh login supersedes any background check queued for the old
             # cookies: drop the old token so a stale result cannot write a
             # conflict onto this login (issue #41 A7).
@@ -270,6 +272,7 @@ def save_cli_login(identity, login_result, targets, *, expected_records=None):
             account[FIELD_DISPLAY_ID] = display_id
         bind_identity(account, identity, BINDING_NEW)
         account[FIELD_LOGIN_GENERATION] = login_generation
+        account[FIELD_COOKIE_IMPORT_GENERATION] = login_generation
         accounts.append(account)
         return dict(account), True
 

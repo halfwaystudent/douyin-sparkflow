@@ -285,6 +285,32 @@ class LazyPickerBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(100, await self.page.locator(".friend-option").count())
         self.assertEqual(2, await self.page.evaluate("requests.length"))
 
+    async def test_duplicate_unique_id_record_keys_isolate_friend_selection(self):
+        await self.page.set_content('''
+          <details open id="first"><summary>first</summary><form id="first-form">
+            <div class="friend-picker" data-account-id="111" data-record-key="a1" data-refresh-url="/accounts/111/friends/refresh" data-csrf-token="fixture">
+              <button type="button" class="friend-refresh-button">刷新好友</button><p class="friend-picker-status"></p>
+              <input class="friend-search-input" type="search"><p class="friend-picker-summary"></p><div class="friend-picker-list"></div>
+              <script type="application/json" id="friends-cache-a1">["first friend"]</script>
+              <script type="application/json" id="selected-targets-a1">["first friend"]</script>
+            </div><textarea class="targets-textarea" name="targets">first friend</textarea>
+          </form></details>
+          <details open id="second"><summary>second</summary><form id="second-form">
+            <div class="friend-picker" data-account-id="111" data-record-key="a3" data-refresh-url="/accounts/111/friends/refresh" data-csrf-token="fixture">
+              <button type="button" class="friend-refresh-button">刷新好友</button><p class="friend-picker-status"></p>
+              <input class="friend-search-input" type="search"><p class="friend-picker-summary"></p><div class="friend-picker-list"></div>
+              <script type="application/json" id="friends-cache-a3">["second friend"]</script>
+              <script type="application/json" id="selected-targets-a3">["second friend"]</script>
+            </div><textarea class="targets-textarea" name="targets">second friend</textarea>
+          </form></details>''')
+        await self.page.add_script_tag(path=str(SCRIPT))
+        await self.page.wait_for_function("document.querySelectorAll('.friend-option').length === 2")
+        self.assertEqual("first friend", await self.page.locator("#first .friend-picker-list").inner_text())
+        self.assertEqual("second friend", await self.page.locator("#second .friend-picker-list").inner_text())
+        await self.page.locator("#second .friend-option input").uncheck()
+        self.assertEqual("first friend", await self.page.locator("#first-form .targets-textarea").input_value())
+        self.assertEqual("", await self.page.locator("#second-form .targets-textarea").input_value())
+
     async def test_batch_refresh_initializes_closed_accounts_and_posts_once_per_account(self):
         await self.load()
         await self.page.locator("[data-refresh-all-friends]").click()

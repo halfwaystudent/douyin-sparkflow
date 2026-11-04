@@ -70,6 +70,11 @@ CONFIRMATION_LABELS = {
 }
 
 FAILURE_CATEGORY_LABELS = {
+    "browser_dialog_blocked": "页面弹窗需人工检查，已停止自动操作",
+    "browser_stage_timeout": "页面阶段超时（整轮暂停）",
+    "friend_identity_mismatch": "聊天对象身份不一致，已停止发送",
+    "friend_identity_unavailable": "聊天对象身份无法确认，已停止发送",
+    "browser_cleanup_blocked": "浏览器清理未完成，需检查后恢复",
     "send_unconfirmed": "待核验",
     "login_required": "登录失效",
     "login_verification_pending": "登录态待核验",
@@ -680,7 +685,7 @@ def schedule_line_kind(line):
     """Classify a douyin task line as a windowed schedule or a single fixed run."""
     if is_patrol_schedule_line(line):
         return "patrol"
-    if "SPARKFLOW_FALLBACK_PHASE=1" in str(line or ""):
+    if "SPARKFLOW_FALLBACK_PHASE=1" in str(line or "") or "SPARKFLOW_8610_RETRY_ONLY=1" in str(line or ""):
         # The end-of-window fallback runs at one fixed minute but only exists
         # as part of a window schedule.
         return "window"
@@ -841,6 +846,9 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
             f"{schedule['minute']} {schedule['hour']} * * * "
             f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
         )
+
+    # Eligible refusals are handled by the normal planner and the same
+    # end-of-window fallback. Never add an extra send hour beyond user config.
 
     # One daily account patrol before the first scheduled send of the day.
     patrol_line = patrol_cron_line(schedule)
@@ -1287,9 +1295,12 @@ def _account_failure_pause_after_attempts():
 
 
 def _account_failure_pause_active(account_failure, now, pause_after):
-    if _coerce_attempt_count(account_failure) < pause_after:
-        return False
     category = str(account_failure.get("category") or "")
+    if category in {"browser_cleanup_blocked", "friend_identity_mismatch"}:
+        # Sending is unsafe or impossible until a human looks at the chat page.
+        return True
+    if category not in {"browser_stage_timeout", "browser_dialog_blocked"} and _coerce_attempt_count(account_failure) < pause_after:
+        return False
     if category not in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES:
         return True
     last_attempt_at = _parse_sent_at(
@@ -1334,6 +1345,9 @@ def _format_duration_seconds(seconds):
 
 
 def _account_failure_entry_today(account, now):
+    cleanup_block = dict(account.get("browser_cleanup_blocked") or {})
+    if cleanup_block:
+        return cleanup_block
     entry = dict(account.get("account_failure") or {})
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
     category = str(entry.get("category") or "")
@@ -1403,14 +1417,20 @@ def _account_blocked_target_status(account, item, account_failure, now):
             "status": "account_blocked",
             "category": category,
             "reason": str(account_failure.get("reason") or ""),
-            "attemptCount": _coerce_attempt_count(account_failure),
-            "lastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
+            # The account fault is not an attempt to this target. Keep the
+            # target ledger fields untouched and expose the batch separately.
+            "accountAttemptCount": _coerce_attempt_count(account_failure),
+            "accountLastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
             "accountFailureAffected": account_failure_affected,
             "cooldownRemainingSeconds": remaining,
             "skipReason": (
-                f"账号冷却中（{category_label}），剩余 {remaining_label} 后才会再尝试"
+                f"该目标未执行发送；账号冷却中（{category_label}），剩余 {remaining_label} 后才会再尝试"
                 if remaining_label
-                else f"账号异常（{category_label}），今天不再发送，明天恢复"
+                else (
+                    "该目标未执行发送；账号需要重新登录后才能恢复"
+                    if category in {"login_required", "browser_login_required", "protocol_login_required", "expired_cookies"}
+                    else f"该目标未执行发送；账号异常（{category_label}），需等待恢复或人工处理"
+                )
             ),
         }
     )
@@ -1577,9 +1597,49 @@ def _build_target_status(account, target_name, now, send_window):
         )
         return _finalize_target_status(item, now)
 
+    # The durable pre-Enter barrier intentionally has no message_history row:
+    # dispatch/receipt can be interrupted before delivery is known. Do not render
+    # that no-resend state as an ordinary pending target.
+    barrier_at = _parse_sent_at(state.get("sentAt"), now.tzinfo)
+    if (
+        state.get("status") == streak_state.STATE_SENT_UNVERIFIED
+        and state.get("lastEvidenceDetail") == "pre_enter_outcome_unknown_barrier"
+        and barrier_at and barrier_at.date() == now.date()
+    ):
+        item.update({
+            "status": "unconfirmed",
+            "lastAttemptAt": barrier_at.isoformat(timespec="seconds"),
+            "category": "send_unconfirmed",
+            "reason": "已建立发送保护记录，但是否实际发出尚未确认",
+            "attemptCount": int(state.get("attemptCount") or 0),
+            "confirmationLevel": "weak",
+            "confirmationSource": "pre_enter_outcome_unknown_barrier",
+            "confirmationDetail": "发送结果不明，不自动重发",
+            "needsVerification": True,
+            "skipReason": "可能已发出，不自动重发；请先核验发送结果",
+        })
+        return _finalize_target_status(item, now)
+
     failure_entry = streak_state.failure_entry(account, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"), now.tzinfo)
     failure_is_today = bool(last_attempt_at and last_attempt_at.date() == now.date())
+    state_attempt_at = _parse_sent_at(state.get("lastAttemptAt"), now.tzinfo)
+    if (
+        state.get("status") in streak_state.FAILED_STATES
+        and state_attempt_at and state_attempt_at.date() == now.date()
+        and (last_attempt_at != state_attempt_at
+             or failure_entry.get("category") != state.get("lastErrorCategory"))
+    ):
+        # A lost/stale queue row must not turn a known failed attempt into a
+        # normal pending target. Never manufacture receipt evidence to retry.
+        item.update({
+            "status": "failed",
+            "lastAttemptAt": state_attempt_at.isoformat(timespec="seconds"),
+            "category": str(state.get("lastErrorCategory") or ""),
+            "reason": "失败记录不一致，自动补试受阻；" + str(state.get("lastErrorReason") or ""),
+            "attemptCount": int(state.get("attemptCount") or 0),
+        })
+        return _finalize_target_status(item, now)
 
     if sent_at and sent_at.date() == now.date():
         confirmation_level = str(history_entry.get("confirmationLevel") or "legacy")
@@ -2188,6 +2248,12 @@ def get_host_status_snapshot():
     if not _host_status_lock.acquire(blocking=False):
         raise HostStatusBusy("host status probe is already running")
     try:
+        snapshot_file = os.getenv("SPARKFLOW_HOST_STATUS_FILE", "")
+        if snapshot_file:
+            # Read freshness on every request; a cached green status must not
+            # conceal a stopped host-side collector. Never fall back to Docker.
+            from utils.service_status import read_host_status_snapshot
+            return read_host_status_snapshot(snapshot_file)
         if _host_status_cache is not None and time.monotonic() - _host_status_cache[0] < 5:
             return deepcopy(_host_status_cache[1])
         visible = {"douyin-web", "douyin-scheduler", "login-desktop", "mihomo"}

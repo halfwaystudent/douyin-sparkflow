@@ -16,8 +16,8 @@ class BindingWorkspaceBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.page.set_content('''<section id="interactive-login-section">
           <div id="login-desktop-controls" data-csrf-token="fixture" data-display-mode="novnc"></div>
           <p id="login-desktop-status-text"></p><span id="login-desktop-runtime-state"></span>
-          <button class="login-desktop-open" data-relogin-unique-id="111">重新登录</button>
-          <button class="login-desktop-save" data-relogin-unique-id="111">保存</button>
+          <button class="login-desktop-open" data-relogin-unique-id="111" data-relogin-account-ref="a3" data-login-generation="gen-a3">重新登录</button>
+          <button class="login-desktop-save" data-relogin-unique-id="111" data-relogin-account-ref="a3" data-login-generation="gen-a3">保存</button>
           <button class="login-desktop-close">关闭</button>
           <button data-recover-login-workspace>重新检查</button>
           </section><section data-binding-result hidden><h2 data-binding-result-title></h2>
@@ -71,14 +71,18 @@ class BindingWorkspaceBrowserTests(unittest.IsolatedAsyncioTestCase):
         fields = await self.page.evaluate("requests.find(item=>item.url.endsWith('/open')).fields")
         self.assertEqual("relogin", fields["mode"])
         self.assertEqual("111", fields["relogin_unique_id"])
+        self.assertEqual("a3", fields["relogin_account_ref"])
+        self.assertEqual("gen-a3", fields["login_generation"])
 
     async def test_save_uses_original_ticket_and_keeps_the_next_step_visible(self):
         await self.page.locator(".login-desktop-save").click()
         await self.page.wait_for_function("!document.querySelector('[data-binding-result]').hidden")
         fields = await self.page.evaluate("requests.find(item=>item.url.endsWith('/save')).fields")
         self.assertEqual("ticket-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fields["ticket"])
+        self.assertEqual("a3", fields["relogin_account_ref"])
+        self.assertEqual("gen-a3", fields["login_generation"])
         self.assertIn("登录待确认", await self.page.locator("[data-binding-result-title]").inner_text())
-        self.assertIn("account-111", await self.page.locator("[data-binding-next]").get_attribute("href"))
+        self.assertIn("account-a1", await self.page.locator("[data-binding-next]").get_attribute("href"))
         self.assertTrue(await self.page.locator(".login-desktop-save").is_disabled())
 
     async def test_uncertain_save_result_requires_review_before_resubmitting(self):
@@ -118,4 +122,4 @@ class BindingWorkspaceBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(saves))
         self.assertEqual([original_ticket, original_ticket], [item["ticket"] for item in saves])
         self.assertNotEqual(saves[0]["request_id"], saves[1]["request_id"])
-        self.assertIn("account-111", await self.page.locator("[data-binding-next]").get_attribute("href"))
+        self.assertIn("account-a1", await self.page.locator("[data-binding-next]").get_attribute("href"))

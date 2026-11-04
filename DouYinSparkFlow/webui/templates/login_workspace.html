@@ -10,10 +10,10 @@
 
 {% block topbar_actions %}
 {% if relogin_account %}
-<button class="button button-primary login-desktop-open" type="button" data-relogin-unique-id="{{ relogin_account.unique_id }}" data-account-name="{{ relogin_account.username }}">
+<button class="button button-primary login-desktop-open" type="button" data-relogin-unique-id="{{ relogin_account.unique_id }}" data-relogin-account-ref="{{ relogin_account.account_ref }}" data-login-generation="{{ relogin_account.login_generation|default('') }}" data-account-name="{{ relogin_account.username }}">
   <i data-lucide="scan-qr-code"></i><span>打开登录工作区</span>
 </button>
-<button class="button button-soft login-desktop-save" type="button" data-relogin-unique-id="{{ relogin_account.unique_id }}" data-account-name="{{ relogin_account.username }}">
+<button class="button button-soft login-desktop-save" type="button" data-relogin-unique-id="{{ relogin_account.unique_id }}" data-relogin-account-ref="{{ relogin_account.account_ref }}" data-login-generation="{{ relogin_account.login_generation|default('') }}" data-account-name="{{ relogin_account.username }}">
   <i data-lucide="save"></i><span>保存登录态</span>
 </button>
 {% else %}
@@ -72,7 +72,7 @@
         <button class="button button-quiet button-sm" type="button" data-recover-login-workspace hidden>
           <i data-lucide="rotate-cw"></i><span>重新检查工作区</span>
         </button>
-        <a class="button button-ghost button-sm" href="/login-desktop/qr" target="_blank" rel="noopener">
+        <a class="button button-ghost button-sm" data-open-login-qr hidden target="_blank" rel="noopener noreferrer">
           <i data-lucide="maximize-2"></i><span>单独打开</span>
         </a>
       </div>
@@ -142,7 +142,7 @@
           <span>要覆盖的账号</span>
           <select data-cookie-relogin-select>
             {% for account in accounts %}
-            <option value="{{ account.unique_id }}" {% if relogin_account and account.unique_id == relogin_account.unique_id %}selected{% endif %}>{{ account.username }}{% if account.unique_id %}（{{ account.unique_id }}）{% endif %}</option>
+            <option value="{{ account.account_ref }}" data-unique-id="{{ account.unique_id }}" data-login-generation="{{ account.login_generation|default('') }}" {% if relogin_account and account.account_ref == relogin_account.account_ref %}selected{% endif %}>{{ account.username }}{% if account.unique_id %}（{{ account.unique_id }}）{% endif %}</option>
             {% endfor %}
           </select>
         </label>

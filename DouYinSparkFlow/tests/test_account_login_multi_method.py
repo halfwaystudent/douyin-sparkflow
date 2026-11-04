@@ -1725,8 +1725,18 @@ class MergeRedirectContractTests(unittest.TestCase):
         }
 
     def _post_merge(self):
-        source = {"unique_id": ACCOUNT_ID, "username": "Same", "account_ref": "acc-1"}
-        target = {"unique_id": "999", "username": "Other", "account_ref": "acc-2"}
+        source = {
+            "unique_id": ACCOUNT_ID,
+            "username": "Same",
+            "account_ref": "acc-1",
+            "login_generation": "source-generation",
+        }
+        target = {
+            "unique_id": "999",
+            "username": "Other",
+            "account_ref": "acc-2",
+            "login_generation": "target-generation",
+        }
         with (
             patch.object(app_module, "current_user", return_value="admin"),
             patch.object(app_module, "current_principal", return_value=self.principal),
@@ -1736,12 +1746,25 @@ class MergeRedirectContractTests(unittest.TestCase):
             ),
             patch.object(app_module, "get_userData", return_value=[source, target]),
             patch.object(app_module, "account_by_unique_id", return_value=source),
-            patch.object(app_module, "account_by_ref", return_value=target),
+            patch.object(
+                app_module,
+                "account_by_ref",
+                side_effect=lambda _accounts, ref: {
+                    source["account_ref"]: source,
+                    target["account_ref"]: target,
+                }.get(ref),
+            ),
             patch.object(app_module, "can_access_account", return_value=True),
         ):
             return self.client.post(
                 f"/accounts/{ACCOUNT_ID}/merge-into",
-                data={"csrf_token": "t", "target_account_ref": "acc-2"},
+                data={
+                    "csrf_token": "t",
+                    "account_ref": source["account_ref"],
+                    "login_generation": source["login_generation"],
+                    "target_account_ref": target["account_ref"],
+                    "target_login_generation": target["login_generation"],
+                },
                 follow_redirects=False,
             )
 

@@ -243,6 +243,15 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn('"/creator-micro/" in page.url', server)
         self.assertIn('"qr_ready": qr_ready', server)
 
+    def test_login_desktop_novnc_metadata_is_repaired_before_websockify(self):
+        start_script = (SOURCE_ROOT / "scripts" / "start_login_desktop.sh").read_text(encoding="utf-8")
+        command = "python /app/scripts/ensure_novnc_metadata.py --web-root /usr/share/novnc"
+        websockify = 'run_forever novnc websockify --web=/usr/share/novnc'
+
+        self.assertIn(command, start_script)
+        self.assertIn(f"if ! {command}; then", start_script)
+        self.assertLess(start_script.index(command), start_script.index(websockify))
+
     def test_login_desktop_uses_fastapi_lifespan(self):
         server = (SOURCE_ROOT / "login_desktop_server.py").read_text(encoding="utf-8")
         self.assertIn("lifespan=lifespan", server)

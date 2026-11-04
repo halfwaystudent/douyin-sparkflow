@@ -1,0 +1,414 @@
+{
+  "source": "one authorized read-only A-B-A check; no input/send",
+  "limits": "Header DOM/text and serialized React graph were not captured; this is evidence, not a complete replay.",
+  "switches": [
+    {
+      "target": "A",
+      "candidate_samples": [
+        {
+          "elapsed_ms": 272,
+          "ok": false,
+          "reason": "friend_header_name_mismatch"
+        },
+        {
+          "elapsed_ms": 528,
+          "ok": false,
+          "reason": "friend_row_uncommitted"
+        },
+        {
+          "elapsed_ms": 2643,
+          "ok": false,
+          "reason": "friend_header_name_mismatch"
+        }
+      ],
+      "immediate_diagnostic": {
+        "row": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": false,
+          "committed_is_alternate": true,
+          "scan_limit_reached": false,
+          "raw_provider_depth": null,
+          "current_provider_depth": null,
+          "current_provider_tag": null,
+          "current_identity_matches": false,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "header": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 6,
+          "current_provider_depth": 6,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "input": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 9,
+          "current_provider_depth": 9,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 5,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "same_committed_provider": true,
+        "current_header_name_matches": false
+      },
+      "settled_diagnostic": {
+        "row": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": false,
+          "committed_is_alternate": true,
+          "scan_limit_reached": false,
+          "raw_provider_depth": null,
+          "current_provider_depth": null,
+          "current_provider_tag": null,
+          "current_identity_matches": false,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "header": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 6,
+          "current_provider_depth": 6,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "input": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": false,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 9,
+          "current_provider_depth": 9,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 5,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "same_committed_provider": false,
+        "current_header_name_matches": false
+      }
+    },
+    {
+      "target": "B",
+      "candidate_samples": [
+        {
+          "elapsed_ms": 43,
+          "ok": false,
+          "reason": "friend_header_name_mismatch"
+        },
+        {
+          "elapsed_ms": 300,
+          "ok": false,
+          "reason": "friend_row_uncommitted"
+        },
+        {
+          "elapsed_ms": 2641,
+          "ok": false,
+          "reason": "friend_header_name_mismatch"
+        }
+      ],
+      "immediate_diagnostic": {
+        "row": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": null,
+          "current_provider_depth": null,
+          "current_provider_tag": null,
+          "current_identity_matches": false,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "header": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": false,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 6,
+          "current_provider_depth": 6,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "input": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": false,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 9,
+          "current_provider_depth": 9,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 5,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "same_committed_provider": true,
+        "current_header_name_matches": false
+      },
+      "settled_diagnostic": {
+        "row": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": null,
+          "current_provider_depth": null,
+          "current_provider_tag": null,
+          "current_identity_matches": false,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "header": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 6,
+          "current_provider_depth": 6,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "input": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 9,
+          "current_provider_depth": 9,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 5,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "same_committed_provider": true,
+        "current_header_name_matches": false
+      }
+    },
+    {
+      "target": "A",
+      "candidate_samples": [
+        {
+          "elapsed_ms": 35,
+          "ok": false,
+          "reason": "friend_header_name_mismatch"
+        },
+        {
+          "elapsed_ms": 297,
+          "ok": false,
+          "reason": "friend_row_uncommitted"
+        },
+        {
+          "elapsed_ms": 2350,
+          "ok": false,
+          "reason": "friend_header_name_mismatch"
+        }
+      ],
+      "immediate_diagnostic": {
+        "row": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": false,
+          "committed_is_alternate": true,
+          "scan_limit_reached": false,
+          "raw_provider_depth": null,
+          "current_provider_depth": null,
+          "current_provider_tag": null,
+          "current_identity_matches": false,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "header": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": false,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 6,
+          "current_provider_depth": 6,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "input": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": false,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 9,
+          "current_provider_depth": 9,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 5,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "same_committed_provider": true,
+        "current_header_name_matches": false
+      },
+      "settled_diagnostic": {
+        "row": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": false,
+          "committed_is_alternate": true,
+          "scan_limit_reached": false,
+          "raw_provider_depth": null,
+          "current_provider_depth": null,
+          "current_provider_tag": null,
+          "current_identity_matches": false,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "header": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 6,
+          "current_provider_depth": 6,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 3,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "input": {
+          "exists": true,
+          "has_fiber": true,
+          "root_known": true,
+          "raw_root_is_current": true,
+          "raw_owns_node": true,
+          "committed_node_found": true,
+          "committed_is_raw": true,
+          "committed_is_alternate": false,
+          "scan_limit_reached": false,
+          "raw_provider_depth": 9,
+          "current_provider_depth": 9,
+          "current_provider_tag": 10,
+          "current_identity_matches": true,
+          "dependency_count": 5,
+          "matching_context_dependencies": 0,
+          "stale_context_dependencies": 0
+        },
+        "same_committed_provider": true,
+        "current_header_name_matches": false
+      }
+    }
+  ]
+}

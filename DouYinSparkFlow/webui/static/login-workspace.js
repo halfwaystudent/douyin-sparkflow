@@ -21,6 +21,7 @@
   const copyLoginUrlButton = document.querySelector("[data-copy-login-url]");
   const qrImage = document.querySelector("[data-login-qr]");
   const qrStatus = document.querySelector("[data-login-qr-status]");
+  const qrOpenLink = document.querySelector("[data-open-login-qr]");
   let timer = null;
   let heartbeatTimer = null;
   let pageActive = true, lifecycleVersion = 0, resumeChecking = false;
@@ -37,6 +38,12 @@
     qrVersion += 1;
     window.clearTimeout(qrRefreshTimer);
     qrController?.abort();
+    // A new tab cannot attach the workspace header. Only expose the local
+    // snapshot already obtained through the guarded QR read, never its URL.
+    if (qrOpenLink) {
+      qrOpenLink.hidden = true;
+      qrOpenLink.removeAttribute("href");
+    }
   };
   let countdownTimer = null;
   // Until this time the routine lines (lease countdown, status poll) leave the
@@ -55,7 +62,9 @@
   let bindingBusy = false;
   let bindingNeedsReview = false;
   const requestedRelogin = document.querySelector(".login-desktop-open[data-relogin-unique-id]")?.dataset.reloginUniqueId || "";
-  const workspaceRequest = () => requestedRelogin ? { mode: "relogin", relogin_unique_id: requestedRelogin } : { mode: "add" };
+  const requestedRef = document.querySelector(".login-desktop-open[data-relogin-account-ref]")?.dataset.reloginAccountRef || "";
+  const requestedGeneration = document.querySelector(".login-desktop-open[data-login-generation]")?.dataset.loginGeneration || "";
+  const workspaceRequest = () => requestedRef ? { mode: "relogin", relogin_unique_id: requestedRelogin, relogin_account_ref: requestedRef, login_generation: requestedGeneration } : { mode: "add" };
   const bindingResult = document.querySelector("[data-binding-result]");
   let bindingResultVersion = 0;
   let saveOperation = null, saveReadVersion = 0;
@@ -86,7 +95,7 @@
     const id = account?.unique_id || "";
     next.href = !uncertain && ref && root.dataset.setupInProgress === "1"
       ? `/setup?account=${encodeURIComponent(ref)}`
-      : id ? `/accounts?_anchor=account-${encodeURIComponent(id)}` : "/accounts";
+      : (ref || id) ? `/accounts?_anchor=account-${encodeURIComponent(ref || id)}` : "/accounts";
     next.textContent = uncertain ? "查看账号列表" : root.dataset.setupInProgress === "1" ? "继续设置" : "选择好友和群";
     bindingResult.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
@@ -508,6 +517,10 @@
         qrImage.src = objectUrl;
         qrImage.dataset.objectUrl = objectUrl;
         qrImage.hidden = false;
+        if (qrOpenLink) {
+          qrOpenLink.href = objectUrl;
+          qrOpenLink.hidden = false;
+        }
         if (previous) URL.revokeObjectURL(previous);
         if (qrStatus) qrStatus.textContent = `二维码已加载。如果过期，点击刷新。${qrWaitLabel()}`;
         setQrButtons("刷新二维码");
@@ -793,10 +806,13 @@
       const previousLabel = status ? status.textContent : "";
       if (status) status.textContent = "正在验证 Cookie 并登录，请稍候...";
       try {
+        const selectedRecord = reloginToggle?.checked ? reloginSelect?.selectedOptions?.[0] : null;
         const cookiePayload = {
           cookie_input: cookieInput,
           display_name: String(displayName?.value || "").trim(),
-          relogin_unique_id: reloginToggle?.checked ? String(reloginSelect?.value || "") : "",
+          relogin_unique_id: selectedRecord ? String(selectedRecord.dataset.uniqueId || "") : "",
+          relogin_account_ref: selectedRecord ? String(selectedRecord.value || "") : "",
+          login_generation: selectedRecord ? String(selectedRecord.dataset.loginGeneration || "") : "",
         };
         let data;
         try {
@@ -1083,7 +1099,7 @@
     button.addEventListener("click", () => {
       if (button.disabled || bindingBusy || bindingNeedsReview) return;
       if (!workspace.ticket) { setStatus("请先申请自己的登录工作区，完成登录后再保存。", "warning"); return; }
-      startSave({ ticket: workspace.ticket, relogin_unique_id: button.dataset.reloginUniqueId || "" });
+      startSave({ ticket: workspace.ticket, relogin_unique_id: button.dataset.reloginUniqueId || "", relogin_account_ref: button.dataset.reloginAccountRef || "", login_generation: button.dataset.loginGeneration || "" });
     });
   });
 

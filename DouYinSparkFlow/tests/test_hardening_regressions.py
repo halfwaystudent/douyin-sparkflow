@@ -694,6 +694,16 @@ class ProtocolHardeningTests(unittest.TestCase):
 
 
 class RuntimeHardeningTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate scan ordering/rename/group routing; the friend
+        # identity gate has separate real-Playwright and sender-boundary tests.
+        async def select_verified_friend(page, row, account, target):
+            await row.click()
+            return True, ''
+        gate = patch.object(tasks.friend_chat_guard, 'select_friend', side_effect=select_verified_friend)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_concurrent_stale_task_lock_has_single_owner(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             lock_path = Path(temp_dir) / "task.run.lock"
@@ -1058,7 +1068,7 @@ class RuntimeHardeningTests(unittest.TestCase):
             ),
             patch.object(
                 tasks,
-                "apply_stored_cookies_to_profile",
+                "prepare_profile_cookies",
                 new=AsyncMock(side_effect=RuntimeError("cookie injection failed")),
             ),
             patch.object(tasks, "_random_delay_seconds", return_value=0),

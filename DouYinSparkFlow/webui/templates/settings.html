@@ -20,7 +20,7 @@
     <a href="#notify"><i data-lucide="bell"></i>推送通知</a>
     <a href="#users"><i data-lucide="users-round"></i>Web 用户</a>
     <a href="#registration"><i data-lucide="user-plus"></i>注册邀请</a>
-    {% if passkeys_enabled %}<a href="#passkeys"><i data-lucide="fingerprint"></i>通行密钥</a>{% endif %}
+    <a href="#passkeys"><i data-lucide="fingerprint"></i>通行密钥</a>
   </nav>
 
   <div>
@@ -31,6 +31,7 @@
           <p>每次续火花发出去的内容和节奏。</p>
         </div>
       </div>
+      <p class="notice-inline">这里是全局默认消息模板。“我的续火花”的发送内容留空时，使用这里已有的固定模板、消息变体和节日模板，保留 [API] 等原有规则。已在“我的续火花”保存个人发送内容的用户，优先使用个人内容，不与这里的固定模板、变体或节日模板混用；个人内容中的 [API] 等标记按普通文字发送。修改全局模板会影响选择留空继承的个人计划。</p>
       <form method="post" action="/config" class="form-stack">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label class="field"><span>固定消息模板</span><input type="text" name="messageTemplate" value="{{ runtime_config.messageTemplate }}"><small>填写了消息变体时会优先从变体里随机挑选。</small></label>

@@ -163,18 +163,24 @@ class RedesignedPagesTests(unittest.TestCase):
 
     def test_relogin_preselects_only_a_visible_account(self):
         self._as(FRIEND)
-        page = self._get("/login-workspace?relogin=1001").text
+        page = self._get("/login-workspace?relogin_ref=ref-1&generation=").text
         self.assertIn('class="button button-primary login-desktop-open" type="button" data-relogin-unique-id="1001"', page)
         self.assertIn('class="button button-soft login-desktop-save" type="button" data-relogin-unique-id="1001"', page)
 
-        hidden = self._get("/login-workspace?relogin=1002").text
-        self.assertIn('data-login-mode="add"', hidden)
-        self.assertNotIn('data-relogin-unique-id="1002"', hidden)
+        foreign = self._get("/login-workspace?relogin_ref=ref-2&generation=")
+        # The selected ref is not in this principal's rendered account set, so
+        # the route intentionally conceals it as not found rather than falling
+        # back to an add-login workspace.
+        self.assertEqual(404, foreign.status_code)
+        self.assertNotIn("小号", foreign.text)
+
+        missing = self._get("/login-workspace?relogin_ref=missing&generation=")
+        self.assertEqual(404, missing.status_code)
 
     def test_accounts_page_links_relogin_to_the_login_page(self):
         self._as(ADMIN)
         page = self._get("/accounts").text
-        self.assertIn('href="/login-workspace?relogin=1001"', page)
+        self.assertIn('href="/login-workspace?relogin_ref=ref-1&amp;generation="', page)
         # Only the login page hosts the workspace controls.
         self.assertNotIn("login-desktop-controls", page)
         self.assertNotIn("login-desktop-controls", self._get("/").text)
@@ -212,9 +218,9 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertIn('<details class="disabled-accounts fold">', page)
         self.assertIn("已停用账号（1）", page)
         disabled_section = page[page.index('<details class="disabled-accounts fold">'):]
-        self.assertIn('id="account-1002"', disabled_section)
-        self.assertNotIn('id="account-1001"', disabled_section)
-        self.assertLess(page.index('id="account-1001"'), page.index('<details class="disabled-accounts fold">'))
+        self.assertIn('id="account-ref-2"', disabled_section)
+        self.assertNotIn('id="account-ref-1"', disabled_section)
+        self.assertLess(page.index('id="account-ref-1"'), page.index('<details class="disabled-accounts fold">'))
 
     def test_send_console_filters_by_status_account_and_target_name(self):
         self._as(ADMIN)
@@ -272,7 +278,7 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertNotIn("已绑定群\n", page)
         self.assertNotIn('\\u003cimg src=x onerror=alert(1)\\u003e', page)
         self.assertNotIn('<img src=x onerror=alert(1)>', page)
-        self.assertIn('id="groups-cache-1001">[]</script>', page)
+        self.assertIn('id="groups-cache-ref-1">[]</script>', page)
         self.assertIn('/accounts/1001/picker-cache?ref=ref-1', page)
         self.assertIn('name="group_targets"', page)
         self.assertIn('data-group-targets="true"', page)

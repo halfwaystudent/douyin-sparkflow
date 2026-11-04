@@ -413,22 +413,53 @@ def update_web_user(
         return deepcopy(target)
 
 
-def remove_account_refs_from_users(account_refs: list[str] | set[str]) -> int:
+def remove_account_refs_from_users(
+    account_refs: list[str] | set[str], *, return_removed: bool = False,
+) -> int | tuple[int, dict[str, list[str]]]:
+    """Remove refs and optionally retain the exact ownership for compensation.
+
+    Callers coordinating an account-data delete hold this lock before taking the
+    account-data lock.  The returned snapshot is safe to restore while that
+    outer lock remains held if the account-data write fails.
+    """
     refs = {str(ref).strip() for ref in account_refs if str(ref).strip()}
     if not refs:
-        return 0
+        return (0, {}) if return_removed else 0
     with _web_users_lock():
         users = get_web_users()
         changed = 0
+        removed = {}
         for user in users:
             original = list(user.get("account_refs", []))
             filtered = [ref for ref in original if ref not in refs]
             if filtered != original:
                 user["account_refs"] = filtered
+                removed[normalize_username(user["username"])] = original
                 changed += 1
         if changed:
             _save_web_users_locked(users)
-        return changed
+        return (changed, removed) if return_removed else changed
+
+
+def restore_account_refs_to_users(removed: dict[str, list[str]]) -> None:
+    """Restore refs removed by ``remove_account_refs_from_users``.
+
+    This is deliberately narrow: it only restores the affected users' exact
+    prior lists, and callers must keep ``_web_users_lock`` held across both
+    operations so an administrator's reassignment is never overwritten.
+    """
+    if not removed:
+        return
+    with _web_users_lock():
+        users = get_web_users()
+        changed = False
+        for user in users:
+            original = removed.get(normalize_username(user["username"]))
+            if original is not None and user.get("account_refs", []) != original:
+                user["account_refs"] = list(original)
+                changed = True
+        if changed:
+            _save_web_users_locked(users)
 
 
 def delete_web_user(username: str) -> bool:

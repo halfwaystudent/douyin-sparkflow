@@ -41,7 +41,12 @@ def setup_state(accounts, preferences, selected_ref=""):
     }
     messages = [value for value in (preferences.get("messages") or []) if isinstance(value, str) and value.strip()]
     has_targets = bool(ready and targets)
-    has_messages = bool(messages)
+    # An empty list is an explicit global-template choice only after the user
+    # has saved a plan; it must not make an untouched account setup-ready.
+    from core.personal_streak import has_global_message_templates
+    from utils.config import get_config
+    using_global_messages = bool(not messages and preferences.get("revision"))
+    has_messages = bool(messages) or (using_global_messages and has_global_message_templates(get_config()))
     can_finish = bool(ready and has_targets and has_messages)
     if not account:
         reason = "之前选择的账号已移除或权限已变化，请重新选择自己的账号。" if selection_missing else "先添加自己的抖音账号。"
@@ -54,12 +59,12 @@ def setup_state(accounts, preferences, selected_ref=""):
     elif not has_targets:
         reason = "先选择并保存发送目标。"
     elif not has_messages:
-        reason = "先保存自己的发送内容、时间和时区。"
+        reason = "全局默认消息为空，请先在“设置 → 消息”配置模板，或填写个人发送内容。" if using_global_messages else "先保存自己的发送设置、时间和时区。"
     else:
         reason = ""
     return {
         "setup_account": account, "ready": ready, "has_targets": has_targets,
-        "has_messages": has_messages, "can_finish": can_finish,
+        "has_messages": has_messages, "using_global_messages": using_global_messages, "can_finish": can_finish,
         "login_pending": pending, "login_verification_state": verification,
         "login_reason": str(check.get("reason") or ""), "setup_blocked_reason": reason,
         "automatic_enabled": bool(preferences.get("enabled")),

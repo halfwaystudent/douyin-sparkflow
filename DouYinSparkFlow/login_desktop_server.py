@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from core.login import collect_login_result
 from core.login_interaction import LoginInteraction, InteractionError
@@ -26,6 +26,7 @@ QR_ERROR_SPECS = {
     "qr_page_busy": (503, "登录页正在处理上一个请求，请稍后重试"),
     "qr_not_ready": (202, "登录页尚未生成二维码，请稍后重试"),
     "qr_expired": (409, "二维码已过期，请点击“刷新二维码”"),
+    "login_navigation_timeout": (503, "登录页打开超时，请稍后重试"),
 }
 
 
@@ -83,6 +84,7 @@ GENERIC_WWW_NAMES = {
     "我的",
     "我",
     "抖音官网账号",
+    "抖音创作者中心",
     "精选",
     "推荐",
     "搜索",
@@ -414,7 +416,20 @@ class LoginDesktopManager:
                 pass
 
     def _context_is_closed(self):
-        return not self.context or getattr(self.context, "_impl_obj", None) is None
+        if not self.context:
+            return True
+        impl = getattr(self.context, "_impl_obj", None)
+        closed = (
+            impl is None
+            or getattr(impl, "_closing_or_closed", False)
+            or bool((future := getattr(impl, "_closed_future", None)) and future.done())
+        )
+        if closed:
+            # Playwright keeps the wrapper object after context.close().  Drop
+            # both wrappers so a later open creates a fresh, isolated context.
+            self.context = None
+            self.page = None
+        return closed
 
     async def _get_active_page(self):
         await self.ensure_running()
@@ -583,7 +598,10 @@ class LoginDesktopManager:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("login page is busy; retry shortly") from exc
         try:
-            if interaction_key and self.interaction.owns(interaction_key) and self.context and self.page and not self.page.is_closed():
+            if (interaction_key and self.interaction.owns(interaction_key)
+                    and self.context and not self._context_is_closed()
+                    and self.interaction.context is self.context
+                    and self.page and not self.page.is_closed()):
                 return {"ok": True, "url": self.page.url, "state": "interactive", "reset": False, "logged_in": False}
             if interaction_key and self.context:
                 await self.stop(clear_profile=False)
@@ -901,6 +919,19 @@ def _clean_www_display_name(value):
     return name
 
 
+def _is_www_profile_page(value):
+    """Whether the fallback is still reading the intended Douyin profile page."""
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "www.douyin.com"
+        and parsed.path.startswith("/user/")
+    )
+
+
 async def collect_www_identity_from_page(page):
     return await page.evaluate(
         r"""() => {
@@ -953,17 +984,19 @@ async def collect_www_login_result(page, context):
 
     identity = await collect_www_identity_from_page(page)
     username = ""
-    for item in identity.get("candidates") or []:
-        username = _clean_www_display_name(item.get("text"))
-        if username:
-            break
-
-    if not username:
-        identity = await collect_www_identity_from_page(page)
+    if _is_www_profile_page(identity.get("url")):
         for item in identity.get("candidates") or []:
             username = _clean_www_display_name(item.get("text"))
             if username:
                 break
+
+    if not username:
+        identity = await collect_www_identity_from_page(page)
+        if _is_www_profile_page(identity.get("url")):
+            for item in identity.get("candidates") or []:
+                username = _clean_www_display_name(item.get("text"))
+                if username:
+                    break
 
     if not username:
         username = "抖音官网账号"
@@ -1081,6 +1114,9 @@ async def open_login(request: Request):
             status_code=502,
             detail={"code": "LOGIN_NETWORK_UNAVAILABLE", "message": str(exc), "checks": exc.checks},
         ) from exc
+    except PlaywrightTimeoutError:
+        code, message = QR_ERROR_SPECS["login_navigation_timeout"]
+        return _qr_error(code, "login_navigation_timeout", message, retry_after=2)
     except RuntimeError:
         # Another request currently owns the login page; report it as retryable
         # instead of letting it surface as an internal server error.

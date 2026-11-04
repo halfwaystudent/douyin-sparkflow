@@ -4,8 +4,9 @@ from urllib.parse import urlsplit
 
 from core.browser import (account_profile_name, acquire_browser_account_lock, douyin_network_modes,
     first_scrollable_element, get_browser, get_persistent_browser_context, normalize_persistent_profile_config, release_browser_account_lock)
-from core.friends import CHAT_PAGE_URL, _wait_for_chat_or_login
-from core.streak_state import AUTH_COOKIE_NAMES
+from core.friends import (CATEGORY_BROWSER_CLEANUP_BLOCKED, CHAT_PAGE_URL,
+    FriendRefreshError, _wait_for_chat_or_login, browser_account_cleanup_blocked,
+    retain_browser_account_lock_for_cleanup)
 from core.tasks import _read_group_row_conversation_id
 from utils.config import get_config
 
@@ -99,19 +100,25 @@ async def fetch_account_groups(account):
     cookies = list(account.get('cookies') or [])
     account_name = str(account.get('username') or account.get('unique_id') or '')
     lock_handle = lock_path = lock_token = playwright = browser = context = page = None
+    cookie_session = None
+    from core import tasks
+    cookie_operations = set()
+    cookie_owner_token = tasks._BROWSER_OPERATION_OWNER.set(cookie_operations)
     try:
+        if browser_account_cleanup_blocked(account):
+            raise FriendRefreshError('浏览器清理尚未确认完成，账号已暂停刷新',
+                                     category=CATEGORY_BROWSER_CLEANUP_BLOCKED)
         profile = normalize_persistent_profile_config(get_config(force_reload=True) or {})
         mode = douyin_network_modes()[0]
         # Every refresh browser session holds the same per-account lock as the
         # sender, whichever browser mode is configured.
         lock_handle, lock_path, lock_token = await acquire_browser_account_lock(account, account_name)
         if profile['enabled']:
-            playwright, context, _ = await get_persistent_browser_context(account_profile_name(account), root=profile['root'], network_mode=mode)
-            if profile['syncStoredCookiesBeforeRun']:
-                await context.add_cookies(cookies)
-            elif profile['seedCookiesWhenEmpty']:
-                current = await context.cookies(['https://creator.douyin.com/'])
-                if not any(c.get('name') in AUTH_COOKIE_NAMES for c in current): await context.add_cookies(cookies)
+            playwright, context, profile_dir = await get_persistent_browser_context(account_profile_name(account), root=profile['root'], network_mode=mode)
+            from core.profile_cookies import prepare_profile_cookies
+            from core.tasks import _run_browser_stage
+            cookie_session = await _run_browser_stage(
+                'seed_cookies', prepare_profile_cookies(context, account, profile, profile_dir))
         else:
             playwright, browser = await get_browser(GUI=False, network_mode=mode); context = await browser.new_context(); await context.add_cookies(cookies)
         async def guard_write_routes(route):
@@ -135,10 +142,33 @@ async def fetch_account_groups(account):
         if old:
             try: await page.get_by_role('tab', name=old, exact=True).click()
             except Exception: pass
+        # Reading group rows is not an account-identity proof. Do not publish
+        # this profile's cookies into the account store from a list-only job.
         return rows
     finally:
-        if page: await page.close()
-        if context: await context.close()
-        if browser: await browser.close()
-        if playwright: await playwright.stop()
-        if lock_handle is not None: release_browser_account_lock(lock_handle, lock_path, lock_token, account_name)
+        try:
+            cancelled = False
+            resources_complete = True
+            for resource, method in (
+                (page, 'close'), (context, 'close'), (browser, 'close'), (playwright, 'stop'),
+            ):
+                if resource is None:
+                    continue
+                try:
+                    await getattr(resource, method)()
+                except asyncio.CancelledError:
+                    cancelled = True
+                    resources_complete = False
+                except Exception:
+                    resources_complete = False
+            pending_cookie_operations = any(not task.done() for task in cookie_operations)
+            if lock_handle is not None:
+                if resources_complete and not pending_cookie_operations:
+                    release_browser_account_lock(lock_handle, lock_path, lock_token, account_name)
+                else:
+                    retain_browser_account_lock_for_cleanup(
+                        account, lock_handle, lock_path, lock_token, account_name)
+            if cancelled:
+                raise asyncio.CancelledError
+        finally:
+            tasks._BROWSER_OPERATION_OWNER.reset(cookie_owner_token)

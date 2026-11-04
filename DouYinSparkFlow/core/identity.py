@@ -55,6 +55,8 @@ IDENTITY_MARKER_KEYS = ("identity_mismatch", "account_identity_mismatch")
 
 # Account field holding the login generation a background check belongs to.
 FIELD_LOGIN_GENERATION = "login_generation"
+# Explicit operator login to import once into the persistent browser profile.
+FIELD_COOKIE_IMPORT_GENERATION = "browser_cookie_import_generation"
 
 # Flags a proven login of the same account resolves. Kept here (not in
 # core.streak_state, which this module must not import) so the Web save and the
