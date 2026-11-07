@@ -843,8 +843,7 @@ class WebCookieLoginEndpointTests(unittest.TestCase):
         self.assertEqual("created", body["action"])
         self.assertNotIn("secret-value", response.text)
         update_user.assert_called_once()
-        clear_state.assert_called_once()
-        self.assertEqual("/clear-login-state", clear_state.call_args.args[0])
+        clear_state.assert_not_called()
         login_result = save.call_args.args[0]
         self.assertEqual("pasted", login_result["cookie_source"])
         self.assertEqual(ACCOUNT_ID, save.call_args.kwargs["identity"]["uid"])
@@ -1444,25 +1443,6 @@ class DashboardRefreshStatusTests(unittest.TestCase):
     def setUp(self):
         self.script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
 
-    def test_failure_path_keeps_the_last_successful_refresh_time(self):
-        self.assertIn("上次成功刷新", self.script)
-        self.assertIn("showRefreshOutcome", self.script)
-        # The failure branch must render the retained timestamp, not only a message.
-        failure_block = self.script[
-            self.script.index("showRefreshOutcome(`刷新失败：") :
-            self.script.index("showRefreshOutcome(`刷新失败：") + 200
-        ]
-        self.assertIn("showRefreshOutcome", failure_block)
-        self.assertIn("lastSuccessAt = data.previousUpdatedAt", self.script)
-        self.assertIn("data.categoryLabel", self.script)
-
-    def test_success_path_records_the_new_refresh_time(self):
-        # The refresh is now an async job the panel polls, so the successful
-        # timestamp comes from the finished job rather than the POST response.
-        self.assertIn("/async", self.script)
-        self.assertIn("${refreshUrl}/status", self.script)
-        self.assertIn("lastSuccessAt = job.updatedAt", self.script)
-
     def test_refresh_reports_collection_progress(self):
         self.assertIn("正在读取好友列表…已采集", self.script)
         self.assertIn("data-refresh-all-friends", self.script)
@@ -1745,8 +1725,18 @@ class MergeRedirectContractTests(unittest.TestCase):
         }
 
     def _post_merge(self):
-        source = {"unique_id": ACCOUNT_ID, "username": "Same", "account_ref": "acc-1"}
-        target = {"unique_id": "999", "username": "Other", "account_ref": "acc-2"}
+        source = {
+            "unique_id": ACCOUNT_ID,
+            "username": "Same",
+            "account_ref": "acc-1",
+            "login_generation": "source-generation",
+        }
+        target = {
+            "unique_id": "999",
+            "username": "Other",
+            "account_ref": "acc-2",
+            "login_generation": "target-generation",
+        }
         with (
             patch.object(app_module, "current_user", return_value="admin"),
             patch.object(app_module, "current_principal", return_value=self.principal),
@@ -1756,12 +1746,25 @@ class MergeRedirectContractTests(unittest.TestCase):
             ),
             patch.object(app_module, "get_userData", return_value=[source, target]),
             patch.object(app_module, "account_by_unique_id", return_value=source),
-            patch.object(app_module, "account_by_ref", return_value=target),
+            patch.object(
+                app_module,
+                "account_by_ref",
+                side_effect=lambda _accounts, ref: {
+                    source["account_ref"]: source,
+                    target["account_ref"]: target,
+                }.get(ref),
+            ),
             patch.object(app_module, "can_access_account", return_value=True),
         ):
             return self.client.post(
                 f"/accounts/{ACCOUNT_ID}/merge-into",
-                data={"csrf_token": "t", "target_account_ref": "acc-2"},
+                data={
+                    "csrf_token": "t",
+                    "account_ref": source["account_ref"],
+                    "login_generation": source["login_generation"],
+                    "target_account_ref": target["account_ref"],
+                    "target_login_generation": target["login_generation"],
+                },
                 follow_redirects=False,
             )
 

@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block nav_key %}personal_streak{% endblock %}
+{% block title %}我的续火花{% endblock %}
+{% block page_title %}我的续火花{% endblock %}
+{% block page_sub %}<p class="page-sub">设置自己的时间和内容，只用于自己名下的抖音账号。</p>{% endblock %}
+{% block content %}
+<section class="card form-stack" style="max-width: 680px">
+  <form method="post" action="/preferences/streak" class="form-stack" data-editor-form data-editor-kind="preferences" data-review-url="/preferences/streak" {% if unsaved_input %}data-editor-unsaved="1"{% endif %}>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="edit_revision" value="{{ preferences.revision|default('', true) }}">
+    <label class="check"><input type="checkbox" name="enabled" {% if preferences.enabled %}checked{% endif %}><span>每天自动续火花</span></label>
+    <div class="form-grid personal-schedule-grid">
+      <label class="field"><span>每天开始时间</span><input type="time" name="time" value="{{ preferences.time }}" required></label>
+      <div class="field"><label class="field"><span>每天结束时间</span><input type="time" name="end_time" value="{{ preferences.end_time if preferences.end_time != '24:00' else '23:59' }}" required></label><label class="check"><input type="checkbox" name="end_midnight"{% if preferences.end_time == '24:00' %} checked{% endif %}><span>结束于当天午夜（24:00）</span></label><small>可直接选择结束时间，修改后自动取消午夜；勾选午夜时按 24:00 结束。结束必须晚于开始，暂不支持跨日。</small></div>
+      <label class="field"><span>时区</span><input type="text" name="timezone" value="{{ preferences.timezone }}" maxlength="64" required {% if not preferences.revision and not preferences.messages %}data-browser-timezone{% endif %}><small>首次按当前浏览器填写，可自行调整。</small></label>
+    </div>
+    <label class="field"><span>发送内容（选填）</span><textarea name="messages" rows="4" maxlength="10020" placeholder="留空使用全局默认消息；填写时每行一条">{{ preferences.messages|join('\n') }}</textarea><small>留空使用“设置 → 消息”中已有的全局默认模板，保留消息变体、节日模板和 [API] 等原有规则。填写后只用此处个人内容，不与全局模板混用；每行一条，最多 20 条，每条最多 500 字，有多条时轮换使用；个人内容按字面发送，[API] 不会展开。无论选择哪种内容，均只用于自己名下账号，按本页保存的时间安排发送。</small></label>
+    <p class="muted compact">到开始时间后安排发送，结束时间后不再自动发送；忙碌时只会在结束前排队重试。开启前请先保存自己的账号和发送目标。修改设置会停止旧计划后续的浏览器发送；已提交的请求可能完成。</p>
+    {% if preferences.last_run and preferences.last_run.status == 'unknown' %}
+    <p class="flash flash-error"><strong>上次计划结果不确定。</strong> 请到发送控制台核对是否已经发送；为避免重复发送，系统不会自动重试，本计划会按下一次正常时间继续。</p>
+    {% elif preferences.last_run and preferences.last_run.status == 'failed' %}
+    <p class="flash flash-error"><strong>上次计划未能启动。</strong> {% if preferences.last_run.retry_scheduled %}系统将在约一分钟后重试（第 {{ preferences.last_run.retry_count }} 次）；若仍失败，请检查服务后到发送控制台核对。{% else %}自动重试已到上限；请检查服务并到发送控制台核对，本计划会按下一次正常时间继续。{% endif %}</p>
+    {% endif %}
+    <p data-editor-next-run {% if not next_personal_run %}hidden{% endif %}>下一次安排：<strong>{{ next_personal_run }}</strong>（{{ preferences.timezone }}）</p>
+    <div class="form-actions editor-actions" data-editor-actions>
+      <button class="button button-primary" type="submit" data-editor-save><span data-editor-save-label>保存我的设置</span></button>
+      <span class="muted compact" data-editor-state aria-live="polite"></span>
+    </div>
+    <p class="notice-inline" data-editor-feedback role="status" aria-live="polite" hidden></p>
+    <a class="section-link" href="/preferences/streak" data-editor-review target="_blank" rel="noopener" {% if not edit_conflict %}hidden{% endif %}>在新页核对已保存内容</a>
+  </form>
+  {% if request.session.get('setup_in_progress') %}<a class="button button-quiet" href="/setup">返回引导，检查下一步</a>{% endif %}
+</section>
+<script>
+(() => {
+  const end = document.querySelector('[name="end_time"]');
+  const midnight = document.querySelector('[name="end_midnight"]');
+  // Midnight is an alternative value, not a reason to disable the picker.
+  // Keep it directly usable on touch devices; only an actual edit switches
+  // away from midnight, so opening and cancelling the picker changes nothing.
+  const customEnd = () => { if (midnight) midnight.checked = false; };
+  end?.addEventListener('input', customEnd);
+  end?.addEventListener('change', customEnd);
+  const input = document.querySelector('[data-browser-timezone]');
+  if (input) {
+    try { input.value = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+  }
+})();
+</script>
+{% endblock %}

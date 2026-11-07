@@ -813,6 +813,7 @@ export async function sendMessages({
   cookieString,
   cookieMap,
   sendStrategy,
+  personalSendDeadlineEpochMs = null,
   identityOverride = null,
 }) {
   if (!dryRun) {
@@ -829,7 +830,12 @@ export async function sendMessages({
   const resolved = [];
   const unresolved = [];
   const sent = [];
+  const skipped = [];
   const normalizedStrategy = normalizeSendStrategy(sendStrategy);
+  const personalDeadline = Number.isFinite(personalSendDeadlineEpochMs)
+    && personalSendDeadlineEpochMs > 0
+    ? personalSendDeadlineEpochMs
+    : null;
 
   for (const [target, message] of Object.entries(messagesByTarget)) {
     try {
@@ -890,6 +896,11 @@ export async function sendMessages({
         continue;
       }
 
+      if (personalDeadline !== null && Date.now() >= personalDeadline) {
+        skipped.push({ target, reason: "personal_window_closed" });
+        continue;
+      }
+
       const sendResult = await client.sendMessage({ message: messageObject });
       const statusCode = sendResult?.statusCode ?? null;
       sent.push({
@@ -922,7 +933,7 @@ export async function sendMessages({
     }
   }
 
-  return { resolved, unresolved, sent };
+  return { resolved, unresolved, sent, skipped };
 }
 
 async function main() {
@@ -958,6 +969,7 @@ async function main() {
     cookieString,
     cookieMap,
     sendStrategy: payload.sendStrategy || {},
+    personalSendDeadlineEpochMs: payload.personalSendDeadlineEpochMs ?? null,
   });
 
   try {

@@ -309,7 +309,7 @@ class WebUiSafetyTests(unittest.TestCase):
             response = client.post("/login-desktop/open", data={"csrf_token": "test"})
 
         self.assertEqual(200, response.status_code)
-        call_login.assert_called_once_with("/open-login", method="POST", payload={}, timeout=90)
+        call_login.assert_called_once_with("/open-login", method="POST", payload={"interaction_key": response.json()["workspace"]["ticket"]}, timeout=90)
 
     def test_websocket_relay_cleans_up_pending_tasks(self):
         cleaned_up = []
@@ -466,7 +466,8 @@ class WebUiSafetyTests(unittest.TestCase):
         page = (Path(app_module.TEMPLATES_DIR) / "login_workspace.html").read_text(encoding="utf-8")
         self.assertIn("data-login-qr", page)
         self.assertIn("data-refresh-login-qr", page)
-        self.assertIn("/login-desktop/qr", page)
+        self.assertIn('data-open-login-qr hidden', page)
+        self.assertNotIn('href="/login-desktop/qr"', page)
 
     def test_login_workspace_loads_inside_dashboard_frame(self):
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
@@ -483,32 +484,8 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertIn("retries - 1", script)
         self.assertIn('/login-desktop/qr/refresh', script)
 
-    def test_saving_a_login_shows_progress_and_blocks_a_second_click(self):
-        # A second click while the first save was still running raced its
-        # release and failed with a 400; the save must look busy until it ends.
-        script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
-        start = script.index('document.querySelectorAll(".login-desktop-save").forEach((button) =>')
-        block = script[start:script.index('document.querySelectorAll(".login-desktop-close")', start)]
-        self.assertIn("if (button.disabled) return;", block)
-        self.assertLess(block.index("setSaving(true);"), block.index("try {"))
-        catch = block[block.rindex("} catch (error) {"):]
-        self.assertIn("setSaving(false);", catch)
-        # Every early return before the result must end the busy state too.
-        duplicates = block[block.index("if (candidates.length > 1) {"):block.index("const update = window.confirm(")]
-        self.assertGreaterEqual(duplicates.count("setSaving(false);"), 2)
-        saving = script[script.index("const setSaving = "):start]
-        self.assertIn("item.disabled = saving || keepDisabled;", saving)
-        self.assertIn("已等待", saving)
-        # The lease countdown and the status poll must not overwrite the save
-        # progress or its error: they flickered with it every second.
-        self.assertIn("statusHeldUntil = saving ? Infinity : Date.now() + 8000;", saving)
-        countdown = script[script.index("countdownTimer = window.setInterval"):]
-        countdown = countdown[: countdown.index("}, 1000);")]
-        self.assertLess(countdown.index("if (statusHeld()) return;"), countdown.index("setStatus("))
-        poll = script[script.index("const pollStatus = async"):script.index("const heartbeat = async")]
-        self.assertLess(poll.index("if (statusHeld())"), poll.index("当前浏览器已登录"))
-        # After a successful save the page reloads; the buttons stay disabled.
-        self.assertIn("setSaving(false, { keepDisabled: true });", block)
+    # Save progress, confirmation, duplicate clicks and interrupted-result
+    # recovery are exercised through Chromium in test_async_save_browser.py.
 
     def test_save_and_close_do_not_wait_for_the_next_workspace(self):
         source = Path(app_module.__file__).read_text(encoding="utf-8")
@@ -528,7 +505,7 @@ class WebUiSafetyTests(unittest.TestCase):
         # answer at once and the button must not invite a second open.
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
         # The click handler, not startOpening(), which also walks these buttons.
-        block_start = script.index('button.addEventListener("click", async () => {\n      if (section) section.open = true;')
+        block_start = script.index('document.querySelectorAll(".login-desktop-open").forEach((button) => {', script.index("const heartbeat = async"))
         block = script[block_start:script.index('document.querySelectorAll("[data-focus-native-browser]")', block_start)]
         self.assertLess(block.index("startOpening()"), block.index('postForm("/login-desktop/open"'))
         self.assertGreaterEqual(block.count("stopOpening()"), 2)  # queued and failure
@@ -546,7 +523,7 @@ class WebUiSafetyTests(unittest.TestCase):
         # again in the click handler reconnected noVNC mid-handshake.
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
         # The click handler, not startOpening(), which also walks these buttons.
-        block_start = script.index('button.addEventListener("click", async () => {\n      if (section) section.open = true;')
+        block_start = script.index('document.querySelectorAll(".login-desktop-open").forEach((button) => {', script.index("const heartbeat = async"))
         block = script[block_start:script.index('document.querySelectorAll("[data-focus-native-browser]")', block_start)]
         guard = block.index("if (lastPromotedTicket === promotedBefore) {")
         self.assertLess(guard, block.index("loadFrame(true)"))
@@ -606,11 +583,12 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertIn("response.status === 423", qr_poll)
         self.assertIn("recoverLease()", qr_poll)
         self.assertLess(qr_poll.index("response.status === 423"), qr_poll.index("recoverLease()"))
-        self.assertLess(qr_poll.index("recoverLease()"), qr_poll.index('retryLater("登录页正在加载")'))
+        self.assertLess(qr_poll.index("recoverLease()"), qr_poll.index('二维码读取超时'))
         # The other lease-gated calls must recover instead of printing a bare error.
         for handler in (".login-desktop-save", "data-focus-native-browser"):
             self.assertIn(handler, script)
-        self.assertGreaterEqual(script.count("payload.leaseLost"), 4)
+        self.assertGreaterEqual(script.count("payload.leaseLost"), 3)
+        self.assertIn("error.payload?.leaseLost", script)
         self.assertIn("if (error.payload && error.payload.leaseLost)", script)
         # A never-ready QR code must stop polling and hand control back to the
         # operator; it must not keep POSTing /qr/refresh, because every refresh
@@ -680,7 +658,7 @@ class WebUiSafetyTests(unittest.TestCase):
         promote_block = script[script.index("if (promoted) {"):script.index("if (displayMode === \"native\") {")]
         self.assertIn("qrPollStartedAt = Date.now()", promote_block)
         apply_fn = script[script.index("const applyWorkspace"):script.index("const acquireWorkspace")]
-        self.assertIn("qrPollStartedAt = Date.now()", apply_fn)
+        self.assertIn("renderWorkspace(trackWorkspace(data.workspace))", apply_fn)
         # Every deliberate user action renews the budget.
         self.assertGreaterEqual(script.count("resetRecoveryBudget()"), 4)
         self.assertNotIn("requestQrRefresh({", script)

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hmac
 import logging
 import os
@@ -12,9 +13,10 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from core.login import collect_login_result
+from core.login_interaction import LoginInteraction, InteractionError
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,7 @@ QR_ERROR_SPECS = {
     "qr_page_busy": (503, "登录页正在处理上一个请求，请稍后重试"),
     "qr_not_ready": (202, "登录页尚未生成二维码，请稍后重试"),
     "qr_expired": (409, "二维码已过期，请点击“刷新二维码”"),
+    "login_navigation_timeout": (503, "登录页打开超时，请稍后重试"),
 }
 
 
@@ -81,6 +84,7 @@ GENERIC_WWW_NAMES = {
     "我的",
     "我",
     "抖音官网账号",
+    "抖音创作者中心",
     "精选",
     "推荐",
     "搜索",
@@ -199,6 +203,7 @@ class LoginDesktopManager:
     def __init__(self):
         self._lock = asyncio.Lock()
         self._page_operation_lock = asyncio.Lock()
+        self.interaction = LoginInteraction()
         self.playwright = None
         self.context = None
         self.page = None
@@ -385,6 +390,8 @@ class LoginDesktopManager:
                 )
             launch_options = {
                 "headless": False,
+                "service_workers": "block",
+                "accept_downloads": False,
                 "viewport": {"width": 1600, "height": 1000},
                 "args": launch_args,
             }
@@ -396,6 +403,11 @@ class LoginDesktopManager:
                 str(PROFILE_DIR),
                 **launch_options,
             )
+            def login_popup(page):
+                if self.interaction.token and page.context is self.interaction.context:
+                    self.page = page
+
+            self.context.on("page", login_popup)
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
             try:
                 # Fewer animations means the 2-core host renders the QR sooner.
@@ -404,7 +416,20 @@ class LoginDesktopManager:
                 pass
 
     def _context_is_closed(self):
-        return not self.context or getattr(self.context, "_impl_obj", None) is None
+        if not self.context:
+            return True
+        impl = getattr(self.context, "_impl_obj", None)
+        closed = (
+            impl is None
+            or getattr(impl, "_closing_or_closed", False)
+            or bool((future := getattr(impl, "_closed_future", None)) and future.done())
+        )
+        if closed:
+            # Playwright keeps the wrapper object after context.close().  Drop
+            # both wrappers so a later open creates a fresh, isolated context.
+            self.context = None
+            self.page = None
+        return closed
 
     async def _get_active_page(self):
         await self.ensure_running()
@@ -424,6 +449,7 @@ class LoginDesktopManager:
         return self.page
 
     async def stop(self, clear_profile=False):
+        self.interaction.clear()
         async with self._lock:
             if self.page:
                 try:
@@ -565,14 +591,23 @@ class LoginDesktopManager:
         self._status_checked_at = now
         return dict(payload)
 
-    async def open_login(self):
+    async def open_login(self, *, interaction_key=""):
         self.mark_activity()
         try:
             await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("login page is busy; retry shortly") from exc
         try:
+            if (interaction_key and self.interaction.owns(interaction_key)
+                    and self.context and not self._context_is_closed()
+                    and self.interaction.context is self.context
+                    and self.page and not self.page.is_closed()):
+                return {"ok": True, "url": self.page.url, "state": "interactive", "reset": False, "logged_in": False}
+            if interaction_key and self.context:
+                await self.stop(clear_profile=False)
             result = await self._ensure_login_form_locked()
+            if interaction_key:
+                await self.interaction.bind(self.context, interaction_key)
             return {
                 "ok": True,
                 "url": result["url"],
@@ -581,6 +616,24 @@ class LoginDesktopManager:
                 "logged_in": result["logged_in"],
                 "network": self._network_payload(),
             }
+        finally:
+            self._page_operation_lock.release()
+
+    async def interact(self, token, action=None):
+        try:
+            await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=1)
+        except asyncio.TimeoutError as exc:
+            raise InteractionError("登录页正在处理上一个操作", 503) from exc
+        try:
+            page = self.page
+            if page and page.is_closed() and self.context:
+                page = next((candidate for candidate in self.context.pages if not candidate.is_closed()), None)
+                self.page = page
+            if action is not None:
+                await asyncio.wait_for(self.interaction.act(token, page, action), timeout=5)
+                return {"ok": True}
+            data = await self.interaction.screenshot(token, page)
+            return {"ok": True, "image": base64.b64encode(data).decode("ascii")}
         finally:
             self._page_operation_lock.release()
 
@@ -697,14 +750,28 @@ class LoginDesktopManager:
             "logged_in": False,
         }
 
-    async def refresh_login_qr(self):
+    def workspace_guard(self, interaction_key):
+        keyed = bool(interaction_key or self.interaction.token)
+        def check(page=None):
+            if (keyed and not self.interaction.owns(interaction_key)) or (not keyed and self.interaction.token):
+                raise InteractionError("登录工作区已释放，请重新申请", 423)
+            if keyed and page is not None:
+                self.interaction.check(interaction_key, page)
+        return check
+
+    async def refresh_login_qr(self, *, interaction_key=""):
+        check = self.workspace_guard(interaction_key)
+        check()
         self.mark_activity()
         try:
             await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
         except asyncio.TimeoutError as exc:
             raise RuntimeError("login page is busy; retry shortly") from exc
         try:
-            return await self._refresh_login_qr_locked()
+            check()
+            payload = await self._refresh_login_qr_locked()
+            check(self.page)
+            return payload
         finally:
             self._page_operation_lock.release()
 
@@ -801,12 +868,43 @@ class LoginDesktopManager:
             "url": payload["url"],
         }
 
-    async def export(self):
+    async def export(self, *, interaction_key=""):
+        # A browser opened for a shared workspace must never be exported by an
+        # older request, including one that waited behind another page action.
+        keyed = bool(interaction_key or self.interaction.token)
+        def check_key(page=None):
+            if (keyed and not self.interaction.owns(interaction_key)) or (not keyed and self.interaction.token):
+                raise InteractionError("登录工作区已释放，请重新申请", 423)
+            if keyed and page is not None:
+                self.interaction.check(interaction_key, page)
+
+        check_key()
         self.mark_activity()
-        page = await self._get_active_page()
-        result = await collect_login_result(page, self.context, timeout_ms=5000)
-        self.schedule_stop_after_export()
-        return result
+        try:
+            await asyncio.wait_for(self._page_operation_lock.acquire(), timeout=5)
+        except asyncio.TimeoutError as exc:
+            raise InteractionError("登录页正在处理上一个操作，请稍后保存", 503) from exc
+        try:
+            check_key()
+            page = await self._get_active_page()
+            check_key(page)
+            context = self.context
+            try:
+                result = await collect_login_result(page, context, timeout_ms=5000)
+            except InteractionError:
+                raise
+            except Exception:
+                check_key(page)
+                try:
+                    result = await collect_www_login_result(page, context)
+                except Exception as exc:
+                    check_key(page)
+                    raise RuntimeError("无法读取已登录账号，请确认登录已完成后重试") from exc
+            check_key(page)
+            self.schedule_stop_after_export()
+            return result
+        finally:
+            self._page_operation_lock.release()
 
 
 def _clean_www_display_name(value):
@@ -819,6 +917,19 @@ def _clean_www_display_name(value):
     if any(token in name for token in ("登录", "注册", "关注", "粉丝", "获赞", "作品", "喜欢", "收藏", "观看历史", "海量优质视频", "抖音旗下")):
         return ""
     return name
+
+
+def _is_www_profile_page(value):
+    """Whether the fallback is still reading the intended Douyin profile page."""
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "www.douyin.com"
+        and parsed.path.startswith("/user/")
+    )
 
 
 async def collect_www_identity_from_page(page):
@@ -873,17 +984,19 @@ async def collect_www_login_result(page, context):
 
     identity = await collect_www_identity_from_page(page)
     username = ""
-    for item in identity.get("candidates") or []:
-        username = _clean_www_display_name(item.get("text"))
-        if username:
-            break
-
-    if not username:
-        identity = await collect_www_identity_from_page(page)
+    if _is_www_profile_page(identity.get("url")):
         for item in identity.get("candidates") or []:
             username = _clean_www_display_name(item.get("text"))
             if username:
                 break
+
+    if not username:
+        identity = await collect_www_identity_from_page(page)
+        if _is_www_profile_page(identity.get("url")):
+            for item in identity.get("candidates") or []:
+                username = _clean_www_display_name(item.get("text"))
+                if username:
+                    break
 
     if not username:
         username = "抖音官网账号"
@@ -986,19 +1099,49 @@ async def status():
 
 
 @app.post("/open-login")
-async def open_login():
+async def open_login(request: Request):
     try:
-        return await manager.open_login()
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = {}
+        key = payload.get("interaction_key", "") if isinstance(payload, dict) else ""
+        return await manager.open_login(interaction_key=key) if key else await manager.open_login()
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
             detail={"code": "LOGIN_NETWORK_UNAVAILABLE", "message": str(exc), "checks": exc.checks},
         ) from exc
+    except PlaywrightTimeoutError:
+        code, message = QR_ERROR_SPECS["login_navigation_timeout"]
+        return _qr_error(code, "login_navigation_timeout", message, retry_after=2)
     except RuntimeError:
         # Another request currently owns the login page; report it as retryable
         # instead of letting it surface as an internal server error.
         code, message = QR_ERROR_SPECS["qr_page_busy"]
         return _qr_error(code, "qr_page_busy", message, retry_after=2)
+
+
+@app.post("/interaction")
+async def login_page_interaction(request: Request):
+    try:
+        raw = await request.body()
+        if len(raw) > 16384:
+            return JSONResponse({"ok": False, "error": "请求过大"}, status_code=413)
+        import json
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) - {"ticket", "action"}:
+            raise InteractionError("登录操作格式无效")
+        return await manager.interact(payload.get("ticket", ""), payload.get("action"))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "登录操作格式无效"}, status_code=400)
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
+    except Exception as exc:
+        logger.warning("Login interaction unavailable: %s", type(exc).__name__)
+        return JSONResponse({"ok": False, "error": "登录窗口暂时不可用，请稍后重试"}, status_code=503)
 
 
 @app.post("/reset")
@@ -1036,9 +1179,19 @@ async def focus():
 
 
 @app.post("/refresh-qr")
-async def refresh_qr():
+async def refresh_qr(request: Request):
     try:
-        payload = await manager.refresh_login_qr()
+        raw = await request.body()
+        if len(raw) > 1024:
+            return JSONResponse({"ok": False, "error": "请求过大"}, status_code=413)
+        data = await request.json() if raw else {}
+        if not isinstance(data, dict) or set(data) - {"interaction_key"} or not isinstance(data.get("interaction_key", ""), str):
+            raise ValueError
+        payload = await manager.refresh_login_qr(interaction_key=data.get("interaction_key", ""))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "工作区凭据格式无效"}, status_code=400)
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
@@ -1061,15 +1214,24 @@ async def refresh_qr():
 
 
 @app.post("/export")
-async def export():
-    page = await manager._get_active_page()
+async def export(request: Request):
     try:
-        result = await manager.export()
-    except Exception as creator_exc:
-        try:
-            result = await collect_www_login_result(page, manager.context)
-        except Exception as www_exc:
-            raise HTTPException(status_code=400, detail=f"creator export failed: {creator_exc}; www export failed: {www_exc}")
+        body = await request.body()
+        if len(body) > 1024:
+            return JSONResponse({"ok": False, "error": "请求过大"}, status_code=413)
+        payload = await request.json() if body else {}
+        if not isinstance(payload, dict) or set(payload) - {"interaction_key"}:
+            raise ValueError
+        key = payload.get("interaction_key", "")
+        if not isinstance(key, str):
+            raise ValueError
+        result = await manager.export(interaction_key=key)
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "登录工作区凭据格式无效"}, status_code=400)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "result": result}
 
 
@@ -1097,17 +1259,28 @@ async def _probe_login_qr(page):
 
 
 @app.get("/qr")
-async def login_qr(wait: float = 0):
+async def login_qr(request: Request, wait: float = 0):
+    try:
+        return await _read_login_qr(wait, request.headers.get("X-SparkFlow-Workspace", ""))
+    except InteractionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=exc.status)
+
+
+async def _read_login_qr(wait, interaction_key):
     # wait > 0 holds the request until a QR appears (up to the limit) instead of
     # making the browser poll; every page call is bounded by that deadline, so a
     # busy renderer yields "not ready" rather than hanging the request.
     loop = asyncio.get_running_loop()
+    check = manager.workspace_guard(interaction_key)
+    check()
     deadline = loop.time() + min(max(0.0, wait), QR_MAX_WAIT_SECONDS)
     while manager._page_operation_lock.locked():
+        check()
         if loop.time() >= deadline:
             code, message = QR_ERROR_SPECS["qr_page_busy"]
             return _qr_error(code, "qr_page_busy", message, retry_after=1)
         await asyncio.sleep(0.25)
+    check()
     if not manager.context or manager._context_is_closed():
         # Reading the QR code must not launch a browser (for example right
         # after /close); only opening the workspace does that.
@@ -1115,6 +1288,7 @@ async def login_qr(wait: float = 0):
         return _qr_error(code, "qr_not_ready", message, retry_after=1)
     try:
         page = await manager._get_active_page()
+        check(page)
     except LoginNetworkError as exc:
         raise HTTPException(
             status_code=502,
@@ -1132,6 +1306,7 @@ async def login_qr(wait: float = 0):
             # The page navigated or closed mid-probe; that is "not ready yet",
             # not an upstream failure that would stop the page's QR wait.
             outcome, data = "not_ready", None
+        check(page)
         if outcome != "not_ready" or loop.time() + 0.5 >= deadline:
             break
         # A page operation (open, refresh) or a closed page ends this wait early.

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block nav_key %}accounts{% endblock %}
+{% block title %}修改尚未保存{% endblock %}
+{% block page_title %}这次修改尚未保存{% endblock %}
+{% block content %}
+<section class="card form-stack" style="max-width: 680px">
+  <p class="notice-inline">{{ edit_message }}</p>
+  <p class="muted">本次输入保留在下面。请先打开最新设置核对，需要时复制本次修改。</p>
+  <label class="field"><span>本次显示名</span><input type="text" value="{{ submitted_name }}" readonly></label>
+  <label class="field"><span>本次好友和手动群名称</span><textarea rows="4" readonly>{{ submitted_targets }}</textarea></label>
+  {% if submitted_groups %}<p>本次勾选的群编号：{{ submitted_groups|join('、') }}</p>{% endif %}
+  <div class="form-actions"><a class="button button-primary" href="{{ review_url }}" target="_blank" rel="noopener">在新页核对最新设置</a><a class="button button-quiet" href="/accounts">返回账号页</a></div>
+</section>
+{% endblock %}

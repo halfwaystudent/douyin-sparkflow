@@ -41,6 +41,9 @@ TERMINAL_FAILURE_CATEGORIES = {
     "protocol_user_blocked",
     "protocol_user_not_in_conversation",
     "protocol_check_conversation_not_pass",
+    # No stored identity for this target: retrying today cannot fix a binding.
+    "friend_binding_unavailable",
+    "friend_binding_incomplete",
 }
 
 LOGIN_FAILURE_CATEGORIES = {
@@ -121,13 +124,32 @@ def account_match_tokens(account):
 
 
 def find_matching_account(accounts, user):
-    wanted = account_match_tokens(user)
-    if not wanted:
+    """Resolve one immutable record and login snapshot, never a duplicate UID."""
+    rows = list(accounts or [])
+    reference = str(user.get("account_ref") or "").strip()
+    wanted_uid = normalize_unique_id(user.get("unique_id"))
+    if reference:
+        matches = [row for row in rows if str(row.get("account_ref") or "").strip() == reference]
+        if len(matches) != 1:
+            return None
+        matched = matches[0]
+        if str(matched.get("login_generation") or "") != str(user.get("login_generation") or ""):
+            return None
+        if wanted_uid and normalize_unique_id(matched.get("unique_id")) != wanted_uid:
+            return None
+        return matched
+    # Legacy callers are accepted only for one unambiguous stable account id.
+    if wanted_uid:
+        matches = [row for row in rows if normalize_unique_id(row.get("unique_id")) == wanted_uid]
+    else:
+        wanted_name = str(user.get("username") or "").strip()
+        matches = [row for row in rows if wanted_name and str(row.get("username") or "").strip() == wanted_name]
+    if len(matches) != 1:
         return None
-    for account in accounts or []:
-        if account_match_tokens(account) & wanted:
-            return account
-    return None
+    matched = matches[0]
+    if str(matched.get("login_generation") or "") != str(user.get("login_generation") or ""):
+        return None
+    return matched
 
 
 def _normalize_key(value):
@@ -494,6 +516,27 @@ def history_entry(account, target_name, tz=None):
 def failure_entry(account, target_name, tz=None):
     target_ref = resolve_target_ref(account, target_name)
     return _legacy_failure_entry(account, target_name, target_ref, tz)
+
+
+def clear_failure_entries(account, target_name):
+    """Clear only this target's known nickname/stable-id aliases after success."""
+    target_ref = resolve_target_ref(account, target_name)
+    aliases = _legacy_aliases(account, target_name, target_ref)
+    bucket = account.get("failure_queue")
+    if not isinstance(bucket, dict):
+        return
+    refs = _ref_bucket(account)
+    for alias in aliases:
+        # A state's historical display name can now belong to a different
+        # bound target. Do not use that stale label as cleanup authority.
+        owner = str(refs.get(alias) or "")
+        if _is_stable_target_ref(owner) and owner != target_ref:
+            continue
+        if alias != target_ref and alias != normalize_target_name(target_name) and owner != target_ref:
+            continue
+        bucket.pop(alias, None)
+    if not bucket:
+        account.pop("failure_queue", None)
 
 
 def target_display_name(account, target_ref):
@@ -1734,6 +1777,13 @@ def schedule_phase(now, send_window):
     now = _now(now)
     start_hour = int(window.get("startHour") or 0)
     end_hour = int(window.get("endHour") or 23)
+    end_minute = int(window.get("endMinute") or 0)
+    end_time = str(window.get("endTime") or "")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d|24:00", end_time):
+        if end_time == "24:00":
+            end_hour, end_minute = 24, 0
+        else:
+            end_hour, end_minute = map(int, end_time.split(":"))
     interval = max(1, int(window.get("scheduleIntervalMinutes") or 20))
     start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
     if end_hour == 24:
@@ -1744,7 +1794,7 @@ def schedule_phase(now, send_window):
                 hour=0, minute=0, second=0, microsecond=0
             )
     else:
-        end = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
     grace = timedelta(minutes=interval)
     if end_hour == 24:
         fallback_start = end - timedelta(minutes=1)

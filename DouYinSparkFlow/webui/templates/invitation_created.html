@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block nav_key %}settings{% endblock %}
+{% block title %}邀请已创建{% endblock %}
+{% block page_title %}邀请已创建{% endblock %}
+{% block content %}
+<section class="card form-stack" style="max-width: 620px">
+  <p>这个链接只能使用一次。请私下发给受邀人，不要公开发布。</p>
+  {% if registration_closed %}<p class="flash flash-warning">当前注册尚未开放。请先启用“仅邀请注册”或“开放注册”，再使用这个邀请。</p>{% endif %}
+  <label class="field"><span>邀请链接（只在此页显示）</span><input type="text" readonly value="{{ invitation_url }}" data-invitation-url autocomplete="off" spellcheck="false"></label>
+  <button class="button button-primary" type="button" data-copy-invitation>复制邀请链接</button>
+  <p role="status" aria-live="polite" data-invitation-copy-status></p>
+  <a class="button button-quiet" href="/settings?_anchor=registration">返回注册设置</a>
+</section>
+{% endblock %}

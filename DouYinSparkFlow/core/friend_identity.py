@@ -30,12 +30,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+from pathlib import Path
 from copy import deepcopy
 from datetime import timedelta
 from urllib.parse import urlparse
 
 from core import streak_state
-from utils.config import update_user_data
+from core.identity import same_login_snapshot
+from utils.config import normalize_unique_id, repo_root, update_user_data
 from utils.logger import setup_logger
 
 
@@ -217,6 +220,48 @@ def merge_uid_entries(*batches):
 # passive collector
 
 
+_UID_COLLECTION_OFF = {'0', 'off', 'false', 'disabled', 'no'}
+UID_COLLECTION_OFF_MARKER = Path('/app/logs/uid-collection-off.flag')
+MAX_CONCURRENT_BODY_READS = 4
+MAX_PENDING_BODY_READS = 16
+BODY_READ_TIMEOUT_SECONDS = 5.0
+CLOSE_WAIT_SECONDS = 0.25
+_BODY_UNREADABLE = object()
+
+
+def uid_collection_marker_path():
+    """Return the shared container marker, or the project-local dev marker."""
+    if UID_COLLECTION_OFF_MARKER.exists() or UID_COLLECTION_OFF_MARKER.parent.exists():
+        return UID_COLLECTION_OFF_MARKER
+    return repo_root() / 'logs' / UID_COLLECTION_OFF_MARKER.name
+
+
+def uid_collection_enabled(purpose="legacy"):
+    """Collect on explicit read operations, never while sending.
+
+    The old off marker/env still governs legacy callers. Patrol and refresh
+    collect independently; the separate all-off marker is an emergency stop.
+    No process-global environment or marker is toggled for a read operation.
+    """
+    purpose = str(purpose or "").strip().lower()
+    if purpose not in {"legacy", "patrol", "refresh"}:
+        return False
+    try:
+        marker = uid_collection_marker_path()
+        if (marker.parent / 'uid-collection-all-off.flag').exists():
+            return False
+        if purpose in {"patrol", "refresh"}:
+            return True
+        if marker.is_file():
+            return False
+    except OSError:
+        logger.warning('Could not read UID collection marker', exc_info=True)
+        if purpose != "legacy":
+            return False
+    raw = str(os.getenv("SPARKFLOW_UID_COLLECTION") or "").strip().lower()
+    return raw not in _UID_COLLECTION_OFF
+
+
 class UserDetailCollector:
     """Passively read the page's own ``user_detail`` responses.
 
@@ -232,15 +277,21 @@ class UserDetailCollector:
     react to new batches without waiting.
     """
 
-    def __init__(self, account_name=""):
+    def __init__(self, account_name="", *, purpose="legacy"):
         self.account_name = str(account_name or "")
+        self.purpose = str(purpose or "").strip().lower()
         self._entries = {}
         self._tasks = set()
+        self._body_tasks = set()
+        self._body_read_slots = asyncio.Semaphore(MAX_CONCURRENT_BODY_READS)
         self._page = None
+        self._listener = None
+        self._attachment_token = 0
         self.responses_seen = 0
         self.responses_parsed = 0
         self.errors = []
         self.version = 0
+        self.disabled = False
 
     @staticmethod
     def matches(url):
@@ -253,16 +304,40 @@ class UserDetailCollector:
     def attach(self, page):
         if self._page is not None or page is None:
             return self
-        try:
-            page.on("response", self._on_response)
-        except Exception as exc:  # noqa: BLE001 - collection must never break a read
-            self._record_error(f"attach_failed:{type(exc).__name__}")
+        self.disabled = not uid_collection_enabled(self.purpose)
+        if self.disabled:
+            # Do not touch the page at all: no listener, no body reads.
+            logger.info(
+                "Friend uid collection disabled for %s purpose=%s",
+                self.account_name or "unknown",
+                self.purpose,
+            )
             return self
+        logger.info("Friend uid collection enabled for %s purpose=%s",
+                    self.account_name or "unknown", self.purpose)
+        self._attachment_token += 1
+        token = self._attachment_token
+
+        def listener(response):
+            self._on_response(response, token)
+
         self._page = page
+        self._listener = listener
+        try:
+            page.on("response", listener)
+        except Exception as exc:  # noqa: BLE001 - collection must never break a read
+            self._page = None
+            self._listener = None
+            self._record_error(f"attach_failed:{type(exc).__name__}")
         return self
 
     def detach(self):
-        page, self._page = self._page, None
+        page, listener = self._page, self._listener
+        self._page = None
+        self._listener = None
+        self._attachment_token += 1
+        for task in self.pending_tasks():
+            task.cancel()
         if page is None:
             return
         for method_name in ("remove_listener", "off"):
@@ -270,12 +345,44 @@ class UserDetailCollector:
             if not callable(method):
                 continue
             try:
-                method("response", self._on_response)
+                method("response", listener)
                 return
             except Exception:  # noqa: BLE001
                 continue
 
-    def _on_response(self, response):
+    def pending_tasks(self):
+        """Include response bodies which have not acknowledged cancellation."""
+        return tuple(task for task in self._tasks | self._body_tasks if not task.done())
+
+    def _reader_done(self, task):
+        self._tasks.discard(task)
+        self._body_tasks.discard(task)
+        if not task.cancelled():
+            # Consume failures even after detach, when nobody awaits this task.
+            task.exception()
+
+    async def aclose(self):
+        """Cancel readers; return False if any body still needs an owner/lock."""
+        tasks = self.pending_tasks()
+        self.detach()
+        if not tasks:
+            return True
+        try:
+            await asyncio.wait(tasks, timeout=CLOSE_WAIT_SECONDS)
+            return not self.pending_tasks()
+        except asyncio.CancelledError:
+            for task in self.pending_tasks():
+                task.cancel()
+            raise
+
+    def _on_response(self, response, attachment_token=None):
+        token = self._attachment_token if attachment_token is None else attachment_token
+        if (
+            self.disabled
+            or self._page is None
+            or token != self._attachment_token
+        ):
+            return
         try:
             url = response.url
         except Exception:  # noqa: BLE001
@@ -283,25 +390,60 @@ class UserDetailCollector:
         if not self.matches(url):
             return
         self.responses_seen += 1
+        if (len(self._tasks) >= MAX_PENDING_BODY_READS
+                or len(self._body_tasks) >= MAX_PENDING_BODY_READS):
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             self._record_error("no_event_loop")
             return
-        task = loop.create_task(self._read(response))
+        deadline = loop.time() + BODY_READ_TIMEOUT_SECONDS
+        task = loop.create_task(self._read(response, token, deadline))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._reader_done)
 
-    async def _read(self, response):
+    async def _read_body(self, response):
         try:
-            payload = await response.json()
-        except Exception:  # noqa: BLE001 - fall back to the raw text
+            return await response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - fall back to the raw text once
             try:
-                payload = await response.text()
+                return await response.text()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 self._record_error(f"unreadable_body:{type(exc).__name__}")
+                return _BODY_UNREADABLE
+
+    async def _body_with_slot(self, response):
+        # The body, not its deadline supervisor, holds the slot. A body ignoring
+        # cancellation must not free capacity for unbounded additional reads.
+        async with self._body_read_slots:
+            return await self._read_body(response)
+
+    async def _read(self, response, attachment_token, deadline):
+        body = asyncio.create_task(self._body_with_slot(response))
+        self._body_tasks.add(body)
+        body.add_done_callback(self._reader_done)
+        try:
+            remaining = max(0, deadline - asyncio.get_running_loop().time())
+            done, _ = await asyncio.wait({body}, timeout=remaining)
+            if not done:
+                self._record_error("body_read_timeout")
                 return
-        self.ingest(payload)
+            payload = body.result()
+            if (
+                payload is not _BODY_UNREADABLE
+                and not self.disabled
+                and self._page is not None
+                and attachment_token == self._attachment_token
+            ):
+                self.ingest(payload)
+        finally:
+            if not body.done():
+                body.cancel()
 
     def ingest(self, payload):
         entries, error = parse_user_detail_payload(payload)
@@ -328,6 +470,8 @@ class UserDetailCollector:
         )
 
     async def drain(self, timeout=5.0):
+        if self.disabled:
+            return
         pending = [task for task in self._tasks if not task.done()]
         if not pending:
             return
@@ -341,6 +485,7 @@ class UserDetailCollector:
 
     def summary(self):
         return {
+            "disabled": self.disabled,
             "responses": self.responses_seen,
             "parsed": self.responses_parsed,
             "uidCount": len(self._entries),
@@ -1122,6 +1267,10 @@ def persist_identity_scan(
 
     def mutate(accounts):
         matched = _match_account(accounts, user)
+        snapshot = user.get("_refresh_snapshot")
+        if snapshot:
+            if not same_login_snapshot(matched, snapshot):
+                return None, False
         if matched is None:
             return None, False
         result = reconcile_targets(

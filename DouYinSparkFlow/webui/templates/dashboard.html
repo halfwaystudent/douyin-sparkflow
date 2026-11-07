@@ -66,6 +66,7 @@
 {% endblock %}
 
 {% block content %}
+{% if not accounts %}<p class="callout"><span>第一次使用？跟着引导完成账号和发送设置。</span><a class="button button-primary" href="/setup?restart=1">开始设置</a></p>{% endif %}
 <div data-overview-root>
   <div
     class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
@@ -118,7 +119,7 @@
           <em data-overview-value="nextTriggerHint"></em>
         </div>
         <div class="fact">
-          <small>发送窗口</small>
+          <small>发送安排</small>
           <strong data-overview-value="scheduleLabel">{{ ops.schedule.label or "-" }}</strong>
           <em>{{ summary.enabled_accounts }} 个启用账号</em>
         </div>
@@ -204,8 +205,11 @@
   {% set service_rows = (ops.containers or [])|selectattr("Names", "in", ["douyin-web", "douyin-scheduler", "login-desktop", "mihomo"])|list %}
   <div class="grid-2" style="margin-top: 16px">
     <div class="card">
-      <h3 class="card-title"><i data-lucide="clock-3"></i>今日发送窗口</h3>
-      {% if window_state.enabled %}
+      <h3 class="card-title"><i data-lucide="clock-3"></i>发送安排</h3>
+      {% if ops.schedule.personal %}
+      <p>{{ ops.schedule.label }}{% if not ops.schedule.enabled %} · 自动发送已暂停{% endif %}</p>
+      <a class="button button-quiet" href="/preferences/streak">修改我的时间和内容</a>
+      {% elif window_state.enabled %}
       <p>{{ "%02d"|format(window_state.startHour) }}:00 – {{ "%02d"|format(window_state.endHour) }}:00 之间按计划分批发送，窗口结束后兜底补发未成功的目标。</p>
       <div class="timeline" aria-hidden="true">
         {% for hour in range(window_state.startHour, window_state.endHour) %}
@@ -219,16 +223,19 @@
       {% else %}
       <p>当前是固定时间发送：{{ ops.schedule.label or "未配置" }}。</p>
       {% endif %}
+      {% if not ops.schedule.personal %}<a class="button button-quiet" href="/preferences/streak">设置我的续火花</a>{% endif %}
     </div>
-    <div class="card">
-      {% if service_rows %}
+    <div class="card" {% if is_admin %}data-host-status{% endif %}>
+      {% if is_admin %}
       <h3 class="card-title"><i data-lucide="activity"></i>服务状态</h3>
-      <ul class="status-list">
+      <p class="muted compact" data-host-status-message>正在检查服务状态，其他操作可以继续。</p>
+      <ul class="status-list" data-host-status-list {% if not service_rows %}hidden{% endif %}>
         {% set service_names = {"douyin-web": "控制台", "douyin-scheduler": "定时调度", "login-desktop": "登录工作区", "mihomo": "备用代理"} %}
         {% for item in service_rows %}
-        <li><span class="dot {% if item.State == 'running' %}ok{% else %}bad{% endif %}"></span>{{ service_names[item.Names] }}<span class="muted compact">{{ item.Status }}</span></li>
+        <li><span class="dot {% if item.State == 'running' %}ok{% elif item.State not in ['not_deployed', 'unavailable'] %}bad{% endif %}"></span>{{ service_names[item.Names] }}<span class="muted compact">{{ item.Status }}</span></li>
         {% endfor %}
       </ul>
+      <button class="button button-quiet button-sm" type="button" data-host-status-retry hidden>重新检查</button>
       {% else %}
       <h3 class="card-title"><i data-lucide="sparkles"></i>小提示</h3>
       <p>弱证据（仅回显/仅回执）表示消息大概率发出了，但没有拿到服务端的强确认；不放心可以在发送明细里标记为待核验，系统会再发一次。</p>
@@ -237,3 +244,4 @@
   </div>
 </div>
 {% endblock %}
+{% block scripts %}{% if is_admin %}<script defer src="{{ asset_url('host-status.js') }}"></script>{% endif %}{% endblock %}

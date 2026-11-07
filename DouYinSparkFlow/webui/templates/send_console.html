@@ -235,8 +235,10 @@
                   {{ item.reason or item.confirmationDetail or "发送结果缺少强确认" }}
                 </div>
                 <span class="target-meta">{{ item.displayLastAttemptAt or item.displaySentAt or "-" }}</span>
-                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
+                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
                   <input type="hidden" name="target" value="{{ item.target }}">
                   <button class="button button-soft button-sm" type="submit"><i data-lucide="refresh-cw"></i><span>重试</span></button>
                 </form>
@@ -252,8 +254,10 @@
                 <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or "未记录失败原因" }}</div>
                 {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
                 <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
-                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
+                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
                   <input type="hidden" name="target" value="{{ item.target }}">
                   <button class="button button-soft button-sm" type="submit"><i data-lucide="refresh-cw"></i><span>重试</span></button>
                 </form>
@@ -269,8 +273,10 @@
                 <div class="target-reason" title="{{ item.reason or '' }}">{{ item.reason or item.categoryLabel }}</div>
                 {% if item.skipReason %}<div class="target-skip muted compact">{{ item.skipReason }}</div>{% endif %}
                 <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
-                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target">
+                <form method="post" action="/accounts/{{ account.unique_id }}/retry-target?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
                   <input type="hidden" name="target" value="{{ item.target }}">
                   <button class="button button-soft button-sm" type="submit"><i data-lucide="refresh-cw"></i><span>重试</span></button>
                 </form>
@@ -295,12 +301,14 @@
                 <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or "-" }}</span>
                 <form
                   method="post"
-                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
                   data-confirm-title="标记为待核验"
                   data-confirm="将把“{{ item.target }}”的今日强确认记录改为待核验并加入补发队列。确认继续吗？"
                   data-confirm-accept="标记待核验"
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
                   <input type="hidden" name="target" value="{{ item.target }}">
                   <button class="button button-ghost button-sm" type="submit"><i data-lucide="flag"></i><span>标记待核验</span></button>
                 </form>
@@ -326,12 +334,14 @@
                 <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
                 <form
                   method="post"
-                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
                   data-confirm-title="标记为待核验并重发"
                   data-confirm="将把“{{ item.target }}”标记为待核验并加入补发队列，今日会再发一次。确认继续吗？"
                   data-confirm-accept="标记并重发"
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
                   <input type="hidden" name="target" value="{{ item.target }}">
                   <button class="button button-ghost button-sm" type="submit"><i data-lucide="repeat"></i><span>不确定，重发</span></button>
                 </form>
@@ -357,12 +367,14 @@
                 <span class="target-meta" title="{{ item.sentAt or '' }}">{{ item.displaySentAt or item.displayLastAttemptAt or "-" }}</span>
                 <form
                   method="post"
-                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed"
+                  action="/accounts/{{ account.unique_id }}/mark-target-unconfirmed?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
                   data-confirm-title="标记为待核验并重发"
                   data-confirm="将把“{{ item.target }}”标记为待核验并加入补发队列，今日会再发一次。确认继续吗？"
                   data-confirm-accept="标记并重发"
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
                   <input type="hidden" name="target" value="{{ item.target }}">
                   <button class="button button-ghost button-sm" type="submit"><i data-lucide="repeat"></i><span>不确定，重发</span></button>
                 </form>

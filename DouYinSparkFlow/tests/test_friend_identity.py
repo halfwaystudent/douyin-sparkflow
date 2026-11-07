@@ -820,8 +820,10 @@ class WebSelectionBindingTests(unittest.TestCase):
         }
 
     def _save(self, targets, group_targets=None):
+        from webui.account_editing import account_edit_revision
         data = {
             "csrf_token": "t",
+            "edit_revision": account_edit_revision(stored_accounts(self.path)[0]),
             "username": "Tester",
             "targets": targets,
             "enabled": "on",
@@ -1037,7 +1039,20 @@ class _FakeCollector:
 
 
 class SendScanIdentityTests(unittest.TestCase):
-    def _scan(self, user, targets, visible_names, collector, *, end_marker=False):
+    def setUp(self):
+        # These tests isolate scan ordering/rename/group routing and never reach
+        # verification, so the gate is replaced wholesale (no selection record is
+        # written); the friend identity gate has separate real-Playwright and
+        # sender-boundary tests.
+        async def select_verified_friend(page, row, account, target):
+            await row.click()
+            return True, ''
+        self.real_select_friend = tasks.friend_chat_guard.select_friend
+        gate = patch.object(tasks.friend_chat_guard, 'select_friend', side_effect=select_verified_friend)
+        gate.start()
+        self.addCleanup(gate.stop)
+
+    def _scan(self, user, targets, visible_names, collector, *, end_marker=False, vanish_after_scroll=False):
         class Element:
             def __init__(self, name):
                 self.name = name
@@ -1058,14 +1073,19 @@ class SendScanIdentityTests(unittest.TestCase):
                 "stableKeys": ["title:" + element.name],
             }
 
+        async def evaluate(script, *args):
+            if vanish_after_scroll and 'scrollTop +=' in script:
+                elements.clear()
+
         async def selector_visible(page, selectors):
             del page
-            return end_marker and "没有更多" in " ".join(selectors)
+            at_end = end_marker or (vanish_after_scroll and not elements)
+            return at_end and "没有更多" in " ".join(selectors)
 
         async def run():
             selected = []
             async for name in tasks.scroll_and_select_user(
-                Mock(evaluate=AsyncMock()),
+                Mock(evaluate=AsyncMock(side_effect=evaluate)),
                 user,
                 "demo",
                 targets,
@@ -1098,6 +1118,42 @@ class SendScanIdentityTests(unittest.TestCase):
             patch.object(tasks.asyncio, "sleep", new=AsyncMock()),
         ):
             return asyncio.run(run())
+
+    def test_unbound_target_is_skipped_without_stopping_the_scan(self):
+        async def gate(page, row, account, target):
+            if target == "Bob":
+                return False, "friend_binding_unavailable"
+            await row.click()
+            return True, ""
+
+        with patch.object(tasks.friend_chat_guard, "select_friend", side_effect=gate), \
+                patch.object(tasks, "_persist_browser_send_failure") as recorded:
+            selected = self._scan(
+                {"username": "demo", "targets": ["Alice", "Bob"]},
+                ["Alice", "Bob"],
+                ["Alice", "Bob"],
+                _FakeCollector(),
+            )
+
+        self.assertEqual(["Alice"], selected)
+        self.assertEqual(recorded.call_args[0][1], "Bob")
+        self.assertEqual(recorded.call_args[0][3], "friend_binding_unavailable")
+
+    def test_skipping_first_unbound_friend_selects_next_friend_on_same_screen(self):
+        async def gate(page, row, account, target):
+            if target == 'Alice':
+                return await self.real_select_friend(page, row, account, target)
+            await row.click()
+            return True, ''
+        with patch.object(tasks.friend_chat_guard, 'select_friend', side_effect=gate), \
+                patch.object(tasks, '_persist_browser_send_failure') as recorded:
+            selected = self._scan(
+                {'username': 'demo', 'targets': ['Alice', 'Bob'],
+                 'target_uid_bindings': {'Alice': {'uid': '10001'}}},
+                ['Alice', 'Bob'], ['Alice', 'Bob'], _FakeCollector(), vanish_after_scroll=True)
+        self.assertEqual(selected, ['Bob'])
+        self.assertEqual(recorded.call_count, 1)
+        self.assertEqual(recorded.call_args[0][1], 'Alice')
 
     def test_renamed_target_is_selected_under_its_new_name_in_the_same_run(self):
         account = bound_account(

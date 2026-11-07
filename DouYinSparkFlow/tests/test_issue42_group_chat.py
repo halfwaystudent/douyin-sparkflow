@@ -17,6 +17,7 @@ SCAN_CONFIG = {
     "scrollStepPx": 100,
     "scrollDelaySeconds": 0,
 }
+COOKIE = {"name": "sessionid", "value": "fixture-session", "domain": ".douyin.com", "path": "/"}
 
 
 class _Row:
@@ -62,6 +63,16 @@ async def _collect(generator):
 
 
 class GroupChatTargetTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate scan ordering/rename/group routing; the friend
+        # identity gate has separate real-Playwright and sender-boundary tests.
+        async def select_verified_friend(page, row, account, target):
+            await row.click()
+            return True, ''
+        gate = patch.object(tasks.friend_chat_guard, 'select_friend', side_effect=select_verified_friend)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def _run_group_send_until_press(
         self,
         press_side_effect,
@@ -70,6 +81,7 @@ class GroupChatTargetTests(unittest.TestCase):
         readback_handler=None,
         bound_id=None,
         verify_side_effect=None,
+        within_send_window=True,
     ):
         """Exercise the production _do_user_task_locked send path through Enter."""
         user = {
@@ -85,11 +97,12 @@ class GroupChatTargetTests(unittest.TestCase):
         context = Mock(
             new_page=AsyncMock(return_value=page),
             add_cookies=AsyncMock(),
+            cookies=AsyncMock(return_value=[COOKIE]),
             close=AsyncMock(),
         )
         browser = Mock(new_context=AsyncMock(return_value=context))
         chat_input = Mock(type=AsyncMock(), press=AsyncMock(side_effect=press_side_effect))
-        collector = Mock()
+        collector = Mock(aclose=AsyncMock(return_value=True), pending_tasks=Mock(return_value=()))
         collector.attach.return_value = collector
 
         async def selected(*_args, **_kwargs):
@@ -124,6 +137,7 @@ class GroupChatTargetTests(unittest.TestCase):
             ),
             patch.object(tasks.friend_identity, "UserDetailCollector", return_value=collector),
             patch.object(tasks, "_verify_open_group_conversation", new=self.verify),
+            patch.object(tasks.personal_streak, "within_send_window", return_value=within_send_window),
         ):
             try:
                 asyncio.run(
@@ -215,6 +229,14 @@ class GroupChatTargetTests(unittest.TestCase):
 
         self.assertEqual(0, self.verify.await_count)
         self.assertEqual(1, chat_input.press.await_count)
+
+    def test_end_time_gate_stops_queued_browser_send_before_enter(self):
+        _user, chat_input = self._run_group_send_until_press(
+            None,
+            within_send_window=False,
+        )
+
+        chat_input.press.assert_not_awaited()
 
     def test_storage_failure_prevents_enter_dispatch(self):
         _user, chat_input = self._run_group_send_until_press(
@@ -811,10 +833,11 @@ class GroupChatTargetTests(unittest.TestCase):
         context = Mock(
             new_page=AsyncMock(return_value=page),
             add_cookies=AsyncMock(),
+            cookies=AsyncMock(return_value=[COOKIE]),
             close=AsyncMock(),
         )
         browser = Mock(new_context=AsyncMock(return_value=context))
-        collector = Mock()
+        collector = Mock(aclose=AsyncMock(return_value=True), pending_tasks=Mock(return_value=()))
         collector.attach.return_value = collector
 
         async def select_with_group_failure(*args, group_scan_errors=None, **kwargs):

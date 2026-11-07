@@ -144,6 +144,9 @@ function Initialize-ProxyConfig {
 
 Require-Command docker
 docker compose version | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker Compose is unavailable. Please install or enable the Compose plugin."
+}
 
 if (-not (Test-Path ".env")) {
     Copy-Item ".env.example" ".env"
@@ -151,6 +154,16 @@ if (-not (Test-Path ".env")) {
 
 if ($ProxySubUrl) {
     Set-EnvValue -Path ".env" -Key "PROXY_SUB_URL" -Value $ProxySubUrl
+}
+
+# Validate quietly: resolved configuration may contain secrets.
+docker compose config --quiet
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker Compose configuration is invalid. Check .env and docker-compose.yml."
+}
+docker info | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker is not reachable. Start Docker Desktop and check your Docker context."
 }
 
 New-Item -ItemType Directory -Force -Path "proxy", "state/cron", "state/login-api", "state/login-profile", "state/browser-profiles", "DouYinSparkFlow/logs" | Out-Null
@@ -168,6 +181,9 @@ if (-not (Test-Path "state/cron/root") -or (Get-Item "state/cron/root").Length -
 Initialize-ProxyConfig
 
 docker compose up -d --build
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker Compose failed to build or start the services. Review the Docker output above."
+}
 
 $webPort = Get-EnvValue -Path ".env" -Key "WEB_PORT" -DefaultValue "8787"
 $url = "http://localhost:$webPort"

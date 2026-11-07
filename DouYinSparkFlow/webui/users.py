@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 import re
-import tempfile
 import uuid
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 
 from filelock import FileLock
 
 from utils.config import (
+    _save_json_file,
     get_app_settings,
+    read_app_settings,
     get_userData,
     normalize_unique_id,
     save_userData,
@@ -21,6 +23,8 @@ from utils.config import (
     users_data_path,
 )
 from webui.auth import hash_password, verify_password
+from utils.secure_storage import read_json
+from utils.secure_storage import encryption_required, StorageError
 
 
 USERS_FILE = Path(__file__).resolve().parents[1] / "webui_users.json"
@@ -32,11 +36,28 @@ class UserStoreError(ValueError):
 
 
 def _web_users_lock():
-    return FileLock(f"{USERS_FILE}.lock", timeout=30)
+    return _users_file_lock(str(USERS_FILE.resolve()))
+
+
+@lru_cache(maxsize=64)
+def _users_file_lock(path):
+    # Reuse the instance so a save and its ownership update can hold one lock.
+    return FileLock(f"{path}.lock", timeout=30)
 
 
 def normalize_username(username: str) -> str:
     return str(username or "").strip().casefold()
+
+
+def _reserved_username(username):
+    settings = get_app_settings(force_reload=True)
+    return normalize_username(username) in {
+        "admin", normalize_username(settings.get("admin_username") or "admin"),
+    }
+
+
+def stable_user_id(user):
+    return str(user.get("user_id") or "legacy-" + hashlib.sha256(normalize_username(user["username"]).encode()).hexdigest())
 
 
 def _coerce_session_version(value) -> int:
@@ -47,20 +68,7 @@ def _coerce_session_version(value) -> int:
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    finally:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
+    _save_json_file(path, payload)
 
 
 def _load_raw() -> dict:
@@ -68,8 +76,10 @@ def _load_raw() -> dict:
         return {"users": [], "auth_epoch": 0}
     text = USERS_FILE.read_text(encoding="utf-8")
     if not text.strip():
+        if encryption_required():
+            raise StorageError("Protected user storage is empty.")
         return {"users": [], "auth_epoch": 0}
-    data = json.loads(text)
+    data = read_json(USERS_FILE, text=text)
     if not isinstance(data, dict) or not isinstance(data.get("users", []), list):
         raise UserStoreError("webui_users.json must contain a users list")
     data["auth_epoch"] = _coerce_session_version(data.get("auth_epoch"))
@@ -88,9 +98,11 @@ def get_web_users(force_reload: bool = False) -> list[dict]:
         users.append(
             {
                 "username": username,
+                "user_id": stable_user_id(raw),
                 "role": "user",
                 "password_hash": str(raw.get("password_hash", "")),
                 "enabled": bool(raw.get("enabled", True)),
+                "registration_pending": bool(raw.get("registration_pending", False)),
                 "session_version": _coerce_session_version(
                     raw.get("session_version")
                 ),
@@ -106,10 +118,12 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
     normalized = []
     seen = set()
     assigned = set()
+    settings = read_app_settings()
+    reserved = {"admin", normalize_username(settings.get("admin_username") or "admin")}
     for raw in users:
         username = str(raw.get("username", "")).strip()
         key = normalize_username(username)
-        if not username or key == normalize_username("admin") or key in seen:
+        if not username or key in reserved or key in seen:
             raise UserStoreError("invalid or duplicate Web user")
         if not USERNAME_RE.fullmatch(username):
             raise UserStoreError("Web username may contain only letters, digits, _, ., and -")
@@ -126,9 +140,11 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
         normalized.append(
             {
                 "username": username,
+                "user_id": stable_user_id(raw),
                 "role": "user",
                 "password_hash": password_hash,
                 "enabled": bool(raw.get("enabled", True)),
+                "registration_pending": bool(raw.get("registration_pending", False)),
                 "session_version": _coerce_session_version(
                     raw.get("session_version")
                 ),
@@ -137,13 +153,9 @@ def _save_web_users_locked(users: list[dict], *, auth_epoch=None) -> list[dict]:
         )
     if auth_epoch is None:
         auth_epoch = int(_load_raw().get("auth_epoch") or 0)
-    _atomic_write_json(
-        USERS_FILE,
-        {
-            "auth_epoch": max(0, int(auth_epoch)),
-            "users": normalized,
-        },
-    )
+    payload = _load_raw()
+    payload.update(auth_epoch=max(0, int(auth_epoch)), users=normalized)
+    _atomic_write_json(USERS_FILE, payload)
     try:
         os.chmod(USERS_FILE, 0o600)
     except OSError:
@@ -173,7 +185,7 @@ def find_web_user(username: str) -> dict | None:
 
 
 def authenticate(username: str, password: str) -> dict | None:
-    settings = get_app_settings(force_reload=True)
+    settings = read_app_settings()
     admin_username = str(settings.get("admin_username", "admin")).strip() or "admin"
     if normalize_username(username) == normalize_username(admin_username):
         if verify_password(password, settings.get("admin_password_hash", "")):
@@ -308,7 +320,7 @@ def create_web_user(username: str, password: str, *, enabled: bool = True, accou
             _load_raw().get("auth_epoch")
         ) + 1
         username = str(username or "").strip()
-        if not USERNAME_RE.fullmatch(username) or normalize_username(username) == normalize_username("admin"):
+        if not USERNAME_RE.fullmatch(username) or _reserved_username(username):
             raise UserStoreError("invalid Web username")
         if not password:
             raise UserStoreError("password is required")
@@ -318,6 +330,7 @@ def create_web_user(username: str, password: str, *, enabled: bool = True, accou
             raise UserStoreError("one or more accounts are already assigned")
         item = {
             "username": username,
+            "user_id": uuid.uuid4().hex,
             "role": "user",
             "password_hash": hash_password(password),
             "enabled": bool(enabled),
@@ -339,6 +352,7 @@ def update_web_user(
     enabled: bool | None = None,
     account_refs: list[str] | None = None,
     append_account_ref: str | None = None,
+    revoke_sessions: bool = False,
 ) -> dict:
     if append_account_ref is not None and account_refs is not None:
         raise UserStoreError("cannot replace and append account references together")
@@ -353,14 +367,14 @@ def update_web_user(
         if target is None:
             raise UserStoreError("Web user not found")
         original_username = target["username"]
-        revoke_session = False
+        revoke_session = revoke_sessions
         if new_username is not None:
             new_username = str(new_username).strip()
-            if not USERNAME_RE.fullmatch(new_username) or normalize_username(new_username) == normalize_username("admin"):
+            if not USERNAME_RE.fullmatch(new_username) or _reserved_username(new_username):
                 raise UserStoreError("invalid Web username")
             if normalize_username(new_username) != normalize_username(target["username"]) and find_web_user(new_username):
                 raise UserStoreError("Web username already exists")
-            revoke_session = (
+            revoke_session = revoke_session or (
                 normalize_username(new_username)
                 != normalize_username(target["username"])
             )
@@ -371,6 +385,8 @@ def update_web_user(
         if enabled is not None:
             revoke_session = True
             target["enabled"] = bool(enabled)
+            if enabled:
+                target["registration_pending"] = False
         if appended is not None:
             # A login claims only its own proven ref. Never restore an old
             # whole-session ref list after an administrator has revoked it.
@@ -380,6 +396,7 @@ def update_web_user(
         if account_refs is not None:
             if all_assigned_refs(original_username).intersection(refs):
                 raise UserStoreError("one or more accounts are already assigned")
+            revoke_session = revoke_session or set(target["account_refs"]) != set(refs)
             target["account_refs"] = refs
         if revoke_session:
             auth_epoch = max(
@@ -396,22 +413,53 @@ def update_web_user(
         return deepcopy(target)
 
 
-def remove_account_refs_from_users(account_refs: list[str] | set[str]) -> int:
+def remove_account_refs_from_users(
+    account_refs: list[str] | set[str], *, return_removed: bool = False,
+) -> int | tuple[int, dict[str, list[str]]]:
+    """Remove refs and optionally retain the exact ownership for compensation.
+
+    Callers coordinating an account-data delete hold this lock before taking the
+    account-data lock.  The returned snapshot is safe to restore while that
+    outer lock remains held if the account-data write fails.
+    """
     refs = {str(ref).strip() for ref in account_refs if str(ref).strip()}
     if not refs:
-        return 0
+        return (0, {}) if return_removed else 0
     with _web_users_lock():
         users = get_web_users()
         changed = 0
+        removed = {}
         for user in users:
             original = list(user.get("account_refs", []))
             filtered = [ref for ref in original if ref not in refs]
             if filtered != original:
                 user["account_refs"] = filtered
+                removed[normalize_username(user["username"])] = original
                 changed += 1
         if changed:
             _save_web_users_locked(users)
-        return changed
+        return (changed, removed) if return_removed else changed
+
+
+def restore_account_refs_to_users(removed: dict[str, list[str]]) -> None:
+    """Restore refs removed by ``remove_account_refs_from_users``.
+
+    This is deliberately narrow: it only restores the affected users' exact
+    prior lists, and callers must keep ``_web_users_lock`` held across both
+    operations so an administrator's reassignment is never overwritten.
+    """
+    if not removed:
+        return
+    with _web_users_lock():
+        users = get_web_users()
+        changed = False
+        for user in users:
+            original = removed.get(normalize_username(user["username"]))
+            if original is not None and user.get("account_refs", []) != original:
+                user["account_refs"] = list(original)
+                changed = True
+        if changed:
+            _save_web_users_locked(users)
 
 
 def delete_web_user(username: str) -> bool:

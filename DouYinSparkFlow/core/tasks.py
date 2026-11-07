@@ -10,15 +10,20 @@ import re
 import unicodedata
 import uuid
 from contextlib import contextmanager
+from functools import wraps
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
+from playwright.async_api import Error as PlaywrightError
+
 from core.browser import (
     account_profile_name,
     acquire_browser_account_lock,
+    douyin_network_modes,
     first_scrollable_element,
     get_browser,
     get_persistent_browser_context,
@@ -27,9 +32,12 @@ from core.browser import (
     select_douyin_network_mode,
 )
 from core.im_receipt import parse_send_response
-from core.msg_builder import build_message, build_message_candidates
+from core.msg_builder import build_message, build_message_candidates, using_message_config, current_message_config
+from core import personal_streak, send_pause
+from core.identity import same_login_snapshot
 from core.protocol_dispatch import run_protocol_tasks
-from core import friend_identity, notifications, streak_state
+from core.profile_cookies import prepare_profile_cookies, publish_profile_cookies
+from core import friend_identity, friend_chat_guard, notifications, streak_state
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -46,6 +54,299 @@ debug_artifacts_dir = Path("logs/debug_artifacts")
 debug_artifacts_dir.mkdir(parents=True, exist_ok=True)
 CREATOR_HOME_URL = "https://creator.douyin.com/"
 CREATOR_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
+
+BROWSER_STAGE_TIMEOUT_SECONDS = 30
+BROWSER_CLEANUP_TIMEOUT_SECONDS = 5
+# Keep strong references to fail-closed locks: FileLock.__del__ releases them.
+_BLOCKED_BROWSER_LOCKS = {}
+# Track ownership across nested stage tasks. Uncooperative work stays strongly
+# referenced and keeps its account blocked; never close a Task's raw coroutine.
+from contextvars import ContextVar
+_BROWSER_OPERATION_OWNER = ContextVar('browser_operation_owner', default=None)
+_PENDING_BROWSER_TASKS = set()
+
+
+class BrowserStageTimeout(RuntimeError):
+    category = "browser_stage_timeout"
+
+    def __init__(self, stage):
+        self.stage = stage
+        super().__init__(f"browser_stage_timeout stage={stage}")
+
+
+def _consume_browser_task(task):
+    if not task.cancelled():
+        task.exception()
+
+
+def _track_browser_operation(task):
+    """Keep every browser reader owned until it really acknowledges exit."""
+    owner = _BROWSER_OPERATION_OWNER.get()
+    if owner is not None:
+        owner.add(task)
+    _PENDING_BROWSER_TASKS.add(task)
+    def completed(done):
+        if owner is not None:
+            owner.discard(done)
+        _PENDING_BROWSER_TASKS.discard(done)
+        _consume_browser_task(done)
+    task.add_done_callback(completed)
+    return task
+
+
+async def _cancel_browser_operation(task, grace):
+    # Cancellation is cooperative. Keep ownership if two bounded cancellation
+    # attempts cannot stop it; forcibly closing its coroutine is not safe.
+    for _ in range(2):
+        if task.done():
+            return True
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=grace)
+        if done:
+            return True
+    return False
+
+
+async def _run_browser_stage(stage, operation, *, timeout_seconds=None,
+                             cancel_grace_seconds=.5):
+    """Bound the entire operation, including its broad inner exception catches.
+
+    asyncio.wait_for alone waits indefinitely for cancellation acknowledgement.
+    Logs deliberately contain only a static stage name and elapsed time.
+    """
+    timeout = BROWSER_STAGE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    logger.info("Browser stage begin stage=%s", stage)
+    owner = _BROWSER_OPERATION_OWNER.get()
+    owner_token = None
+    if owner is None:
+        owner = set()
+        owner_token = _BROWSER_OPERATION_OWNER.set(owner)
+    task = _track_browser_operation(asyncio.ensure_future(operation))
+    outcome = "error"
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            outcome = "timeout"
+            await _cancel_browser_operation(task, cancel_grace_seconds)
+            raise BrowserStageTimeout(stage)
+        result = task.result()
+        outcome = "ok"
+        return result
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        await _cancel_browser_operation(task, cancel_grace_seconds)
+        raise
+    finally:
+        if not task.done():
+            task.cancel()
+        if owner_token is not None:
+            _BROWSER_OPERATION_OWNER.reset(owner_token)
+        logger.info("Browser stage end stage=%s outcome=%s duration=%.3fs",
+                    stage, outcome, loop.time() - started)
+
+
+def _bounded_browser_stage(stage, *, cancel_grace_seconds=.1):
+    def decorate(function):
+        @wraps(function)
+        async def bounded(*args, **kwargs):
+            return await _run_browser_stage(stage, function(*args, **kwargs),
+                                            cancel_grace_seconds=cancel_grace_seconds)
+        return bounded
+    return decorate
+
+
+async def _bounded_target_scan(generator, timeout_seconds):
+    # A fresh deadline for each __anext__: time spent delivering a yielded
+    # target is explicitly outside the scan-next budget.
+    while True:
+        try:
+            target = await _run_browser_stage(
+                "scan_next_target", generator.__anext__(), timeout_seconds=timeout_seconds)
+        except StopAsyncIteration:
+            return
+        yield target
+
+
+async def _run_friend_scan_stage(stage, operation, *, scan_started_at, max_scan_seconds):
+    """Bound one DOM scan phase without extending the configured scan budget."""
+    remaining = max_scan_seconds - (asyncio.get_running_loop().time() - scan_started_at)
+    # A phase that starts at the deadline still gets a bounded cancellation path
+    # and reports its concrete phase rather than waiting for the outer scan.
+    timeout = min(BROWSER_STAGE_TIMEOUT_SECONDS, max(.001, remaining))
+    return await _run_browser_stage(stage, operation, timeout_seconds=timeout)
+
+
+async def _navigate_with_retries(name, operation, **kwargs):
+    return await _run_browser_stage(
+        "navigation", retry_operation(name, operation, **kwargs), timeout_seconds=180)
+
+
+# Route reuse is deliberately narrower than ordinary navigation recovery: a
+# persistent profile may be reopened only before the first committed navigation.
+_PRE_DISPATCH_NETWORK_ERRORS = frozenset({
+    "net::err_connection_refused",
+    "net::err_connection_reset",
+    "net::err_connection_closed",
+    "net::err_connection_aborted",
+    "net::err_connection_timed_out",
+    "net::err_address_unreachable",
+    "net::err_name_not_resolved",
+    "net::err_internet_disconnected",
+    "net::err_proxy_connection_failed",
+})
+_PRE_DISPATCH_RISK_MARKERS = (
+    "login_required", "login", "登录", "验证码", "验证", "captcha", "challenge", "8610",
+)
+
+
+class _PreDispatchNetworkRouteFallback(RuntimeError):
+    """Signal a single safe profile reopen before any target dispatch exists."""
+
+
+def _is_pre_dispatch_network_failure(page, exc, navigation_state=None):
+    """Require positive evidence that the first home navigation never committed."""
+    if (not navigation_state or not navigation_state.get("tracking")
+            or navigation_state.get("committed") or navigation_state.get("completed")):
+        return False
+    if not isinstance(exc, PlaywrightError):
+        return False
+    detail = str(exc or "")
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _PRE_DISPATCH_RISK_MARKERS):
+        return False
+    if re.search(r"\bhttp\s*[45]\d\d\b", lowered):
+        return False
+    if not any(code in lowered for code in _PRE_DISPATCH_NETWORK_ERRORS):
+        return False
+    try:
+        page_url = str(page.url or "").strip()
+    except Exception:
+        return False
+    return page_url in {"", "about:blank"}
+
+
+def _route_reopen_cleanup_proven(session_state, operation_tasks):
+    """Persistent profile reuse is forbidden until the old context is provably gone."""
+    return (
+        session_state.get("cleanup_complete") is True
+        and not session_state.get("launch_pending")
+        and not any(not task.done() for task in operation_tasks)
+    )
+
+
+async def _cleanup_browser_session(page, context, playwright, state):
+    context_closed = context is None
+    cancelled = False
+    for stage, resource, method in (
+        ("close_page", page, "close"),
+        ("close_context", context, "close"),
+        ("stop_playwright", playwright, "stop"),
+    ):
+        if resource is None:
+            continue
+        try:
+            await _run_browser_stage(stage, getattr(resource, method)(),
+                                     timeout_seconds=BROWSER_CLEANUP_TIMEOUT_SECONDS)
+            if stage == "close_context":
+                context_closed = True
+        except asyncio.CancelledError:
+            # Cancellation during page.close must not skip context/driver close.
+            cancelled = True
+        except Exception:
+            logger.warning("Browser cleanup incomplete stage=%s", stage)
+    # stop() is attempted even after close() fails, but is not by itself proof
+    # that a persistent Chromium profile has exited. Fail closed in that case.
+    state["cleanup_complete"] = context_closed and not state.get("launch_pending")
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _browser_not_started_targets(user, targets):
+    now = datetime.now(_schedule_timezone())
+    return [target for target in targets
+            if not _target_sent_today(user, target, now)
+            and not streak_state.attempt_in_progress(user, target, now)
+            and not streak_state.is_sent_unverified(user, target, now)]
+
+
+def _record_browser_stage_failure(user, exc, targets):
+    _persist_account_send_failure(
+        user, exc.category, str(exc), datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        _browser_not_started_targets(user, targets))
+
+
+def _automatic_refusal_retry_eligible(user, target, now, schedule_timezone=None):
+    """Cooled 8610 retries run only in the configured final fallback job.
+
+    Explicit operator retries retain their separate allow_retry authorization.
+    Protocol browser fallback is not the end-of-day fallback signal.
+    """
+    from core import refusal_retry
+    return _is_fallback_run() and refusal_retry.eligible(
+        user, target, now, schedule_timezone=schedule_timezone,
+    )
+
+
+def _sender_scope_timezone(user):
+    """Validate scope without treating legacy global policy as a profile."""
+    scope = user.get("_personal_scope")
+    if not isinstance(scope, dict):
+        return True, None
+    if scope.get("legacy_global_schedule"):
+        return personal_streak.authorized(user), None
+    schedule_timezone = personal_streak.authorized_schedule_timezone(user)
+    return schedule_timezone is not None, schedule_timezone
+
+
+def _browser_prelaunch_targets(user, targets, allow_retry, *, scope_user=None):
+    from core import refusal_retry
+    now = datetime.now(_schedule_timezone())
+    # The fresh ledger row does not carry the original authorization scope.
+    scope_ok, schedule_timezone = _sender_scope_timezone(
+        user if scope_user is None else scope_user
+    )
+    if not scope_ok:
+        return []
+    if allow_retry:
+        # Preserve the existing explicit manual override for sent-unverified;
+        # active attempts and confirmed sends still cannot be overridden.
+        return [target for target in targets
+                if not _target_sent_today(user, target, now)
+                and not streak_state.attempt_in_progress(user, target, now)]
+    candidates = _browser_not_started_targets(user, targets)
+    return [target for target in candidates
+            if not refusal_retry.used_today(
+                user, target, now, schedule_timezone=schedule_timezone,
+            )
+            and (not _target_has_non_retryable_failure_today(user, target, now)
+                 or _automatic_refusal_retry_eligible(
+                     user, target, now, schedule_timezone=schedule_timezone,
+                 ))]
+
+
+async def _require_friend_chat(page, user, target_name, *, arm=False, wait=False):
+    if not friend_chat_guard.guard_enabled():
+        return
+    try:
+        latest = _find_matching_account(get_userData(force_reload=True), user)
+    except Exception as exc:
+        raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: configuration unreadable') from exc
+    if latest is None:
+        raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: target configuration changed')
+    configured = latest.get("targets") or []
+    if not any(target_match_key(name) == target_match_key(target_name) for name in configured):
+        raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: target configuration changed')
+    try:
+        ok, reason = await _run_browser_stage("friend_identity", friend_chat_guard.verify_friend(
+            page, latest, target_name, arm=arm, wait=wait))
+    except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+        raise
+    except Exception as exc:
+        raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: verification failed') from exc
+    if not ok:
+        raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: ' + reason)
 
 
 async def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -167,6 +468,7 @@ def _find_login_required_text(text):
     return None
 
 
+@_bounded_browser_stage("login_check")
 async def _page_has_login_required_prompt(page):
     for selector in LOGIN_REQUIRED_SELECTORS:
         locator = page.locator(selector).first
@@ -217,114 +519,53 @@ async def ensure_not_login_required(page, account_name, stage):
         raise RuntimeError(f"login_required at {stage} for {account_name}: {detail}")
 
 
+class BrowserDialogBlocked(RuntimeError):
+    """A visible, unaudited dialog requires operator review, not a click."""
+    category = "browser_dialog_blocked"
+
+
+@_bounded_browser_stage("dismiss_dialogs")
 async def _dismiss_non_login_dialogs(page, account_name, stage):
-    dismissed = 0
+    # No harmless dialog content has been independently audited yet. A generic
+    # "OK"/"Confirm" or close icon is not permission to accept unknown UI.
     for selector in LOGIN_REQUIRED_DIALOG_SELECTORS:
-        locator = page.locator(selector)
-        try:
-            count = min(await locator.count(), 5)
-        except Exception:
+        item = page.locator(f"{selector}:visible").first
+        if await item.count() == 0:
             continue
-
-        for index in range(count):
-            item = locator.nth(index)
-            try:
-                if not await item.is_visible(timeout=500):
-                    continue
-                dialog_text = (await item.inner_text(timeout=1000)).replace("\n", " ")
-            except Exception:
-                continue
-
-            if _find_login_required_text(dialog_text):
-                continue
-
-            clicked = False
-            for text in NON_LOGIN_DIALOG_DISMISS_TEXTS:
-                button = item.get_by_text(text, exact=True).first
-                try:
-                    if await button.count() > 0 and await button.is_visible(timeout=500):
-                        await button.click(timeout=2000)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
-            if not clicked:
-                for close_selector in NON_LOGIN_DIALOG_CLOSE_SELECTORS:
-                    close_button = item.locator(close_selector).first
-                    try:
-                        if await close_button.count() > 0 and await close_button.is_visible(timeout=500):
-                            await close_button.click(timeout=2000)
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-
-            if clicked:
-                dismissed += 1
-                logger.info(
-                    "Dismissed non-login dialog for %s at %s: %s",
-                    account_name,
-                    stage,
-                    dialog_text[:160],
-                )
-                await asyncio.sleep(0.5)
-            else:
-                logger.debug(
-                    "Visible non-login dialog for %s at %s was not dismissed: %s",
-                    account_name,
-                    stage,
-                    dialog_text[:160],
-                )
-    return dismissed
-
-
-async def apply_stored_cookies_to_profile(context, cookies, account_name, only_when_empty=False):
-    if not cookies:
-        return
-    if only_when_empty:
         try:
-            current_cookies = await context.cookies(
-                ["https://creator.douyin.com/", "https://www.douyin.com/"]
-            )
+            dialog_text = await item.inner_text(timeout=1000)
         except Exception:
-            current_cookies = []
+            # A visible dialog whose contents cannot be read is also unsafe.
+            raise BrowserDialogBlocked(
+                f"browser_dialog_blocked at {stage}: visible dialog requires review"
+            ) from None
+        if _find_login_required_text(dialog_text):
+            raise RuntimeError(f"login_required at {stage}: visible verification dialog")
+        raise BrowserDialogBlocked(
+            f"browser_dialog_blocked at {stage}: visible dialog requires review"
+        )
+    return 0
 
-        if any(cookie.get("name") in AUTH_COOKIE_NAMES for cookie in current_cookies):
-            logger.info(
-                "Persistent profile for %s already has auth cookies; not seeding stored cookies",
-                account_name,
-            )
-            return
 
-    await context.add_cookies(cookies)
-    logger.info("Applied %s stored cookies to persistent profile for %s", len(cookies), account_name)
+def _adopt_cookie_session_snapshot(user, session):
+    # Do not replace runnable targets, owner, receipts or quota with a full row.
+    for key in ("cookies", "login_generation", "browser_cookie_import_generation"):
+        if key in session.account:
+            user[key] = deepcopy(session.account[key])
+        else:
+            user.pop(key, None)
 
 
-async def refresh_stored_cookies_from_profile(context, user, account_name):
-    try:
-        cookies = await context.cookies()
-    except Exception as exc:
-        logger.warning("Could not read persistent profile cookies for %s: %s", account_name, exc)
-        return
-
-    if not cookies:
-        return
-
-    def mutate(accounts):
-        matched = _find_matching_account(accounts, user)
-        if matched is None:
-            return None, False
-        matched["cookies"] = list(cookies)
-        return matched, True
-
-    matched_account = update_user_data(mutate, force_reload=True)
-    if matched_account is None:
-        logger.warning("Could not find account to refresh cookies for user=%s", account_name)
-        return
-
-    user["cookies"] = list(cookies)
-    logger.info("Refreshed stored cookies for %s from persistent profile count=%s", account_name, len(cookies))
+@_bounded_browser_stage("refresh_cookies")
+async def refresh_stored_cookies_from_profile(context, user, account_name, *, cookie_session=None):
+    # Without a captured generation/snapshot there is no safe compare-and-swap.
+    if cookie_session is None:
+        return False
+    saved = await publish_profile_cookies(context, cookie_session)
+    if saved:
+        _adopt_cookie_session_snapshot(user, cookie_session)
+        logger.info("Refreshed stored cookies for %s from verified persistent profile", account_name)
+    return saved
 
 
 def _is_stop_account_category(category):
@@ -345,6 +586,7 @@ async def save_debug_artifacts(page, account_name, target_name, stage):
     logger.info("Saved debug artifacts at stage=%s for %s/%s", stage, account_name, target_name)
 
 
+@_bounded_browser_stage("locate_chat_input")
 async def locate_chat_input(page):
     selectors = [
         "xpath=//div[contains(@class, 'chat-input-dccKiL')]//div[@contenteditable='true']",
@@ -365,6 +607,7 @@ async def locate_chat_input(page):
     raise RuntimeError(f"Unable to locate chat input, last error: {last_error}")
 
 
+@_bounded_browser_stage("read_chat_input")
 async def read_chat_input_text(chat_input):
     try:
         return await chat_input.evaluate(
@@ -696,6 +939,7 @@ async def start_im_send_observer(page, account_name, target_name):
 
     return summary
 
+@_bounded_browser_stage("last_message_read")
 async def snapshot_last_own_message(page, chat_input=None):
     try:
         return await page.evaluate(
@@ -756,6 +1000,7 @@ async def snapshot_last_own_message(page, chat_input=None):
         return None
 
 
+@_bounded_browser_stage("last_message_count")
 async def count_today_own_message_matches(page, target_text):
     """Count how many of *target_text* appear in today's own-message bubbles."""
     try:
@@ -794,6 +1039,7 @@ async def count_today_own_message_matches(page, target_text):
         return 0
 
 
+@_bounded_browser_stage("visible_message_count")
 async def count_visible_message_matches(page, message, chat_input=None):
     probe = _message_probe_text(message)
     if not probe:
@@ -840,6 +1086,7 @@ async def count_visible_message_matches(page, message, chat_input=None):
     return visible_count
 
 
+@_bounded_browser_stage("confirm_message", cancel_grace_seconds=.5)
 async def confirm_message_sent(page, chat_input, message, before_snapshot=None, before_indicator=None):
     expected_message = _normalize_message_text(message)
     before_signature = None
@@ -970,6 +1217,8 @@ async def detect_message_already_sent(page, chat_input, message, before_snapshot
             )
             if sent_ok:
                 return True, detail
+    except BrowserStageTimeout:
+        raise
     except Exception:
         pass
 
@@ -977,6 +1226,10 @@ async def detect_message_already_sent(page, chat_input, message, before_snapshot
 
 
 def classify_browser_failure(stage, exc):
+    if isinstance(exc, BrowserDialogBlocked):
+        return exc.category
+    if isinstance(exc, BrowserStageTimeout):
+        return exc.category
     if isinstance(exc, BrowserSendRejected):
         # The server answered with a refusal code: that is a decision about this
         # message, not a transport hiccup worth retrying within the day.
@@ -1036,6 +1289,9 @@ class GroupTargetSelectionError(FriendListUnavailableError):
 
 
 ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
+    "browser_dialog_blocked",
+    "browser_stage_timeout",
+    "browser_cleanup_blocked",
     "login_required",
     "friend_list_unavailable",
     "friend_list_timeout",
@@ -1044,10 +1300,13 @@ ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
     "navigation_timeout",
     "navigation_failed",
     "page_crashed",
+    "friend_identity_mismatch",
+    "friend_identity_unavailable",
 }
 
 
 TEMPORARY_ACCOUNT_FAILURE_CATEGORIES = {
+    "browser_stage_timeout",
     "friend_list_unavailable",
     "friend_list_timeout",
     "friend_list_incomplete",
@@ -1743,7 +2002,7 @@ async def _reopen_friend_chat_page(page, account_name):
     except Exception as exc:
         logger.warning("Account %s reload before reopen chat page failed: %s", account_name, exc)
 
-    await retry_operation(
+    await _navigate_with_retries(
         "reopen chat page after friend list wait",
         page.goto,
         retries=2,
@@ -1888,6 +2147,30 @@ async def _first_scrollable_friends_element(page, selectors):
     # Douyin renders zero-height grids next to the real list, so taking the
     # first match made every scroll a no-op; the shared probe skips those.
     return await first_scrollable_element(page, selectors)
+
+
+async def _scan_delivery_targets(page, user, account_name, targets,
+                                 friend_scan_config=None, **kwargs):
+    """Keep final-fallback first attempts ahead of 8610 retries across tabs.
+
+    Partition after shuffling, not before: both tiers retain their own random
+    order, and a rejected group cannot jump ahead of a new friend merely because
+    the existing list scanner visits the group tab first. Reuse the same page.
+    """
+    from core import refusal_retry
+    batches = [targets]
+    if _is_fallback_run():
+        now = datetime.now(_schedule_timezone())
+        retry_targets = [t for t in targets
+                         if refusal_retry.explicit_8610(user, t, now)
+                         and not refusal_retry.rejection_precedes_today(user, t, now)]
+        normal_targets = [t for t in targets if t not in retry_targets]
+        if normal_targets and retry_targets:
+            batches = [normal_targets, retry_targets]
+    for batch in batches:
+        async for target in scroll_and_select_user(
+                page, user, account_name, batch, friend_scan_config, **kwargs):
+            yield target
 
 
 async def scroll_and_select_user(
@@ -2132,16 +2415,28 @@ async def scroll_and_select_user(
             # stopping once every target was found is not a full list read.
             follow_uid_renames(scan_complete=reached_end, final=True)
 
-    _, initial_scroll_element = await _first_scrollable_friends_element(
-        page,
-        scrollable_friends_selectors,
-    )
-    if initial_scroll_element:
-        await page.evaluate(
-            "(element) => { element.scrollTop = 0; }",
-            initial_scroll_element,
+    async def reset_friend_list_scroll():
+        _, scrollable_element = await _run_friend_scan_stage(
+            "friend_list_find_scroll_container",
+            _first_scrollable_friends_element(page, scrollable_friends_selectors),
+            scan_started_at=scan_started_at,
+            max_scan_seconds=max_scan_seconds,
+        )
+        if not scrollable_element:
+            return False
+        await _run_friend_scan_stage(
+            "friend_list_scroll_reset",
+            page.evaluate(
+                "(element) => { element.scrollTop = 0; }",
+                scrollable_element,
+            ),
+            scan_started_at=scan_started_at,
+            max_scan_seconds=max_scan_seconds,
         )
         await asyncio.sleep(min(scroll_delay_seconds, 1))
+        return True
+
+    await reset_friend_list_scroll()
 
     if uid_collector is not None:
         # The friends tab load already triggered the page's own user_detail
@@ -2179,7 +2474,12 @@ async def scroll_and_select_user(
                 empty_grace_seconds=15,
             )
             continue
-        target_elements = await target_locator.all()
+        target_elements = await _run_friend_scan_stage(
+            "friend_list_read_rows",
+            target_locator.all(),
+            scan_started_at=scan_started_at,
+            max_scan_seconds=max_scan_seconds,
+        )
         clicked_delivery_target = False
         next_target_key = next(
             (item for item in target_order if item in remaining_targets),
@@ -2187,7 +2487,12 @@ async def scroll_and_select_user(
         )
 
         for element in target_elements:
-            friend_record = await _extract_friend_record(element)
+            friend_record = await _run_friend_scan_stage(
+                "friend_list_extract_row",
+                _extract_friend_record(element),
+                scan_started_at=scan_started_at,
+                max_scan_seconds=max_scan_seconds,
+            )
             if not friend_record:
                 continue
 
@@ -2207,7 +2512,31 @@ async def scroll_and_select_user(
             if matched_target_name and normalized_target_name in remaining_targets:
                 if normalized_target_name != next_target_key:
                     continue
-                await element.click()
+                if parse_chat_target(matched_target_name)[0] == "group":
+                    # Groups keep the previous name-based selection; their chat
+                    # identity is checked after opening (bound group id), not here.
+                    await element.click()
+                elif not friend_chat_guard.guard_enabled():
+                    await element.click()
+                else:
+                    selected, reason = await _run_browser_stage("select_friend_identity", friend_chat_guard.select_friend(
+                        page, element, user, matched_target_name))
+                    if not selected and reason in {"friend_binding_unavailable", "friend_binding_incomplete"}:
+                        # A missing stored identity is a per-target gap, not a
+                        # page fault: record it, drop the target for this scan
+                        # and keep delivering the others.
+                        logger.warning(
+                            "Account %s skipped target %s: %s", account_name, matched_target_name, reason)
+                        _persist_browser_send_failure(
+                            user, matched_target_name, "", "friend_binding_unavailable", reason,
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"))
+                        remaining_targets.discard(normalized_target_name)
+                        remaining_index_targets.discard(normalized_target_name)
+                        next_target_key = next(
+                            (item for item in target_order if item in remaining_targets), None)
+                        continue
+                    if not selected:
+                        raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: ' + reason)
                 logger.info("Account %s selected target friend %s", account_name, target_name)
                 if matched_target_name != target_name:
                     logger.info(
@@ -2239,16 +2568,7 @@ async def scroll_and_select_user(
                 break
         if clicked_delivery_target:
             if remaining_targets:
-                _, scrollable_element = await _first_scrollable_friends_element(
-                    page,
-                    scrollable_friends_selectors,
-                )
-                if scrollable_element:
-                    await page.evaluate(
-                        "(element) => { element.scrollTop = 0; }",
-                        scrollable_element,
-                    )
-                    await asyncio.sleep(min(scroll_delay_seconds, 1))
+                await reset_friend_list_scroll()
             continue
 
         if not remaining_targets and not remaining_index_targets:
@@ -2267,31 +2587,13 @@ async def scroll_and_select_user(
                         normalized_targets.get(next_target_key, next_target_key),
                     )
                     if remaining_targets:
-                        _, scrollable_element = await _first_scrollable_friends_element(
-                            page,
-                            scrollable_friends_selectors,
-                        )
-                        if scrollable_element:
-                            await page.evaluate(
-                                "(element) => { element.scrollTop = 0; }",
-                                scrollable_element,
-                            )
-                            await asyncio.sleep(min(scroll_delay_seconds, 1))
+                        await reset_friend_list_scroll()
                         continue
                 await persist_index(True, reached_end=True)
                 if remaining_targets:
                     # A rename followed from the final uid data re-queued a
                     # target under its new nickname; go back and select it.
-                    _, scrollable_element = await _first_scrollable_friends_element(
-                        page,
-                        scrollable_friends_selectors,
-                    )
-                    if scrollable_element:
-                        await page.evaluate(
-                            "(element) => { element.scrollTop = 0; }",
-                            scrollable_element,
-                        )
-                        await asyncio.sleep(min(scroll_delay_seconds, 1))
+                    await reset_friend_list_scroll()
                     continue
                 logger.warning(
                     "Account %s reached the end of the friend list. Missing delivery targets: %s; missing indexed targets=%s",
@@ -2313,16 +2615,7 @@ async def scroll_and_select_user(
                     )
                     if remaining_targets:
                         last_new_friend_at = now_monotonic
-                        _, scrollable_element = await _first_scrollable_friends_element(
-                            page,
-                            scrollable_friends_selectors,
-                        )
-                        if scrollable_element:
-                            await page.evaluate(
-                                "(element) => { element.scrollTop = 0; }",
-                                scrollable_element,
-                            )
-                            await asyncio.sleep(min(scroll_delay_seconds, 1))
+                        await reset_friend_list_scroll()
                         continue
                 await persist_index(False)
                 logger.warning(
@@ -2342,14 +2635,24 @@ async def scroll_and_select_user(
                 logger.debug("Account %s is waiting for more friends to load", account_name)
                 await asyncio.sleep(scroll_delay_seconds)
 
-            scrollable_selector, scrollable_element = await _first_scrollable_friends_element(page, scrollable_friends_selectors)
+            scrollable_selector, scrollable_element = await _run_friend_scan_stage(
+                "friend_list_find_scroll_container",
+                _first_scrollable_friends_element(page, scrollable_friends_selectors),
+                scan_started_at=scan_started_at,
+                max_scan_seconds=max_scan_seconds,
+            )
             if not scrollable_element:
                 raise FriendListUnavailableError(
                     f"friend_list_unavailable for {account_name}: could not find the friend list scroll container"
                 )
 
             logger.debug("Account %s scrolls friend list via selector %s", account_name, scrollable_selector)
-            await page.evaluate(f"(element) => element.scrollTop += {scroll_step_px}", scrollable_element)
+            await _run_friend_scan_stage(
+                "friend_list_scroll",
+                page.evaluate(f"(element) => element.scrollTop += {scroll_step_px}", scrollable_element),
+                scan_started_at=scan_started_at,
+                max_scan_seconds=max_scan_seconds,
+            )
             await asyncio.sleep(scroll_delay_seconds)
 
 
@@ -2361,9 +2664,11 @@ def _is_fallback_run():
     return os.getenv("SPARKFLOW_FALLBACK_PHASE") == "1"
 
 
-def _schedule_timezone():
+def _schedule_timezone(config=None):
+    scoped_config = config or current_message_config() or {}
     timezone_name = (
-        str(os.getenv("SPARKFLOW_TIMEZONE") or "").strip()
+        str(scoped_config.get("scheduleTimezone") or "").strip()
+        or str(os.getenv("SPARKFLOW_TIMEZONE") or "").strip()
         or str(os.getenv("TZ") or "").strip()
         or "Asia/Shanghai"
     )
@@ -2379,20 +2684,40 @@ def _schedule_timezone():
 
 def _normalize_send_window(config):
     raw = config.get("dailySendWindow", {}) or {}
+    raw_end_time = str(raw.get("endTime") or "")
+    end_minutes = None
+    if raw_end_time:
+        if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d|24:00", raw_end_time):
+            end_minutes = 24 * 60 if raw_end_time == "24:00" else sum(
+                value * multiplier for value, multiplier in zip(map(int, raw_end_time.split(":")), (60, 1))
+            )
+        else:
+            end_minutes = -1
+    else:
+        try:
+            end_minutes = int(raw.get("endHour", 18)) * 60
+        except (TypeError, ValueError):
+            end_minutes = -1
     normalized = {
         "enabled": bool(raw.get("enabled", False)),
         "startHour": int(raw.get("startHour", 10)),
-        "endHour": int(raw.get("endHour", 18)),
+        "endHour": end_minutes // 60 if end_minutes >= 0 else -1,
+        "endMinute": end_minutes % 60 if end_minutes >= 0 else -1,
+        "endTime": raw_end_time or f"{end_minutes // 60:02d}:{end_minutes % 60:02d}",
         "scheduleIntervalMinutes": max(1, int(raw.get("scheduleIntervalMinutes", 10))),
     }
+    exact_time = str(raw.get("exactTime") or "")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", exact_time):
+        normalized["exactTime"] = exact_time
     if normalized["startHour"] < 0 or normalized["startHour"] > 23:
         normalized["enabled"] = False
-    if normalized["endHour"] < 1 or normalized["endHour"] > 24:
+    if end_minutes < 1 or end_minutes > 24 * 60:
         normalized["enabled"] = False
-    if normalized["endHour"] <= normalized["startHour"]:
+    if end_minutes <= normalized["startHour"] * 60:
         normalized["enabled"] = False
     if bool(raw.get("enabled", False)) and not normalized["enabled"]:
         logger.warning("Invalid dailySendWindow=%s, disabling windowed sending for this run", raw)
+        normalized["invalid"] = True
     return normalized
 
 
@@ -2475,6 +2800,9 @@ def _target_failed_today(user, target_name, now):
 
 
 def _account_failure_entry_today(user, now):
+    cleanup_block = dict(user.get("browser_cleanup_blocked") or {})
+    if cleanup_block:
+        return cleanup_block  # Manual verification only; not a dated outcome.
     entry = dict(user.get("account_failure") or {})
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
     category = str(entry.get("category") or "")
@@ -2515,8 +2843,14 @@ def _temporary_account_failure_cooldown_minutes():
 
 
 def _account_paused_by_failure_today(user, now):
+    # Unproven cleanup requires operator reconciliation, not a new day or an
+    # explicit send retry. The OS lock alone does not survive process exit.
+    if (user.get("browser_cleanup_blocked")
+            or (user.get("account_failure") or {}).get("category") == "browser_cleanup_blocked"):
+        return True
     entry = _account_failure_entry_today(user, now)
-    if _coerce_attempt_count(entry) < _account_failure_pause_after_attempts():
+    if (entry.get("category") not in {"browser_stage_timeout", "browser_dialog_blocked"}
+            and _coerce_attempt_count(entry) < _account_failure_pause_after_attempts()):
         return False
 
     category = str(entry.get("category") or "")
@@ -2576,7 +2910,13 @@ def _target_has_non_retryable_failure_today(user, target_name, now):
     # Read the shared terminal set instead of repeating it, so a new terminal
     # category (for example a refused browser send) cannot be honoured by the
     # state machine but forgotten by the retry planners.
-    return (
+    state = streak_state.target_state(user, target_name, now)
+    attempted_at = _parse_sent_at(state.get("lastAttemptAt"), now.tzinfo)
+    state_terminal_today = bool(
+        state.get("status") == streak_state.STATE_FAILED_TERMINAL
+        and attempted_at and attempted_at.date() == now.date()
+    )
+    return state_terminal_today or (
         _target_failure_category_today(user, target_name, now)
         in streak_state.TERMINAL_FAILURE_CATEGORIES
     )
@@ -2670,7 +3010,12 @@ def _pending_unsent_targets(user, now):
 
 
 def _scheduled_send_time(user, target_name, send_window, now):
-    window_minutes = (send_window["endHour"] - send_window["startHour"]) * 60
+    if send_window.get("exactTime"):
+        hour, minute = map(int, send_window["exactTime"].split(":"))
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    window_minutes = (send_window["endHour"] - send_window["startHour"]) * 60 + int(send_window.get("endMinute") or 0)
+    if window_minutes <= 0:
+        raise ValueError("The send window must have a positive duration")
     start_of_window = now.replace(
         hour=send_window["startHour"],
         minute=0,
@@ -2700,6 +3045,13 @@ def _window_boundary(now, hour):
 
 
 def _select_due_targets(user, send_window, now):
+    from core import refusal_retry
+    scope_ok, schedule_timezone = _sender_scope_timezone(user)
+    if not scope_ok:
+        return [], [], [], _dedupe_group_target_aliases(list(user.get("targets") or []))
+    if os.getenv("SPARKFLOW_8610_RETRY_ONLY") == "1":
+        # Retired extra-pass mode must never bypass the final fallback policy.
+        return [], [], [], _dedupe_group_target_aliases(list(user.get("targets") or []))
     # Scheduler decisions must use the same group namespace/alias rules as the
     # browser sender, otherwise 群聊：/群聊: aliases can each be scheduled.
     targets = _dedupe_group_target_aliases(list(user.get("targets") or []))
@@ -2736,6 +3088,7 @@ def _select_due_targets(user, send_window, now):
         return [], already_sent, pending_targets, queued_failures
 
     due_targets = []
+    refusal_retry_targets = []
     already_sent = []
     pending_targets = []
     queued_failures = []
@@ -2745,6 +3098,16 @@ def _select_due_targets(user, send_window, now):
             already_sent.append(target_name)
             continue
         scheduled_at = _scheduled_send_time(user, target_name, send_window, now)
+        if refusal_retry.used_today(
+                user, target_name, now, schedule_timezone=schedule_timezone):
+            queued_failures.append(target_name)
+            continue
+        if (not account_paused and phase == "fallback"
+                and _automatic_refusal_retry_eligible(
+                    user, target_name, now, schedule_timezone=schedule_timezone,
+                )):
+            refusal_retry_targets.append(target_name)
+            continue
         if any(
             streak_state.attempt_in_progress(user, target_name, check_now)
             for check_now in phase_check_times
@@ -2829,14 +3192,14 @@ def _select_due_targets(user, send_window, now):
             _account_failure_attempts_today(user, now),
             _account_failure_pause_after_attempts(),
         )
-    return due_targets, already_sent, pending_targets, queued_failures
+    return due_targets + refusal_retry_targets, already_sent, pending_targets, queued_failures
 
 
 def _prepare_active_users_for_run(active_config, active_user_data):
-    schedule_tz = _schedule_timezone()
+    schedule_tz = _schedule_timezone(active_config)
     now = datetime.now(schedule_tz)
 
-    if not _is_manual_run() or _is_fallback_run():
+    if not _is_manual_run() or _is_fallback_run() or os.getenv("SPARKFLOW_8610_RETRY_ONLY") == "1":
         healthy_users = []
         checked_at = now.astimezone(timezone.utc).isoformat(timespec="seconds")
         for user in active_user_data:
@@ -2862,6 +3225,17 @@ def _prepare_active_users_for_run(active_config, active_user_data):
         if not active_user_data:
             logger.warning("No accounts passed preflight for the scheduled run")
             return []
+
+    if os.getenv("SPARKFLOW_8610_RETRY_ONLY") == "1":
+        send_window = _normalize_send_window(active_config)
+        if not send_window.get("enabled"):
+            return []
+        runnable_users = []
+        for user in active_user_data:
+            due, _, _, _ = _select_due_targets(user, send_window, now)
+            if due:
+                runnable_users.append(dict(user, targets=due))
+        return runnable_users
 
     if _is_fallback_run():
         send_window = _normalize_send_window(active_config)
@@ -2923,6 +3297,9 @@ def _prepare_active_users_for_run(active_config, active_user_data):
 
     send_window = _normalize_send_window(active_config)
     if not send_window.get("enabled"):
+        if send_window.get("invalid"):
+            logger.error("Not sending because dailySendWindow is invalid")
+            return []
         return [dict(user, targets=list(user.get("targets") or [])) for user in active_user_data]
 
     logger.info(
@@ -2971,19 +3348,7 @@ def _account_match_tokens(user):
 
 
 def _find_matching_account(accounts, user):
-    target_username = str(user.get("username") or "").strip()
-    target_unique_id = normalize_unique_id(user.get("unique_id"))
-    if not target_username and not target_unique_id:
-        return None
-
-    for account in accounts:
-        account_username = str(account.get("username") or "").strip()
-        account_unique_id = normalize_unique_id(account.get("unique_id"))
-        if target_unique_id and account_unique_id == target_unique_id:
-            return account
-        if target_username and account_username == target_username:
-            return account
-    return None
+    return streak_state.find_matching_account(accounts, user)
 
 
 def _persist_group_target_rename_notice(user, configured, current_name):
@@ -3053,14 +3418,14 @@ def _persist_account_send_failure(user, category, reason, attempted_at, affected
             "lastRunMode": _current_run_mode(),
             "affectedTargets": affected_targets,
         }
-        failure_queue = dict(matched.get("failure_queue") or {})
-        for target_name in affected_targets:
-            failure_queue.pop(target_name, None)
-        if failure_queue:
-            matched["failure_queue"] = failure_queue
-        else:
-            matched.pop("failure_queue", None)
+        # An account navigation/login failure is not a new target outcome.
+        # Preserve target receipts, including the current rejection needed by
+        # the bounded retry policy; deleting nickname keys can expose stale
+        # stable-id entries and make the planner disagree with dispatch.
         matched["account_failure"] = entry
+        if category == "browser_cleanup_blocked":
+            # Independent sticky safety state: late results must never clear it.
+            matched.setdefault("browser_cleanup_blocked", dict(entry))
         return (dict(matched), dict(entry)), True
 
     saved = update_user_data(mutate, force_reload=True)
@@ -3074,13 +3439,8 @@ def _persist_account_send_failure(user, category, reason, attempted_at, affected
     matched_account, entry = saved
 
     user["account_failure"] = dict(entry)
-    user_queue = dict(user.get("failure_queue") or {})
-    for target_name in affected_targets:
-        user_queue.pop(target_name, None)
-    if user_queue:
-        user["failure_queue"] = user_queue
-    else:
-        user.pop("failure_queue", None)
+    if category == "browser_cleanup_blocked":
+        user.setdefault("browser_cleanup_blocked", dict(entry))
     logger.warning(
         "Paused browser sends for account %s category=%s affectedTargets=%s reason=%s",
         matched_account.get("username", "unknown"),
@@ -3104,7 +3464,13 @@ def _clear_account_send_failure(user):
 
 def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, missing_targets=None):
     def mutate(accounts):
-        matched = _find_matching_account(accounts, user)
+        snapshot = user.get("_refresh_snapshot")
+        if snapshot:
+            matched = next((row for row in accounts if row.get("account_ref") == snapshot.get("account_ref")), None)
+        else:
+            matched = _find_matching_account(accounts, user)
+        if snapshot and not same_login_snapshot(matched, snapshot):
+            return None, False
         if matched is None:
             return None, False
         existing_index = dict(matched.get("friend_index") or {})
@@ -3141,7 +3507,8 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
         }
         matched["friend_index"] = existing_index
         matched["friend_index_meta"] = meta
-        if scan_complete and friend_records:
+        if (scan_complete and friend_records
+                and (matched.get("account_failure") or {}).get("category") != "browser_dialog_blocked"):
             matched.pop("account_failure", None)
         return (dict(existing_index), dict(meta), dict(matched)), True
 
@@ -3151,14 +3518,18 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
             "Could not find account to persist friend index for user=%s",
             user.get("username", "unknown"),
         )
-        return
+        return False
 
     existing_index, meta, matched_account = saved
 
     user["friend_index"] = dict(existing_index)
     user["friend_index_meta"] = dict(meta)
     if scan_complete and friend_records:
-        user.pop("account_failure", None)
+        saved_failure = matched_account.get("account_failure") or {}
+        if saved_failure.get("category") == "browser_dialog_blocked":
+            user["account_failure"] = dict(saved_failure)
+        else:
+            user.pop("account_failure", None)
 
     logger.info(
         "Persisted friend index for %s scanned=%s complete=%s missingTargets=%s",
@@ -3167,6 +3538,7 @@ def _persist_friend_index(user, friend_records, scanned_at, *, scan_complete, mi
         bool(scan_complete),
         list(missing_targets or []),
     )
+    return True
 
 
 def record_friend_scan(user, names, *, scan_complete, targets=None, missing_targets=None, scanned_at=None):
@@ -3203,14 +3575,14 @@ def record_friend_scan(user, names, *, scan_complete, targets=None, missing_targ
             if str(target or "").strip()
             and _normalize_target_name(str(target).strip()) not in found
         ]
-    _persist_friend_index(
+    persisted = _persist_friend_index(
         user,
         records,
         scanned_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         scan_complete=bool(scan_complete),
         missing_targets=list(missing_targets),
     )
-    return records
+    return records if persisted is not False else False
 
 
 def _log_rejected_state_transition(action, user, target_name, state, now, *, requested, detail=""):
@@ -3508,12 +3880,7 @@ def _persist_browser_send_success(
         history = dict(matched.get("message_history") or {})
         history[target_name] = dict(strong_entry)
         matched["message_history"] = history
-        queue = dict(matched.get("failure_queue") or {})
-        queue.pop(target_name, None)
-        if queue:
-            matched["failure_queue"] = queue
-        else:
-            matched.pop("failure_queue", None)
+        streak_state.clear_failure_entries(matched, target_name)
         matched.pop("account_failure", None)
         return dict(matched), True
 
@@ -3571,12 +3938,7 @@ def _persist_browser_send_success(
     user_history = dict(user.get("message_history") or {})
     user_history[target_name] = dict(strong_entry)
     user["message_history"] = user_history
-    user_queue = dict(user.get("failure_queue") or {})
-    user_queue.pop(target_name, None)
-    if user_queue:
-        user["failure_queue"] = user_queue
-    else:
-        user.pop("failure_queue", None)
+    streak_state.clear_failure_entries(user, target_name)
     user.pop("account_failure", None)
 
     logger.info(
@@ -3610,27 +3972,71 @@ def _split_sender_modes(active_config, runnable_user_data):
     if not active_config.get("useProtocolSender", True):
         return [], runnable_user_data
 
+    from core import refusal_retry
+
     browser_sender_accounts = {
         str(item).strip().lower()
         for item in (active_config.get("browserSenderAccounts") or [])
         if str(item).strip()
     }
+    now = datetime.now(_schedule_timezone())
     protocol_users = []
     browser_users = []
     for user in runnable_user_data:
         targets = _dedupe_group_target_aliases(list(user.get("targets") or []))
-        group_targets = [target for target in targets if parse_chat_target(target)[0] == "group"]
-        friend_targets = [target for target in targets if parse_chat_target(target)[0] == "friend"]
-        # Group chats have no peer identity contract for the protocol sender.
-        # Split mixed accounts so a group can never fall through to protocol.
-        if group_targets:
-            browser_users.append(dict(user, targets=group_targets))
-        if friend_targets:
-            if _account_match_tokens(user) & browser_sender_accounts:
-                browser_users.append(dict(user, targets=friend_targets))
-            else:
-                protocol_users.append(dict(user, targets=friend_targets))
+        browser_targets = []
+        protocol_targets = []
+        account_requires_browser = bool(
+            _account_match_tokens(user) & browser_sender_accounts
+        )
+        for target in targets:
+            target_kind = parse_chat_target(target)[0]
+            # Group chats have no peer identity contract for the protocol sender.
+            # Strict 8610 retries use the browser claim wrapper, which owns the
+            # shared durable reservation and its independent readback.
+            if (
+                target_kind == "group"
+                or account_requires_browser
+                or (refusal_retry.explicit_8610(user, target, now)
+                    and not refusal_retry.rejection_precedes_today(user, target, now))
+            ):
+                browser_targets.append(target)
+            elif target_kind == "friend":
+                protocol_targets.append(target)
+        # Keep every browser-routed target for an account in one row.  This lets
+        # the browser wrapper order ordinary group work before retry work.
+        if browser_targets:
+            browser_users.append(dict(user, targets=browser_targets))
+        if protocol_targets:
+            protocol_users.append(dict(user, targets=protocol_targets))
     return protocol_users, browser_users
+
+
+def _browser_login_generation_current(user):
+    """Fail closed on a saved re-login, deletion or ambiguous stable record."""
+    try:
+        accounts = get_userData(force_reload=True)
+        ref = str(user.get("account_ref") or "")
+        if ref:
+            matches = [a for a in accounts if str(a.get("account_ref") or "") == ref]
+            matched = matches[0] if len(matches) == 1 else None
+        else:
+            matched = _find_matching_account(accounts, user)
+        return (matched is not None
+                and normalize_unique_id(matched.get("unique_id")) == normalize_unique_id(user.get("unique_id"))
+                and str(matched.get("login_generation") or "") == str(user.get("login_generation") or ""))
+    except Exception:
+        return False
+
+
+async def _dispatch_browser_enter_if_current(user, chat_input):
+    # Read inside the dispatch task, not before it is queued by the stage wrapper.
+    if (send_pause.should_pause_sending() or not personal_streak.authorized(user)
+            or not personal_streak.within_send_window(user)
+            or not _browser_login_generation_current(user)):
+        return False
+    await chat_input.press("Enter")
+    return True
 
 
 def _mark_browser_target_in_flight(
@@ -3644,7 +4050,41 @@ def _mark_browser_target_in_flight(
     effective_run_id = str(run_id or _ACTIVE_RUN_ID or "")
     if not effective_run_id:
         return False
-    now = datetime.now(timezone.utc)
+    from core import refusal_retry
+    now = datetime.now(_schedule_timezone())
+    scope_ok, schedule_timezone = _sender_scope_timezone(user)
+    if not scope_ok:
+        return False
+
+    def permission(account):
+        # A QR/manual re-login supersedes an already-running browser session.
+        # Explicit retries do not authorize an old session to use the new row.
+        if str(account.get("login_generation") or "") != str(user.get("login_generation") or ""):
+            return False, False
+        before = streak_state.target_state(account, target_name, now)
+        if not allow_retry:
+            if refusal_retry.used_today(account, target_name, now, schedule_timezone=schedule_timezone):
+                return False, False
+            if before.get("status") == streak_state.STATE_FAILED_TERMINAL:
+                if (not refusal_retry.rejection_precedes_today(
+                            account, target_name, now, schedule_timezone=schedule_timezone,
+                        )
+                        and not _automatic_refusal_retry_eligible(
+                            account, target_name, now, schedule_timezone=schedule_timezone,
+                        )):
+                    return False, False
+        consume = (before.get("lastErrorCategory") == "send_rejected"
+                   and not refusal_retry.rejection_precedes_today(
+                       account, target_name, now, schedule_timezone=schedule_timezone,
+                   )
+                   and not refusal_retry.used_today(
+                       account, target_name, now, schedule_timezone=schedule_timezone,
+                   ))
+        return True, consume
+
+    permitted, _consume = permission(user)
+    if not permitted:
+        return False
     state, claimed = streak_state.claim_in_flight(
         user,
         target_name,
@@ -3667,6 +4107,9 @@ def _mark_browser_target_in_flight(
         matched = streak_state.find_matching_account(accounts, user)
         if matched is None:
             return None, False
+        permitted, consume = permission(matched)
+        if not permitted:
+            return None, False
         matched_state = streak_state.mark_in_flight(
             matched,
             target_name,
@@ -3680,6 +4123,12 @@ def _mark_browser_target_in_flight(
             or str(matched_state.get("runId") or "") != effective_run_id
         ):
             return None, False
+        if consume:
+            if refusal_retry.reserve(
+                    matched, target_name, now, effective_run_id,
+                    schedule_timezone=schedule_timezone,
+            ) is None:
+                return None, False
         if fallback:
             streak_state.mark_fallback_attempted(
                 matched,
@@ -3689,7 +4138,25 @@ def _mark_browser_target_in_flight(
         return dict(matched), True
 
     persisted = update_user_data(mutate, force_reload=True)
-    return persisted is not None
+    if persisted is None:
+        return False
+    if refusal_retry.used_today(persisted, target_name, now, schedule_timezone=schedule_timezone):
+        # The quota is consumed even if the process dies before clicking Send.
+        user[refusal_retry.KEY] = dict(persisted.get(refusal_retry.KEY) or {})
+        accounts = get_userData(force_reload=True)
+        verified = streak_state.find_matching_account(accounts, user)
+        if verified is None or not refusal_retry.used_today(
+                verified, target_name, now, schedule_timezone=schedule_timezone):
+            return False
+        verified_state = streak_state.target_state(verified, target_name, now)
+        if (verified_state.get("status") != streak_state.STATE_IN_FLIGHT
+                or verified_state.get("runId") != effective_run_id):
+            return False
+        ref = streak_state.resolve_target_ref(verified, target_name)
+        reservation = (verified.get(refusal_retry.KEY) or {}).get(ref) or {}
+        if reservation.get("runId") != effective_run_id and not allow_retry:
+            return False
+    return True
 
 
 def _persist_account_preflight(user, result, checked_at):
@@ -3759,7 +4226,10 @@ def _prepare_protocol_fallback_users(active_config, protocol_users):
                     continue
                 targets.append(target_name)
             if targets:
-                fallback_users.append(dict(matched, targets=targets))
+                fallback = dict(matched, targets=targets)
+                if "_personal_scope" in user:
+                    fallback["_personal_scope"] = dict(user["_personal_scope"])
+                fallback_users.append(fallback)
         return fallback_users, bool(fallback_users)
 
     return update_user_data(mutate, force_reload=True) or []
@@ -3950,6 +4420,22 @@ def _browser_account_timeout_seconds(friend_scan_config, target_count):
 
 
 async def run_browser_tasks(
+    active_config, browser_user_data, *, run_id="", fallback=False, allow_retry=False,
+):
+    if send_pause.should_pause_sending():
+        logger.info("Skipping browser sender: sending is temporarily paused")
+        return
+    if browser_user_data and not all("_personal_scope" in user for user in browser_user_data):
+        groups = personal_streak.account_groups(active_config, browser_user_data, manual=True)
+        if not groups or any("_personal_scope" in user for _, accounts in groups for user in accounts):
+            for config, accounts in groups:
+                await run_browser_tasks(config, accounts, run_id=run_id, fallback=fallback, allow_retry=allow_retry)
+            return
+    with using_message_config(active_config):
+        return await _run_browser_tasks(active_config, browser_user_data, run_id=run_id, fallback=fallback, allow_retry=allow_retry)
+
+
+async def _run_browser_tasks(
     active_config,
     browser_user_data,
     *,
@@ -3963,7 +4449,13 @@ async def run_browser_tasks(
     send_strategy = _normalize_send_strategy(active_config)
     friend_scan_config = _normalize_friend_list_scan_config(active_config)
     profile_config = _normalize_persistent_profile_config(active_config)
-    network_mode = await select_douyin_network_mode(CREATOR_HOME_URL)
+    if profile_config["enabled"]:
+        # Persistent sender profiles own the first real homepage navigation. Do
+        # not launch a disposable anonymous browser merely to choose its route.
+        network_mode = douyin_network_modes()[0]
+    else:
+        # Retain the established disposable-context preflight for legacy runs.
+        network_mode = await select_douyin_network_mode(CREATOR_HOME_URL)
     logger.info("Selected Douyin task network route=%s", network_mode)
     semaphore = asyncio.Semaphore(active_config["taskCount"] if active_config["multiTask"] else 1)
     tasks = []
@@ -4044,10 +4536,22 @@ async def do_user_task(
     allow_retry=False,
 ):
     async with semaphore:
+        if send_pause.should_pause_sending():
+            return
+        if not personal_streak.authorized(user):
+            logger.info("Skipping account because its personal sending authorization changed")
+            return
         account_name = user.get("username", "unknown")
+        lock_key = _account_profile_name(user)
+        if lock_key in _BLOCKED_BROWSER_LOCKS:
+            logger.error("Browser account blocked: previous cleanup is unproven")
+            return
         account_lock_handle = None
         account_lock_path = None
         account_lock_token = None
+        session_state = {"cleanup_complete": True}
+        operation_tasks = set()
+        owner_token = _BROWSER_OPERATION_OWNER.set(operation_tasks)
         try:
             (
                 account_lock_handle,
@@ -4063,43 +4567,74 @@ async def do_user_task(
                 account_name,
                 timeout_seconds,
             )
-            try:
-                await asyncio.wait_for(
-                    _do_user_task_locked(
-                        browser,
-                        user,
-                        send_strategy,
-                        profile_config,
-                        friend_scan_config,
-                        account_name,
-                        network_mode,
-                        run_id=run_id,
-                        fallback=fallback,
-                        allow_retry=allow_retry,
-                    ),
-                    timeout=timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                reason = f"browser sender exceeded {timeout_seconds}s timeout guard"
-                logger.exception("Account %s browser sender timed out", account_name)
-                for target_name in user.get("targets") or []:
-                    _persist_browser_send_failure(
-                        user,
-                        target_name,
-                        "",
-                        "timeout",
-                        reason,
-                        attempted_at,
+            route_modes = (network_mode,)
+            if profile_config["enabled"]:
+                configured_modes = tuple(douyin_network_modes())
+                try:
+                    first_index = configured_modes.index(network_mode)
+                except ValueError:
+                    first_index = len(configured_modes)
+                # Sender route fallback is one bounded retry, never a route loop.
+                route_modes = configured_modes[first_index:first_index + 2] or (network_mode,)
+            account_deadline = asyncio.get_running_loop().time() + timeout_seconds
+            for route_index, active_network_mode in enumerate(route_modes):
+                remaining_seconds = account_deadline - asyncio.get_running_loop().time()
+                if remaining_seconds <= 0:
+                    _record_browser_stage_failure(
+                        user, BrowserStageTimeout("whole_account"), user.get("targets") or [])
+                    break
+                try:
+                    await _run_browser_stage(
+                        "whole_account",
+                        _do_user_task_locked(
+                            browser,
+                            user,
+                            send_strategy,
+                            profile_config,
+                            friend_scan_config,
+                            account_name,
+                            active_network_mode,
+                            run_id=run_id,
+                            fallback=fallback,
+                            allow_retry=allow_retry,
+                            _session_state=session_state,
+                            _allow_pre_dispatch_route_fallback=(
+                                profile_config["enabled"] and route_index == 0
+                                and len(route_modes) > 1
+                            ),
+                        ),
+                        timeout_seconds=remaining_seconds,
+                        cancel_grace_seconds=3 * (BROWSER_CLEANUP_TIMEOUT_SECONDS + 1.0) + 2,
                     )
+                    break
+                except _PreDispatchNetworkRouteFallback:
+                    # _do_user_task_locked's finally closes the old profile first.
+                    # Do not reopen while its cleanup or owned readers remain unsure.
+                    if not _route_reopen_cleanup_proven(session_state, operation_tasks):
+                        logger.error("Skipping sender route fallback: prior profile cleanup is unproven")
+                        break
+                    logger.info(
+                        "Retrying persistent sender profile on fallback route=%s",
+                        route_modes[route_index + 1],
+                    )
+                    continue
+                except BrowserStageTimeout as exc:
+                    # Never replace in-flight/unknown or confirmed target outcomes.
+                    _record_browser_stage_failure(user, exc, user.get("targets") or [])
+                    break
         finally:
+            _BROWSER_OPERATION_OWNER.reset(owner_token)
             if account_lock_handle is not None:
-                _release_browser_account_lock(
-                    account_lock_handle,
-                    account_lock_path,
-                    account_lock_token,
-                    account_name,
-                )
+                if session_state["cleanup_complete"] and not any(not t.done() for t in operation_tasks):
+                    _release_browser_account_lock(
+                        account_lock_handle, account_lock_path, account_lock_token, account_name)
+                else:
+                    _BLOCKED_BROWSER_LOCKS[lock_key] = (
+                        account_lock_handle, account_lock_path, account_lock_token)
+                    _persist_account_send_failure(
+                        user, "browser_cleanup_blocked", "browser cleanup not proven complete",
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        _browser_not_started_targets(user, user.get("targets") or []))
 
 
 async def _do_user_task_locked(
@@ -4114,7 +4649,11 @@ async def _do_user_task_locked(
     run_id="",
     fallback=False,
     allow_retry=False,
+    _session_state=None,
+    _allow_pre_dispatch_route_fallback=False,
 ):
+    session_state = _session_state if _session_state is not None else {}
+    session_state["cleanup_complete"] = True
     cookies = user["cookies"]
     targets = _dedupe_group_target_aliases(
         _ordered_targets_for_run(user["targets"], send_strategy)
@@ -4126,9 +4665,29 @@ async def _do_user_task_locked(
     )
     await _sleep_with_log(start_delay, "Delaying browser sender start", account_name)
 
+    # Recheck the durable ledger under the lock immediately before launch.
+    latest = _find_matching_account(get_userData(force_reload=True), user)
+    eligibility_account = latest if latest is not None else user
+    if (eligibility_account.get("browser_cleanup_blocked")
+            or (eligibility_account.get("account_failure") or {}).get("category") == "browser_cleanup_blocked"):
+        return
+    if not allow_retry and _account_paused_by_failure_today(
+            eligibility_account, datetime.now(_schedule_timezone())):
+        return
+    targets = _browser_prelaunch_targets(
+        eligibility_account, targets, allow_retry, scope_user=user
+    )
+    if not targets:
+        logger.info("Skipping browser launch: dispatch eligibility guard denied all targets")
+        return
+
     owned_playwright = None
     profile_dir = None
     context = None
+    cookie_session = None
+    cookie_export_safe = False
+    session_state["cleanup_complete"] = False
+    session_state["launch_pending"] = True
     try:
         if profile_config["enabled"]:
             owned_playwright, context, profile_dir = await get_persistent_browser_context(
@@ -4136,50 +4695,61 @@ async def _do_user_task_locked(
                 root=profile_config["root"],
                 network_mode=network_mode,
             )
+            session_state["launch_pending"] = False
             logger.info("Opened persistent browser profile for %s at %s", account_name, profile_dir)
-            if profile_config["syncStoredCookiesBeforeRun"]:
-                await apply_stored_cookies_to_profile(context, cookies, account_name)
-            elif profile_config["seedCookiesWhenEmpty"]:
-                await apply_stored_cookies_to_profile(context, cookies, account_name, only_when_empty=True)
+            cookie_session = await _run_browser_stage(
+                "seed_cookies", prepare_profile_cookies(context, user, profile_config, profile_dir))
+            _adopt_cookie_session_snapshot(user, cookie_session)
         else:
             context = await browser.new_context()
 
+        session_state["launch_pending"] = False
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)
-    except Exception:
-        if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
-        if owned_playwright is not None:
-            try:
-                await owned_playwright.stop()
-            except Exception:
-                pass
+    except BaseException:
+        await _cleanup_browser_session(None, context, owned_playwright, session_state)
         raise
     yielded_targets = set()
     group_scan_errors = []
     persisted_group_error_targets = set()
     page = None
     uid_collector = None
+    home_navigation = {"tracking": False, "committed": False, "completed": False}
+
+    def note_home_commit(_frame):
+        home_navigation["committed"] = True
 
     try:
-        page = await context.new_page()
+        page = await _run_browser_stage("new_page", context.new_page())
         # Passively read the friend uids the chat page requests by itself; no
         # request is built or replayed here.
-        uid_collector = friend_identity.UserDetailCollector(account_name).attach(page)
+        uid_collector = friend_identity.UserDetailCollector(account_name, purpose="send").attach(page)
         try:
-            await retry_operation(
-                "open creator home",
-                page.goto,
-                retries=3,
-                delay=5,
-                url=CREATOR_HOME_URL,
-            )
+            try:
+                page.on("framenavigated", note_home_commit)
+                home_navigation["tracking"] = True
+            except Exception:
+                # Without a commit monitor normal navigation remains possible,
+                # but a failure must never authorize reopening on another route.
+                pass
+            try:
+                await _navigate_with_retries(
+                    "open creator home",
+                    page.goto,
+                    retries=3,
+                    delay=5,
+                    url=CREATOR_HOME_URL,
+                )
+                home_navigation["completed"] = True
+            finally:
+                if home_navigation["tracking"]:
+                    try:
+                        page.remove_listener("framenavigated", note_home_commit)
+                    except Exception:
+                        home_navigation["tracking"] = False
             if not profile_config["enabled"]:
-                await context.add_cookies(cookies)
-            await retry_operation(
+                await _run_browser_stage("seed_cookies", context.add_cookies(cookies))
+            await _navigate_with_retries(
                 "open chat page",
                 page.goto,
                 retries=3,
@@ -4187,10 +4757,18 @@ async def _do_user_task_locked(
                 url=CREATOR_CHAT_URL,
             )
             await asyncio.sleep(3)
-            await ensure_not_login_required(page, account_name, "open_chat_page")
+            await _run_browser_stage("login_check", ensure_not_login_required(page, account_name, "open_chat_page"))
+            cookie_export_safe = True
             if profile_config["enabled"] and profile_config["refreshStoredCookiesAfterLogin"]:
-                await refresh_stored_cookies_from_profile(context, user, account_name)
+                await _run_browser_stage("refresh_cookies", refresh_stored_cookies_from_profile(
+                    context, user, account_name, cookie_session=cookie_session))
         except Exception as exc:
+            cookie_export_safe = False
+            if (_allow_pre_dispatch_route_fallback
+                    and _is_pre_dispatch_network_failure(page, exc, home_navigation)):
+                # This leaves the target loop and every send/Enter guard untouched;
+                # the enclosing locked attempt closes this profile before retrying.
+                raise _PreDispatchNetworkRouteFallback() from exc
             attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             category = classify_browser_failure("open_chat_page", exc)
             reason = str(exc)
@@ -4214,7 +4792,7 @@ async def _do_user_task_locked(
                     account_name,
                     len(targets),
                 )
-            async for target_name in scroll_and_select_user(
+            async for target_name in _bounded_target_scan(_scan_delivery_targets(
                 page,
                 user,
                 account_name,
@@ -4223,16 +4801,21 @@ async def _do_user_task_locked(
                 index_targets=index_targets,
                 uid_collector=uid_collector,
                 group_scan_errors=group_scan_errors,
-            ):
+            ), max(30, float(friend_scan_config.get("maxScanSeconds") or 300))):
+                if not personal_streak.authorized(user):
+                    logger.info("Stopping account because its personal sending authorization changed")
+                    return
                 yielded_targets.add(target_name)
                 message = ""
                 chat_input = None
                 last_own_message_before = None
                 send_receipt = {}
                 try:
-                    await save_debug_artifacts(page, account_name, target_name, "selected-friend")
-                    chat_input, selector_used = await locate_chat_input(page)
+                    await _run_browser_stage("debug_selected", save_debug_artifacts(page, account_name, target_name, "selected-friend"))
+                    chat_input, selector_used = await _run_browser_stage("locate_chat_input", locate_chat_input(page))
                     logger.info("Using chat input selector %s for %s/%s", selector_used, account_name, target_name)
+                    if parse_chat_target(target_name)[0] != "group":
+                        await _require_friend_chat(page, user, target_name, wait=True)
 
                     previous_entry = dict(user.get("message_history") or {}).get(target_name) or {}
                     previous_message = str(previous_entry.get("message") or "")
@@ -4245,10 +4828,10 @@ async def _do_user_task_locked(
                         len(message),
                         bool(previous_message and previous_message == message),
                     )
-                    last_own_message_before = await snapshot_last_own_message(
+                    last_own_message_before = await _run_browser_stage("last_message_read", snapshot_last_own_message(
                         page,
                         chat_input=chat_input,
-                    )
+                    ))
                     logger.info(
                         "Last own message before send for %s/%s length=%s",
                         account_name,
@@ -4265,31 +4848,37 @@ async def _do_user_task_locked(
                     )
                     if not started:
                         logger.info(
-                            "Skipping browser send for %s/%s because it is already confirmed",
+                            "Skipping browser send for %s/%s: dispatch guard denied (confirmation, retry eligibility, quota or persistence check)",
                             account_name,
                             target_name,
                         )
                         continue
                     lines = message.split("\n")
                     for index, line in enumerate(lines):
-                        await chat_input.type(line, delay=50)
+                        await _run_browser_stage("type_message", chat_input.type(line, delay=50))
                         if index < len(lines) - 1:
-                            await chat_input.press("Shift+Enter")
+                            await _run_browser_stage("type_newline", chat_input.press("Shift+Enter"))
 
-                    await save_debug_artifacts(page, account_name, target_name, "typed-message")
+                    await _run_browser_stage("debug_typed", save_debug_artifacts(page, account_name, target_name, "typed-message"))
 
-                    im_observer_summary = await start_im_send_observer(page, account_name, target_name)
+                    im_observer_summary = await _run_browser_stage("start_observer", start_im_send_observer(page, account_name, target_name))
                     # Baseline the failure indicator while the message is still
                     # sitting in the input: anything on the page now predates
                     # this send and must not veto the confirmation below.
-                    pre_send_indicator = await _detect_send_failure_indicator(page)
+                    pre_send_indicator = await _run_browser_stage("failure_indicator", _detect_send_failure_indicator(page))
+                    if not _browser_login_generation_current(user):
+                        cookie_export_safe = False
+                        logger.info("Stopping old browser session: saved login changed before Enter")
+                        return
                     if parse_chat_target(target_name)[0] == "group":
                         bound_id = get_bound_group_conversation_id(user, target_name)
                         if bound_id:
-                            verified, verify_reason = await _verify_open_group_conversation(page, chat_input, bound_id)
+                            verified, verify_reason = await _run_browser_stage("verify_group_identity", _verify_open_group_conversation(page, chat_input, bound_id))
                             if not verified:
                                 try:
-                                    await chat_input.fill("")
+                                    await _run_browser_stage("clear_input", chat_input.fill(""))
+                                except BrowserStageTimeout:
+                                    raise
                                 except Exception:
                                     pass
                                 raise RuntimeError(f"group_identity_unavailable before barrier: {verify_reason}")
@@ -4309,24 +4898,52 @@ async def _do_user_task_locked(
                             )
                             return
                         if bound_id:
-                            verified, verify_reason = await _verify_open_group_conversation(page, chat_input, bound_id)
+                            verified, verify_reason = await _run_browser_stage("verify_group_identity", _verify_open_group_conversation(page, chat_input, bound_id))
                             if not verified:
                                 try:
-                                    await chat_input.fill("")
+                                    await _run_browser_stage("clear_input", chat_input.fill(""))
+                                except BrowserStageTimeout:
+                                    raise
                                 except Exception:
                                     pass
                                 raise RuntimeError(f"group_identity_unavailable before Enter: {verify_reason}")
+                    if not personal_streak.authorized(user):
+                        await chat_input.fill("")
+                        logger.info("Stopping before send because personal authorization changed")
+                        return
+                    if not personal_streak.within_send_window(user):
+                        await chat_input.fill("")
+                        logger.info("Stopping before send because the personal end time has passed")
+                        return
+                    if parse_chat_target(target_name)[0] != "group":
+                        # Friends need the same durable unknown-outcome barrier:
+                        # an in-flight lease alone becomes retryable on expiry.
+                        if not _persist_browser_pre_enter_unknown(
+                            user, target_name, message,
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        ):
+                            logger.error("Aborting before Enter: durable resend barrier unavailable")
+                            return
+                        await _require_friend_chat(page, user, target_name, arm=True)
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
-                    await chat_input.press("Enter")
+                    if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input)):
+                        cookie_export_safe = False
+                        logger.info("Stopping old browser session: saved login changed at dispatch")
+                        return
+                    if (parse_chat_target(target_name)[0] != "group"
+                            and friend_chat_guard.guard_enabled()):
+                        allowed = await _run_browser_stage("friend_dispatch_guard", friend_chat_guard.dispatch_was_allowed(page))
+                        if not allowed:
+                            raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: Enter blocked at dispatch')
 
-                    sent_ok, detail = await confirm_message_sent(
+                    sent_ok, detail = await _run_browser_stage("confirm_message", confirm_message_sent(
                         page,
                         chat_input,
                         message,
                         before_snapshot=last_own_message_before,
                         before_indicator=pre_send_indicator,
-                    )
-                    im_summary = await im_observer_summary()
+                    ))
+                    im_summary = await _run_browser_stage("read_observer", im_observer_summary())
                     logger.info(
                         "IM send observer summary for %s/%s: request=%s response=%s events=%s error=%s",
                         account_name,
@@ -4343,7 +4960,7 @@ async def _do_user_task_locked(
                         f"response={im_summary.get('send_response_seen')} serverOk={server_ok} "
                         f"logid={send_receipt.get('logid', '')} reason={send_receipt.get('reason', '')}"
                     )
-                    await save_debug_artifacts(page, account_name, target_name, "after-send")
+                    await _run_browser_stage("debug_after_send", save_debug_artifacts(page, account_name, target_name, "after-send"))
 
                     if im_summary.get("enabled"):
                         if not im_summary.get("send_request_seen"):
@@ -4381,16 +4998,28 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message", account_name)
+                except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+                    # No recovery browser probes after a wedged stage or an
+                    # identity mismatch, and never continue to another target.
+                    try:
+                        await _run_browser_stage(
+                            "friend_disarm",
+                            friend_chat_guard.disarm(page),
+                            timeout_seconds=BROWSER_CLEANUP_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        pass
+                    raise
                 except Exception as exc:
                     sent_ok = False
                     detail = ""
                     if message:
-                        sent_ok, detail = await detect_message_already_sent(
+                        sent_ok, detail = await _run_browser_stage("recover_evidence", detect_message_already_sent(
                             page,
                             chat_input,
                             message,
                             before_snapshot=last_own_message_before,
-                        )
+                        ))
                     if _should_persist_recovered_browser_evidence(
                         sent_ok,
                         exc,
@@ -4425,7 +5054,7 @@ async def _do_user_task_locked(
                         continue
 
                     logger.exception("Send flow failed for %s/%s", account_name, target_name)
-                    await save_debug_artifacts(page, account_name, target_name, "send-error")
+                    await _run_browser_stage("debug_send_error", save_debug_artifacts(page, account_name, target_name, "send-error"))
                     category = classify_browser_failure("send_flow", exc)
                     reason = str(exc)
                     is_login_required, login_detail = await _page_has_login_required_prompt(page)
@@ -4438,6 +5067,7 @@ async def _do_user_task_locked(
                             login_detail,
                         )
                     if _is_stop_account_category(category):
+                        cookie_export_safe = False
                         affected_targets = [
                             target_name,
                             *[target for target in targets if target not in yielded_targets],
@@ -4467,6 +5097,8 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message after failure", account_name)
+        except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+            raise
         except Exception as exc:
             for group_error in group_scan_errors:
                 target_name = group_error["target"]
@@ -4528,26 +5160,47 @@ async def _do_user_task_locked(
                     "target not selected from friend list",
                     attempted_at,
                 )
+    except asyncio.CancelledError:
+        cookie_export_safe = False
+        raise
+    except BrowserStageTimeout as exc:
+        cookie_export_safe = False
+        _record_browser_stage_failure(user, exc, targets)
+    except friend_chat_guard.FriendIdentityError as exc:
+        cookie_export_safe = False
+        _persist_account_send_failure(user, exc.category, str(exc),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            _browser_not_started_targets(user, targets))
     finally:
-        if uid_collector is not None:
-            uid_collector.detach()
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
         try:
-            await context.close()
-        finally:
-            if owned_playwright is not None:
+            if (cookie_session is not None and cookie_export_safe
+                    and profile_config["refreshStoredCookiesAfterLogin"]):
                 try:
-                    await owned_playwright.stop()
+                    await _run_browser_stage("final_cookie_snapshot", refresh_stored_cookies_from_profile(
+                        context, user, account_name, cookie_session=cookie_session))
                 except Exception:
-                    pass
+                    # Keep browser state authoritative if exporting its backup fails.
+                    logger.warning("Could not publish final cookie snapshot", exc_info=True)
+        finally:
+            try:
+                if uid_collector is not None:
+                    uid_collector.detach()
+                    for reader in uid_collector.pending_tasks():
+                        _track_browser_operation(reader)
+                    await _run_browser_stage(
+                        "close_uid_collector", uid_collector.aclose(),
+                        timeout_seconds=BROWSER_CLEANUP_TIMEOUT_SECONDS,
+                    )
+            finally:
+                # A cancelled export/reader must still close the browser session.
+                await _cleanup_browser_session(page, context, owned_playwright, session_state)
 
 
 async def runTasks():
     global _ACTIVE_RUN_ID
+    if send_pause.should_pause_sending():
+        logger.info("Skipping task run: sending is temporarily paused")
+        return "skipped_sending_paused"
     active_config = get_config(force_reload=True)
     all_user_data = get_userData(force_reload=True)
     requested_refs = _requested_account_refs()
@@ -4581,49 +5234,35 @@ async def runTasks():
         if not active_user_data:
             run_status = "skipped_no_enabled_accounts"
             logger.warning("No enabled accounts are available for the task run")
-            return
+            return run_status
 
-        runnable_user_data = _prepare_active_users_for_run(
-            active_config,
-            active_user_data,
+        groups = personal_streak.account_groups(
+            active_config, active_user_data, manual=_is_manual_run() and not _is_fallback_run(),
+            profile_key=os.getenv("SPARKFLOW_PERSONAL_USER_ID", ""),
+            revision=os.getenv("SPARKFLOW_PERSONAL_REVISION", ""),
+            claim=os.getenv("SPARKFLOW_PERSONAL_CLAIM", ""),
         )
+        runnable_groups = [(config, _prepare_active_users_for_run(config, accounts)) for config, accounts in groups]
+        runnable_user_data = [user for _, accounts in runnable_groups for user in accounts]
         if not runnable_user_data:
             run_status = "skipped_no_runnable_accounts"
-            return
+            return run_status
 
         for user in runnable_user_data:
             streak_state.reconcile_account(user, started_at)
 
         with task_run_lock():
-            protocol_user_data, browser_user_data = _split_sender_modes(active_config, runnable_user_data)
-            if protocol_user_data:
-                try:
-                    await run_protocol_tasks(
-                        active_config,
-                        protocol_user_data,
-                        build_message,
-                        run_id=run_id,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Protocol sender run failed before fallback selection: %s",
-                        exc,
-                    )
-                fallback_users = _prepare_protocol_fallback_users(
-                    active_config,
-                    protocol_user_data,
-                )
-                if fallback_users:
-                    logger.info(
-                        "Running browser fallback for %s protocol-failed targets",
-                        sum(len(user.get("targets") or []) for user in fallback_users),
-                    )
-                    await run_browser_tasks(
-                        active_config,
-                        fallback_users,
-                        fallback=True,
-                    )
-            await run_browser_tasks(active_config, browser_user_data)
+            for group_config, group_accounts in runnable_groups:
+                protocol_user_data, browser_user_data = _split_sender_modes(group_config, group_accounts)
+                if protocol_user_data:
+                    try:
+                        await run_protocol_tasks(group_config, protocol_user_data, build_message, run_id=run_id)
+                    except Exception as exc:
+                        logger.error("Protocol sender run failed before fallback selection: %s", exc)
+                    fallback_users = _prepare_protocol_fallback_users(group_config, protocol_user_data)
+                    if fallback_users:
+                        await run_browser_tasks(group_config, fallback_users, fallback=True)
+                await run_browser_tasks(group_config, browser_user_data)
     except TaskRunAlreadyInProgress:
         run_status = "skipped_task_in_progress"
         logger.warning("Skipping task run because another task run is already in progress")
@@ -4655,6 +5294,7 @@ async def runTasks():
                 logger.warning("run notification hook failed: %s", type(exc).__name__)
         finally:
             _ACTIVE_RUN_ID = ""
+    return run_status
 
 
 class TaskRunAlreadyInProgress(RuntimeError):

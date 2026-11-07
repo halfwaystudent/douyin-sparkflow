@@ -430,6 +430,44 @@ test("a conversation lookup exception preserves earlier sends", async () => {
   assert.equal(result.sent[1].statusName, "exception");
 });
 
+test("claimed personal deadline is checked immediately before every protocol send", async () => {
+  const client = {
+    updateSendMessageHeaders() {},
+    getConversation({ conversationId }) { return { conversationId }; },
+    async createMessage({ content }) { return { text: JSON.parse(content).text }; },
+    async sendMessage({ message }) {
+      sends.push(message.text);
+      now = 101; // The first dispatch crosses the personal end boundary.
+      return { success: true, statusCode: 0, statusMsg: "ok" };
+    },
+  };
+  const sends = [];
+  let now = 99;
+  const originalNow = Date.now;
+  Date.now = () => now;
+  try {
+    const result = await sendMessages({
+      client,
+      cacheEntries: [
+        { nickname: "Alice", secUid: "sec-1", conversationId: "conversation-1" },
+        { nickname: "Bob", secUid: "sec-2", conversationId: "conversation-2" },
+      ],
+      messagesByTarget: { Alice: "first", Bob: "second" },
+      targetIdentities: { Alice: { secUid: "sec-1" }, Bob: { secUid: "sec-2" } },
+      dryRun: false,
+      cookieString: "",
+      cookieMap: {},
+      sendStrategy: { messageIntervalSecondsMin: 0, messageIntervalSecondsMax: 0 },
+      identityOverride: { identitySecurityHeader: "token", realDeviceId: "device" },
+      personalSendDeadlineEpochMs: 100,
+    });
+    assert.deepEqual(sends, ["first"]);
+    assert.deepEqual(result.skipped, [{ target: "Bob", reason: "personal_window_closed" }]);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("the creator user_id keeps every digit of a long UID (issue #41)", () => {
   assert.equal(extractExactUserId('{"status_code":0,"user_id":1234567890123456789}'), "1234567890123456789");
   assert.equal(extractExactUserId('{"user_id":"2718281828459045","token":"t"}'), "2718281828459045");

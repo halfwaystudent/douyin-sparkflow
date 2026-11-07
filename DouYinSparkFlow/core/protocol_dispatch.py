@@ -8,9 +8,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core import refusal_retry, send_pause
 from core import streak_state
 from core.msg_builder import build_messages_for_targets
-from utils.config import normalize_unique_id, repo_root, update_user_data
+from utils.config import get_userData, normalize_unique_id, repo_root, update_user_data
 from utils.logger import setup_logger
 
 
@@ -415,14 +416,64 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
 
 
 def _mark_protocol_targets_in_flight(user, run_id, *, allow_retry=False):
+    from core import personal_streak
+
     now = datetime.now(timezone.utc)
+    personal_scope = user.get("_personal_scope")
+    if isinstance(personal_scope, dict):
+        # Legacy global schedules carry a live authorization scope but no
+        # personal profile timezone.  Preserve their global quota policy only
+        # after revalidating the mapping; a forged legacy marker must not skip
+        # the ownership check.
+        if personal_scope.get("legacy_global_schedule"):
+            if not personal_streak.authorized(user):
+                return []
+            schedule_timezone = None
+        else:
+            # Durable rows deliberately omit the personal scope. Capture the
+            # profile timezone only after validating this live scope, then
+            # carry it through every quota decision made against the
+            # scope-less disk row.
+            schedule_timezone = personal_streak.authorized_schedule_timezone(user)
+            if schedule_timezone is None:
+                return []
+    else:
+        schedule_timezone = None
+
+    def automatic_claim_allowed(account, target_name):
+        if refusal_retry.used_today(
+                account, target_name, now, schedule_timezone=schedule_timezone):
+            return False
+        state = streak_state.target_state(account, target_name, now)
+        if (state.get("status") == streak_state.STATE_FAILED_TERMINAL
+                and state.get("lastErrorCategory") == "send_rejected"):
+            # Same-day, future and unreadable refusal times are never normal
+            # automatic protocol work. A valid previous day is a new daily send.
+            return refusal_retry.rejection_precedes_today(
+                account, target_name, now, schedule_timezone=schedule_timezone,
+            )
+        return True
 
     def mutate(accounts):
         matched = streak_state.find_matching_account(accounts, user)
         if matched is None:
-            return None, False
+            return ([], []), False
         claimed_targets = []
+        reserved_targets = []
         for target_name in user.get("targets") or []:
+            if not allow_retry and not automatic_claim_allowed(matched, target_name):
+                continue
+            before = streak_state.target_state(matched, target_name, now)
+            consume = (
+                allow_retry
+                and before.get("lastErrorCategory") == "send_rejected"
+                and not refusal_retry.rejection_precedes_today(
+                    matched, target_name, now, schedule_timezone=schedule_timezone,
+                )
+                and not refusal_retry.used_today(
+                    matched, target_name, now, schedule_timezone=schedule_timezone,
+                )
+            )
             state, claimed = streak_state.claim_in_flight(
                 matched,
                 target_name,
@@ -437,10 +488,44 @@ def _mark_protocol_targets_in_flight(user, run_id, *, allow_retry=False):
                 state.get("status") == streak_state.STATE_IN_FLIGHT
                 and str(state.get("runId") or "") == str(run_id or "")
             ):
+                if consume:
+                    if refusal_retry.reserve(
+                            matched, target_name, now, run_id,
+                            schedule_timezone=schedule_timezone,
+                    ) is None:
+                        continue
+                    reserved_targets.append(str(target_name))
                 claimed_targets.append(str(target_name))
-        return claimed_targets, True
+        return (claimed_targets, reserved_targets), bool(claimed_targets)
 
-    return update_user_data(mutate, force_reload=True)
+    persisted = update_user_data(mutate, force_reload=True) or ([], [])
+    claimed_targets, reserved_targets = persisted
+    if not reserved_targets:
+        return claimed_targets
+
+    # A reservation is not permission until independently read back from disk.
+    accounts = get_userData(force_reload=True)
+    verified = streak_state.find_matching_account(accounts, user)
+    if verified is None:
+        return [target for target in claimed_targets if target not in reserved_targets]
+    verified_reserved = set()
+    for target_name in reserved_targets:
+        ref = streak_state.resolve_target_ref(verified, target_name)
+        reservation = (verified.get(refusal_retry.KEY) or {}).get(ref) or {}
+        state = streak_state.target_state(verified, target_name, now)
+        if (
+            refusal_retry.used_today(
+                verified, target_name, now, schedule_timezone=schedule_timezone,
+            )
+            and reservation.get("runId") == run_id
+            and state.get("status") == streak_state.STATE_IN_FLIGHT
+            and str(state.get("runId") or "") == str(run_id or "")
+        ):
+            verified_reserved.add(target_name)
+    return [
+        target for target in claimed_targets
+        if target not in reserved_targets or target in verified_reserved
+    ]
 
 
 def _protocol_claimed_targets(user, run_id):
@@ -540,6 +625,8 @@ def _build_protocol_command():
 
 
 def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
+    if send_pause.should_pause_sending():
+        return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "sending-paused"}
     (
         command,
         cwd,
@@ -558,6 +645,12 @@ def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
         ),
         "sendStrategy": send_strategy,
     }
+    if (user.get("_personal_scope") or {}).get("claim"):
+        from core import personal_streak
+        deadline = personal_streak.protocol_send_deadline(user)
+        if deadline is None:
+            return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "personal-window-closed"}
+        payload["personalSendDeadlineEpochMs"] = deadline
     timeout_seconds = _protocol_timeout_seconds()
     try:
         process = subprocess.run(
@@ -614,6 +707,17 @@ def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
 
 
 async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, allow_retry=False):
+    if send_pause.should_pause_sending():
+        logger.info("Skipping protocol sender: sending is temporarily paused")
+        return []
+    from core import personal_streak
+    if accounts and not all("_personal_scope" in account for account in accounts):
+        groups = personal_streak.account_groups(config, accounts, manual=True)
+        if not groups or any("_personal_scope" in account for _, group in groups for account in group):
+            results = []
+            for effective, group in groups:
+                results.extend(await run_protocol_tasks(effective, group, message_builder, run_id, allow_retry=allow_retry))
+            return results
     del message_builder
 
     dry_run = bool(config.get("protocolDryRun", False))
@@ -624,6 +728,15 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, al
 
     async def _worker(user):
         async with semaphore:
+            claimed_personal_job = bool(
+                (user.get("_personal_scope") or {}).get("claim")
+            )
+            if not personal_streak.authorized(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "ownership-changed"}
+            # Claimed personal jobs are bound by their saved end time.  Manual
+            # personal and global runs deliberately retain no-claim semantics.
+            if claimed_personal_job and not personal_streak.within_send_window(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "personal-window-closed"}
             start_delay = random.randint(
                 send_strategy["accountStartDelaySecondsMin"],
                 send_strategy["accountStartDelaySecondsMax"],
@@ -636,6 +749,8 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, al
                 )
                 await asyncio.sleep(start_delay)
 
+            if claimed_personal_job and not personal_streak.within_send_window(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "personal-window-closed"}
             logger.info("Starting protocol sender for %s", user.get("username", "unknown"))
             if run_id and not dry_run:
                 claimed_targets = _mark_protocol_targets_in_flight(
@@ -684,6 +799,8 @@ async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, al
                 send_strategy["messageIntervalSecondsMax"],
                 os.getenv("SPARKFLOW_MANUAL_RUN") == "1",
             )
+            if not personal_streak.authorized(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "ownership-changed"}
             result = await asyncio.to_thread(
                 _run_protocol_for_user,
                 user,

@@ -1,5 +1,9 @@
 services:
   proxy:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
     image: metacubex/mihomo:latest
     container_name: mihomo
     restart: unless-stopped
@@ -15,6 +19,10 @@ services:
       - ./proxy/config.yaml:/root/.config/mihomo/config.yaml:ro
 
   web:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
     build:
       context: ./DouYinSparkFlow
       dockerfile: Dockerfile.server
@@ -35,6 +43,8 @@ services:
       - login-desktop
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      SPARKFLOW_STORAGE_KEY_FILE: ${SPARKFLOW_STORAGE_KEY_FILE:-}
+      FORWARDED_ALLOW_IPS: ${SPARKFLOW_TRUSTED_PROXY_IPS:-127.0.0.1}
       SPARKFLOW_LOGIN_DESKTOP_API_URL: http://login-desktop:18090
       LOGIN_DESKTOP_PUBLIC_PORT: ${LOGIN_DESKTOP_WEB_PORT:-8788}
       SPARKFLOW_LOGIN_DESKTOP_PUBLIC_URL: ${LOGIN_DESKTOP_PUBLIC_URL:-/login-desktop/proxy/vnc.html?autoconnect=1&resize=scale&view_only=0&path=login-desktop/proxy/websockify}
@@ -42,19 +52,25 @@ services:
       SPARKFLOW_LOGIN_DESKTOP_NOVNC_WS_URL: ws://login-desktop:6080/websockify
       SPARKFLOW_LOGIN_DESKTOP_API_TOKEN_FILE: /run/login-api/token
       SPARKFLOW_SESSION_COOKIE_SECURE: ${SPARKFLOW_SESSION_COOKIE_SECURE:-0}
+      SPARKFLOW_PASSKEY_RP_ID: ${SPARKFLOW_PASSKEY_RP_ID:-}
+      SPARKFLOW_PASSKEY_ORIGIN: ${SPARKFLOW_PASSKEY_ORIGIN:-}
       DOCKER_API_VERSION: ${DOCKER_API_VERSION:-}
     ports:
-      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-8787}:8787"
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8787}:8787"
     command: python main.py --web --host 0.0.0.0 --port 8787
     volumes:
       - ./DouYinSparkFlow:/app
       - ./DouYinSparkFlow/logs:/app/logs
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./state/cron:/host-spool-cron
       - ./state/login-api:/run/login-api:ro
-      - .:/opt/douyin-sparkflow
+      - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
+      - ./state/keys:/run/storage-key:ro
 
   login-desktop:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
     image: douyin-sparkflow:local
     container_name: login-desktop
     restart: unless-stopped
@@ -84,12 +100,15 @@ services:
     mem_limit: ${LOGIN_DESKTOP_MEMORY_LIMIT:-1200m}
     pids_limit: ${LOGIN_DESKTOP_PIDS_LIMIT:-256}
     volumes:
-      - ./DouYinSparkFlow:/app
-      - ./DouYinSparkFlow/logs:/app/logs
+      - ./DouYinSparkFlow/logs/login_desktop:/app/logs/login_desktop
       - ./state/login-profile:/data/login-profile
       - ./state/login-api:/run/login-api
 
   scheduler:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
     image: douyin-sparkflow:local
     container_name: douyin-scheduler
     restart: unless-stopped
@@ -97,6 +116,7 @@ services:
       - proxy
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      SPARKFLOW_STORAGE_KEY_FILE: ${SPARKFLOW_STORAGE_KEY_FILE:-}
       PYTHONUNBUFFERED: "1"
     command: python /app/scripts/cron_runner.py /host-spool-cron/root
     volumes:
@@ -104,18 +124,25 @@ services:
       - ./DouYinSparkFlow/logs:/app/logs
       - ./state/cron:/host-spool-cron
       - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
+      - ./state/keys:/run/storage-key:ro
 
   task:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
     image: douyin-sparkflow:local
     container_name: douyin-task
     depends_on:
       - proxy
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      SPARKFLOW_STORAGE_KEY_FILE: ${SPARKFLOW_STORAGE_KEY_FILE:-}
       PYTHONUNBUFFERED: "1"
     command: python main.py --doTask
     volumes:
       - ./DouYinSparkFlow:/app
       - ./DouYinSparkFlow/logs:/app/logs
       - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
+      - ./state/keys:/run/storage-key:ro
     restart: "no"

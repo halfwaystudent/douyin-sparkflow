@@ -1,0 +1,472 @@
+{
+  "source": "one authorized single-friend read-only capture; structural/equality flags only",
+  "identity": {
+    "row": {
+      "exists": true,
+      "root_known": true,
+      "committed": true,
+      "committed_is_expando": false,
+      "committed_is_alternate": true,
+      "current_provider_depth": null,
+      "current_identity_matches": false,
+      "dependency_count": 10,
+      "matching_context_dependencies": 0,
+      "stale_context_dependencies": 0
+    },
+    "header": {
+      "exists": true,
+      "root_known": true,
+      "committed": true,
+      "committed_is_expando": true,
+      "committed_is_alternate": false,
+      "current_provider_depth": 6,
+      "current_identity_matches": true,
+      "dependency_count": 3,
+      "matching_context_dependencies": 0,
+      "stale_context_dependencies": 0
+    },
+    "input": {
+      "exists": true,
+      "root_known": true,
+      "committed": true,
+      "committed_is_expando": true,
+      "committed_is_alternate": false,
+      "current_provider_depth": 9,
+      "current_identity_matches": true,
+      "dependency_count": 5,
+      "matching_context_dependencies": 0,
+      "stale_context_dependencies": 0
+    },
+    "same_committed_provider": true,
+    "row_binding_matches": true
+  },
+  "candidate_before_title_fix": {
+    "ok": false,
+    "reason": "friend_header_name_mismatch"
+  },
+  "title": {
+    "schema_version": 1,
+    "header_count": 1,
+    "visible_header_count": 1,
+    "headers": [
+      {
+        "visible": true,
+        "text": {
+          "length": 11,
+          "sampled_length": 11,
+          "truncated": false,
+          "exact_equal": false,
+          "trim_equal": false,
+          "contains_target": true,
+          "nfc_trim_equal": false,
+          "without_zero_width_trim_equal": false,
+          "has_zero_width": false,
+          "has_nbsp": false,
+          "has_newline": false,
+          "has_ellipsis": false
+        },
+        "rendered_text": {
+          "length": 11,
+          "sampled_length": 11,
+          "truncated": false,
+          "exact_equal": false,
+          "trim_equal": false,
+          "contains_target": true,
+          "nfc_trim_equal": false,
+          "without_zero_width_trim_equal": false,
+          "has_zero_width": false,
+          "has_nbsp": false,
+          "has_newline": false,
+          "has_ellipsis": false
+        },
+        "tail_stripped_text": {
+          "length": 11,
+          "sampled_length": 11,
+          "truncated": false,
+          "exact_equal": false,
+          "trim_equal": false,
+          "contains_target": true,
+          "nfc_trim_equal": false,
+          "without_zero_width_trim_equal": false,
+          "has_zero_width": false,
+          "has_nbsp": false,
+          "has_newline": false,
+          "has_ellipsis": false
+        },
+        "structure": {
+          "tag": "DIV",
+          "visible": true,
+          "class_kinds": {
+            "header": true,
+            "header_tail": false,
+            "typography": false,
+            "ellipsis": false,
+            "avatar": false
+          },
+          "attributes": {},
+          "text": {
+            "length": 11,
+            "sampled_length": 11,
+            "truncated": false,
+            "exact_equal": false,
+            "trim_equal": false,
+            "contains_target": true,
+            "nfc_trim_equal": false,
+            "without_zero_width_trim_equal": false,
+            "has_zero_width": false,
+            "has_nbsp": false,
+            "has_newline": false,
+            "has_ellipsis": false
+          },
+          "rendered_text": {
+            "length": 11,
+            "sampled_length": 11,
+            "truncated": false,
+            "exact_equal": false,
+            "trim_equal": false,
+            "contains_target": true,
+            "nfc_trim_equal": false,
+            "without_zero_width_trim_equal": false,
+            "has_zero_width": false,
+            "has_nbsp": false,
+            "has_newline": false,
+            "has_ellipsis": false
+          },
+          "direct_text": [],
+          "children": [
+            {
+              "tag": "DIV",
+              "visible": true,
+              "class_kinds": {
+                "header": false,
+                "header_tail": false,
+                "typography": false,
+                "ellipsis": false,
+                "avatar": false
+              },
+              "attributes": {},
+              "text": {
+                "length": 11,
+                "sampled_length": 11,
+                "truncated": false,
+                "exact_equal": false,
+                "trim_equal": false,
+                "contains_target": true,
+                "nfc_trim_equal": false,
+                "without_zero_width_trim_equal": false,
+                "has_zero_width": false,
+                "has_nbsp": false,
+                "has_newline": false,
+                "has_ellipsis": false
+              },
+              "rendered_text": {
+                "length": 11,
+                "sampled_length": 11,
+                "truncated": false,
+                "exact_equal": false,
+                "trim_equal": false,
+                "contains_target": true,
+                "nfc_trim_equal": false,
+                "without_zero_width_trim_equal": false,
+                "has_zero_width": false,
+                "has_nbsp": false,
+                "has_newline": false,
+                "has_ellipsis": false
+              },
+              "direct_text": [],
+              "children": [
+                {
+                  "tag": "STRONG",
+                  "visible": true,
+                  "class_kinds": {
+                    "header": true,
+                    "header_tail": false,
+                    "typography": false,
+                    "ellipsis": false,
+                    "avatar": false
+                  },
+                  "attributes": {},
+                  "text": {
+                    "length": 4,
+                    "sampled_length": 4,
+                    "truncated": false,
+                    "exact_equal": true,
+                    "trim_equal": true,
+                    "contains_target": true,
+                    "nfc_trim_equal": true,
+                    "without_zero_width_trim_equal": true,
+                    "has_zero_width": false,
+                    "has_nbsp": false,
+                    "has_newline": false,
+                    "has_ellipsis": false
+                  },
+                  "rendered_text": {
+                    "length": 4,
+                    "sampled_length": 4,
+                    "truncated": false,
+                    "exact_equal": true,
+                    "trim_equal": true,
+                    "contains_target": true,
+                    "nfc_trim_equal": true,
+                    "without_zero_width_trim_equal": true,
+                    "has_zero_width": false,
+                    "has_nbsp": false,
+                    "has_newline": false,
+                    "has_ellipsis": false
+                  },
+                  "direct_text": [
+                    {
+                      "length": 4,
+                      "sampled_length": 4,
+                      "truncated": false,
+                      "exact_equal": true,
+                      "trim_equal": true,
+                      "contains_target": true,
+                      "nfc_trim_equal": true,
+                      "without_zero_width_trim_equal": true,
+                      "has_zero_width": false,
+                      "has_nbsp": false,
+                      "has_newline": false,
+                      "has_ellipsis": false
+                    }
+                  ],
+                  "children": []
+                },
+                {
+                  "tag": "SPAN",
+                  "visible": true,
+                  "class_kinds": {
+                    "header": false,
+                    "header_tail": false,
+                    "typography": false,
+                    "ellipsis": false,
+                    "avatar": false
+                  },
+                  "attributes": {},
+                  "text": {
+                    "length": 7,
+                    "sampled_length": 7,
+                    "truncated": false,
+                    "exact_equal": false,
+                    "trim_equal": false,
+                    "contains_target": false,
+                    "nfc_trim_equal": false,
+                    "without_zero_width_trim_equal": false,
+                    "has_zero_width": false,
+                    "has_nbsp": false,
+                    "has_newline": false,
+                    "has_ellipsis": false
+                  },
+                  "rendered_text": {
+                    "length": 7,
+                    "sampled_length": 7,
+                    "truncated": false,
+                    "exact_equal": false,
+                    "trim_equal": false,
+                    "contains_target": false,
+                    "nfc_trim_equal": false,
+                    "without_zero_width_trim_equal": false,
+                    "has_zero_width": false,
+                    "has_nbsp": false,
+                    "has_newline": false,
+                    "has_ellipsis": false
+                  },
+                  "direct_text": [
+                    {
+                      "length": 7,
+                      "sampled_length": 7,
+                      "truncated": false,
+                      "exact_equal": false,
+                      "trim_equal": false,
+                      "contains_target": false,
+                      "nfc_trim_equal": false,
+                      "without_zero_width_trim_equal": false,
+                      "has_zero_width": false,
+                      "has_nbsp": false,
+                      "has_newline": false,
+                      "has_ellipsis": false
+                    }
+                  ],
+                  "children": [
+                    {
+                      "tag": "IMG",
+                      "visible": true,
+                      "class_kinds": {
+                        "header": false,
+                        "header_tail": false,
+                        "typography": false,
+                        "ellipsis": false,
+                        "avatar": false
+                      },
+                      "attributes": {},
+                      "text": {
+                        "length": 0,
+                        "sampled_length": 0,
+                        "truncated": false,
+                        "exact_equal": false,
+                        "trim_equal": false,
+                        "contains_target": false,
+                        "nfc_trim_equal": false,
+                        "without_zero_width_trim_equal": false,
+                        "has_zero_width": false,
+                        "has_nbsp": false,
+                        "has_newline": false,
+                        "has_ellipsis": false
+                      },
+                      "rendered_text": {
+                        "length": 0,
+                        "sampled_length": 0,
+                        "truncated": false,
+                        "exact_equal": false,
+                        "trim_equal": false,
+                        "contains_target": false,
+                        "nfc_trim_equal": false,
+                        "without_zero_width_trim_equal": false,
+                        "has_zero_width": false,
+                        "has_nbsp": false,
+                        "has_newline": false,
+                        "has_ellipsis": false
+                      },
+                      "direct_text": [],
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "tag": "DIV",
+              "visible": true,
+              "class_kinds": {
+                "header": false,
+                "header_tail": true,
+                "typography": false,
+                "ellipsis": false,
+                "avatar": false
+              },
+              "attributes": {},
+              "text": {
+                "length": 0,
+                "sampled_length": 0,
+                "truncated": false,
+                "exact_equal": false,
+                "trim_equal": false,
+                "contains_target": false,
+                "nfc_trim_equal": false,
+                "without_zero_width_trim_equal": false,
+                "has_zero_width": false,
+                "has_nbsp": false,
+                "has_newline": false,
+                "has_ellipsis": false
+              },
+              "rendered_text": {
+                "length": 0,
+                "sampled_length": 0,
+                "truncated": false,
+                "exact_equal": false,
+                "trim_equal": false,
+                "contains_target": false,
+                "nfc_trim_equal": false,
+                "without_zero_width_trim_equal": false,
+                "has_zero_width": false,
+                "has_nbsp": false,
+                "has_newline": false,
+                "has_ellipsis": false
+              },
+              "direct_text": [],
+              "children": [
+                {
+                  "tag": "OTHER",
+                  "visible": true,
+                  "class_kinds": {
+                    "header": false,
+                    "header_tail": false,
+                    "typography": false,
+                    "ellipsis": false,
+                    "avatar": false
+                  },
+                  "attributes": {},
+                  "text": {
+                    "length": 0,
+                    "sampled_length": 0,
+                    "truncated": false,
+                    "exact_equal": false,
+                    "trim_equal": false,
+                    "contains_target": false,
+                    "nfc_trim_equal": false,
+                    "without_zero_width_trim_equal": false,
+                    "has_zero_width": false,
+                    "has_nbsp": false,
+                    "has_newline": false,
+                    "has_ellipsis": false
+                  },
+                  "rendered_text": {
+                    "length": 0,
+                    "sampled_length": 0,
+                    "truncated": false,
+                    "exact_equal": false,
+                    "trim_equal": false,
+                    "contains_target": false,
+                    "nfc_trim_equal": false,
+                    "without_zero_width_trim_equal": false,
+                    "has_zero_width": false,
+                    "has_nbsp": false,
+                    "has_newline": false,
+                    "has_ellipsis": false
+                  },
+                  "direct_text": [],
+                  "children": [
+                    {
+                      "tag": "OTHER",
+                      "visible": true,
+                      "class_kinds": {
+                        "header": false,
+                        "header_tail": false,
+                        "typography": false,
+                        "ellipsis": false,
+                        "avatar": false
+                      },
+                      "attributes": {},
+                      "text": {
+                        "length": 0,
+                        "sampled_length": 0,
+                        "truncated": false,
+                        "exact_equal": false,
+                        "trim_equal": false,
+                        "contains_target": false,
+                        "nfc_trim_equal": false,
+                        "without_zero_width_trim_equal": false,
+                        "has_zero_width": false,
+                        "has_nbsp": false,
+                        "has_newline": false,
+                        "has_ellipsis": false
+                      },
+                      "rendered_text": {
+                        "length": 0,
+                        "sampled_length": 0,
+                        "truncated": false,
+                        "exact_equal": false,
+                        "trim_equal": false,
+                        "contains_target": false,
+                        "nfc_trim_equal": false,
+                        "without_zero_width_trim_equal": false,
+                        "has_zero_width": false,
+                        "has_nbsp": false,
+                        "has_newline": false,
+                        "has_ellipsis": false
+                      },
+                      "direct_text": [],
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "nodes_recorded": 8,
+    "truncated": false
+  }
+}

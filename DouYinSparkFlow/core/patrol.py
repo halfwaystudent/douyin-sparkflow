@@ -42,6 +42,7 @@ from core.browser import (
 )
 from core.friends import (
     CATEGORY_EMPTY_RESULT,
+    CATEGORY_BROWSER_CLEANUP_BLOCKED,
     CATEGORY_INCOMPLETE_SCAN,
     CATEGORY_LOGIN_REQUIRED,
     CATEGORY_NETWORK_UNAVAILABLE,
@@ -52,8 +53,11 @@ from core.friends import (
     FriendRefreshError,
     FriendScanResult,
     _left_creator_host,
+    browser_account_cleanup_blocked,
     classify_refresh_error,
+    close_uid_collectors,
     collect_friend_names,
+    retain_browser_account_lock_for_cleanup,
 )
 from core.streak_state import AUTH_COOKIE_NAMES
 from utils.config import get_config, get_userData, update_user_data
@@ -97,6 +101,7 @@ LOGIN_CATEGORY_LABELS = {
     CATEGORY_NETWORK_UNAVAILABLE: "网络不可用",
     CATEGORY_STRUCTURE_CHANGED: "页面结构变化",
     CATEGORY_ACCOUNT_BUSY: "账号正被其他任务占用",
+    CATEGORY_BROWSER_CLEANUP_BLOCKED: "浏览器清理未完成，账号已暂停",
     CATEGORY_TIMEOUT: "巡查超时",
 }
 
@@ -196,6 +201,24 @@ class LoginUidWatcher:
                 except Exception:  # noqa: BLE001
                     continue
 
+    def pending_tasks(self):
+        return tuple(task for task in self._tasks if not task.done())
+
+    async def aclose(self):
+        tasks = self.pending_tasks()
+        self.detach()
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return True
+        try:
+            await asyncio.wait(tasks, timeout=friend_identity.CLOSE_WAIT_SECONDS)
+        except asyncio.CancelledError:
+            for task in self.pending_tasks():
+                task.cancel()
+            raise
+        return not self.pending_tasks()
+
     def _on_response(self, response):
         try:
             url = response.url
@@ -248,15 +271,22 @@ async def _detect_login_prompt(page):
     return await _page_has_login_required_prompt(page)
 
 
-async def _open_session(user, network_mode, profile_config):
+async def _open_session(user, network_mode, profile_config, *, operation_tasks=None):
     """Own browser startup until handles can be handed to the inspection.
 
     Playwright startup must not be cancelled before its handles are returned:
     on cancellation, finish the shielded startup, close everything it owns,
     then propagate cancellation (the caller still holds the account lock).
     """
+    owns_operations = operation_tasks is None
+    owner_token = None
+    if owns_operations:
+        from core import tasks
+        operation_tasks = set()
+        owner_token = tasks._BROWSER_OPERATION_OWNER.set(operation_tasks)
+
     async def start():
-        playwright = browser = context = None
+        playwright = browser = context = cookie_session = None
         cookies = list(user.get("cookies") or [])
         try:
             if profile_config["enabled"]:
@@ -265,41 +295,60 @@ async def _open_session(user, network_mode, profile_config):
                     root=profile_config["root"],
                     network_mode=network_mode,
                 )
-                if profile_config["syncStoredCookiesBeforeRun"]:
-                    await context.add_cookies(cookies)
-                elif profile_config["seedCookiesWhenEmpty"]:
-                    current = await context.cookies(
-                        ["https://creator.douyin.com/", "https://www.douyin.com/"]
-                    )
-                    if not any(cookie.get("name") in AUTH_COOKIE_NAMES for cookie in current):
-                        await context.add_cookies(cookies)
+                from core.profile_cookies import prepare_profile_cookies
+                from core.tasks import _run_browser_stage
+
+                cookie_session = await _run_browser_stage(
+                    "seed_cookies",
+                    prepare_profile_cookies(context, user, profile_config, _profile_dir),
+                )
             else:
                 playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
                 context = await browser.new_context()
                 await context.add_cookies(cookies)
-            return playwright, browser, context
+            return playwright, browser, context, cookie_session
         except BaseException:
-            await _close_session(playwright, browser, context)
+            try:
+                close_complete = await _close_session(playwright, browser, context)
+            except BaseException:
+                user['_patrol_uid_cleanup_blocked'] = True
+                raise
+            if not close_complete:
+                user['_patrol_uid_cleanup_blocked'] = True
             raise
 
-    startup = asyncio.create_task(start())
     try:
-        return await asyncio.shield(startup)
-    except asyncio.CancelledError:
-        # Do not release the profile lock until startup has returned its handles
-        # and cleanup has finished. Startup errors already clean their handles.
+        startup = asyncio.create_task(start())
         try:
-            handles = await startup
+            return await asyncio.shield(startup)
+        except asyncio.CancelledError:
+            # Do not release the profile lock until startup has returned its handles
+            # and cleanup has finished. Startup errors already clean their handles.
+            if owns_operations:
+                user['_patrol_uid_cleanup_blocked'] = True
+            try:
+                handles = await startup
+            except BaseException:
+                pass
+            else:
+                if not await _close_session(*handles[:3]):
+                    user['_patrol_uid_cleanup_blocked'] = True
+            raise
         except BaseException:
-            pass
-        else:
-            await _close_session(*handles)
-        raise
+            if owns_operations:
+                user['_patrol_uid_cleanup_blocked'] = True
+            raise
+    finally:
+        if owns_operations:
+            if any(not task.done() for task in operation_tasks):
+                user['_patrol_uid_cleanup_blocked'] = True
+            tasks._BROWSER_OPERATION_OWNER.reset(owner_token)
 
 
 async def _close_session(playwright, browser, context, page=None):
     """Best-effort close every owned handle before propagating cancellation."""
     cancelled = False
+    complete = True
     for closer, label in (
         (getattr(page, "close", None), "page"),
         (getattr(context, "close", None), "context"),
@@ -315,33 +364,44 @@ async def _close_session(playwright, browser, context, page=None):
             except asyncio.CancelledError:
                 if close_task.cancelled():
                     logger.debug("Patrol %s closer was cancelled", label)
+                    complete = False
                     break
                 cancelled = True
                 logger.debug("Patrol cancellation deferred while closing %s", label)
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to close patrol %s", label, exc_info=True)
+                complete = False
                 break
-        if close_task.done() and not close_task.cancelled():
+        if close_task.cancelled():
+            complete = False
+        elif close_task.done():
             try:
                 close_task.result()
             except Exception:  # noqa: BLE001
                 logger.debug("Failed to close patrol %s", label, exc_info=True)
+                complete = False
     if cancelled:
         raise asyncio.CancelledError
+    return complete
 
 
 async def _inspect_once(user, network_mode, profile_config):
     """Read the login state and the full friend list on one network route."""
     account_name = _account_name(user)
-    playwright, browser, context = await _open_session(user, network_mode, profile_config)
-    page = None
+    from core import tasks
+    cookie_operations = set()
+    cookie_owner_token = tasks._BROWSER_OPERATION_OWNER.set(cookie_operations)
+    playwright = browser = context = cookie_session = page = None
     uid_collector = None
     login_watch = None
     try:
+        playwright, browser, context, cookie_session = await _open_session(
+            user, network_mode, profile_config, operation_tasks=cookie_operations
+        )
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)
         page = await context.new_page()
-        uid_collector = friend_identity.UserDetailCollector(account_name).attach(page)
+        uid_collector = friend_identity.UserDetailCollector(account_name, purpose="patrol").attach(page)
         login_watch = LoginUidWatcher().attach(page)
         await page.goto(
             CHAT_PAGE_URL,
@@ -371,6 +431,21 @@ async def _inspect_once(user, network_mode, profile_config):
         friends.uid_entries = uid_collector.entries()
         friends.uid_summary = uid_collector.summary()
         groups, group_error = await _collect_patrol_groups(page, user)
+        identity_state, _expected, _actual = _identity_verdict(user, login_watch.uid)
+        if (
+            cookie_session is not None
+            and profile_config["refreshStoredCookiesAfterLogin"]
+            and bool(friends.complete and list(friends))
+            and identity_state == "verified"
+        ):
+            # The passive login UID must match before this patrol can publish a
+            # profile snapshot back to the account store.
+            from core.profile_cookies import publish_profile_cookies
+            from core.tasks import _run_browser_stage
+
+            await _run_browser_stage(
+                "refresh_cookies", publish_profile_cookies(context, cookie_session)
+            )
         return {
             "friends": friends,
             "loginUid": login_watch.uid,
@@ -378,11 +453,30 @@ async def _inspect_once(user, network_mode, profile_config):
             "groupError": group_error,
         }
     finally:
-        if uid_collector is not None:
-            uid_collector.detach()
-        if login_watch is not None:
-            login_watch.detach()
-        await _close_session(playwright, browser, context, page)
+        try:
+            collectors_complete, collectors_cancelled = await close_uid_collectors(
+                uid_collector, login_watch
+            )
+            close_cancelled = False
+            close_complete = False
+            try:
+                close_complete = await _close_session(playwright, browser, context, page)
+            except asyncio.CancelledError:
+                close_cancelled = True
+            pending_cookie_operations = any(not task.done() for task in cookie_operations)
+            if not collectors_complete or not close_complete or pending_cookie_operations:
+                # patrol_account owns the account lock and consumes this private,
+                # in-memory signal in its finally block before deciding to release.
+                user["_patrol_uid_cleanup_blocked"] = True
+            if collectors_cancelled or close_cancelled:
+                raise asyncio.CancelledError
+            if not collectors_complete:
+                raise FriendRefreshError(
+                    "浏览器 UID 读取器未停止，账号已暂停巡查",
+                    category=CATEGORY_BROWSER_CLEANUP_BLOCKED,
+                )
+        finally:
+            tasks._BROWSER_OPERATION_OWNER.reset(cookie_owner_token)
 
 
 def _group_targets(user):
@@ -468,6 +562,8 @@ async def _inspect_account(user, profile_config):
             raise
         except Exception as exc:  # noqa: BLE001 - try the next route
             category = getattr(exc, "category", None) or classify_refresh_error(exc)
+            if category in {CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
+                raise
             if category == CATEGORY_LOGIN_REQUIRED and isinstance(exc, FriendRefreshError):
                 raise PatrolLoginFailure(CATEGORY_LOGIN_REQUIRED, _short(str(exc))) from exc
             last_error = exc
@@ -651,6 +747,10 @@ async def patrol_account(user, *, now=None, trigger="scheduled", lock_wait=None,
             "category": CATEGORY_MISSING_COOKIES,
             "reason": "账号没有保存登录信息，需要重新扫码登录",
         }
+    elif browser_account_cleanup_blocked(user):
+        record["skipped"] = True
+        record["login"]["category"] = CATEGORY_BROWSER_CLEANUP_BLOCKED
+        record["reason"] = "浏览器清理尚未确认完成，账号已暂停巡查"
     else:
         if profile_config is None:
             profile_config = normalize_persistent_profile_config(get_config(force_reload=True) or {})
@@ -671,6 +771,7 @@ async def patrol_account(user, *, now=None, trigger="scheduled", lock_wait=None,
                 f"账号正被发送或刷新任务占用，等待 {wait_seconds} 秒后跳过本次巡查"
             )
         if lock is not None:
+            cleanup_blocked = False
             try:
                 inspection = await asyncio.wait_for(
                     _inspect_account(user, profile_config),
@@ -683,15 +784,25 @@ async def patrol_account(user, *, now=None, trigger="scheduled", lock_wait=None,
                 record["reason"] = f"巡查超过 {account_timeout_seconds()} 秒未完成"
             except Exception as exc:  # noqa: BLE001
                 category = getattr(exc, "category", None) or classify_refresh_error(exc)
+                if category == CATEGORY_BROWSER_CLEANUP_BLOCKED:
+                    cleanup_blocked = True
                 record["login"]["category"] = category
                 record["reason"] = _short(
                     f"{LOGIN_CATEGORY_LABELS.get(category, '页面读取失败')}：{exc}"
                 )
             finally:
-                try:
-                    release_browser_account_lock(*lock, account_name)
-                except Exception:  # noqa: BLE001
-                    logger.debug("Failed to release patrol account lock", exc_info=True)
+                cleanup_blocked = cleanup_blocked or bool(
+                    user.pop("_patrol_uid_cleanup_blocked", False)
+                )
+                if cleanup_blocked:
+                    retain_browser_account_lock_for_cleanup(
+                        user, *lock, account_name
+                    )
+                else:
+                    try:
+                        release_browser_account_lock(*lock, account_name)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Failed to release patrol account lock", exc_info=True)
 
     if inspection is not None:
         state, expected, actual = _identity_verdict(user, inspection.get("loginUid") or "")

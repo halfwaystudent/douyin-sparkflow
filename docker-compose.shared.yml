@@ -1,0 +1,32 @@
+# Requires Docker Compose 2.24.4 or later.
+# docker compose -f docker-compose.yml -f docker-compose.shared.yml up -d --build web scheduler
+services:
+  web:
+    environment:
+      SPARKFLOW_SHARED_MODE: "1"
+      SPARKFLOW_STORAGE_KEY_FILE: /run/storage-key/storage.key
+      SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED: "1"
+      SPARKFLOW_ALLOWED_HOSTS: ${SPARKFLOW_ALLOWED_HOSTS:?Set the console hostname in .env}
+      SPARKFLOW_BOOTSTRAP_TOKEN: ${SPARKFLOW_BOOTSTRAP_TOKEN:-}
+      SPARKFLOW_SESSION_COOKIE_SECURE: "1"
+      SPARKFLOW_PASSKEY_RP_ID: ${SPARKFLOW_PASSKEY_RP_ID:-}
+      SPARKFLOW_PASSKEY_ORIGIN: ${SPARKFLOW_PASSKEY_ORIGIN:-}
+    ports: !override
+      - "127.0.0.1:${WEB_PORT:-8787}:8787"
+    volumes: !override
+      - ./DouYinSparkFlow:/app
+      - ./DouYinSparkFlow/logs:/app/logs
+      - ./state/cron:/host-spool-cron
+      - ./state/login-api:/run/login-api:ro
+      - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
+      - ./state/keys:/run/storage-key:ro
+  login-desktop:
+    ports: !reset []
+  scheduler:
+    environment:
+      SPARKFLOW_STORAGE_KEY_FILE: /run/storage-key/storage.key
+      SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED: "1"
+  task:
+    environment:
+      SPARKFLOW_STORAGE_KEY_FILE: /run/storage-key/storage.key
+      SPARKFLOW_STORAGE_REQUIRE_ENCRYPTED: "1"

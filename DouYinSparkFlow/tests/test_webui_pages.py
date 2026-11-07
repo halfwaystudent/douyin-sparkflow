@@ -98,6 +98,7 @@ class RedesignedPagesTests(unittest.TestCase):
                                  "messageIntervalSecondsMin": 45, "messageIntervalSecondsMax": 150},
             }),
             patch.object(app_module, "get_web_users", return_value=[]),
+            patch("core.personal_streak.preferences", return_value={"enabled": False, "time": "18:00", "timezone": "Asia/Shanghai", "messages": [], "next_run_at": ""}),
         ]
         for item in patches:
             item.start()
@@ -162,18 +163,24 @@ class RedesignedPagesTests(unittest.TestCase):
 
     def test_relogin_preselects_only_a_visible_account(self):
         self._as(FRIEND)
-        page = self._get("/login-workspace?relogin=1001").text
+        page = self._get("/login-workspace?relogin_ref=ref-1&generation=").text
         self.assertIn('class="button button-primary login-desktop-open" type="button" data-relogin-unique-id="1001"', page)
         self.assertIn('class="button button-soft login-desktop-save" type="button" data-relogin-unique-id="1001"', page)
 
-        hidden = self._get("/login-workspace?relogin=1002").text
-        self.assertIn('data-login-mode="add"', hidden)
-        self.assertNotIn('data-relogin-unique-id="1002"', hidden)
+        foreign = self._get("/login-workspace?relogin_ref=ref-2&generation=")
+        # The selected ref is not in this principal's rendered account set, so
+        # the route intentionally conceals it as not found rather than falling
+        # back to an add-login workspace.
+        self.assertEqual(404, foreign.status_code)
+        self.assertNotIn("小号", foreign.text)
+
+        missing = self._get("/login-workspace?relogin_ref=missing&generation=")
+        self.assertEqual(404, missing.status_code)
 
     def test_accounts_page_links_relogin_to_the_login_page(self):
         self._as(ADMIN)
         page = self._get("/accounts").text
-        self.assertIn('href="/login-workspace?relogin=1001"', page)
+        self.assertIn('href="/login-workspace?relogin_ref=ref-1&amp;generation="', page)
         # Only the login page hosts the workspace controls.
         self.assertNotIn("login-desktop-controls", page)
         self.assertNotIn("login-desktop-controls", self._get("/").text)
@@ -211,9 +218,9 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertIn('<details class="disabled-accounts fold">', page)
         self.assertIn("已停用账号（1）", page)
         disabled_section = page[page.index('<details class="disabled-accounts fold">'):]
-        self.assertIn('id="account-1002"', disabled_section)
-        self.assertNotIn('id="account-1001"', disabled_section)
-        self.assertLess(page.index('id="account-1001"'), page.index('<details class="disabled-accounts fold">'))
+        self.assertIn('id="account-ref-2"', disabled_section)
+        self.assertNotIn('id="account-ref-1"', disabled_section)
+        self.assertLess(page.index('id="account-ref-1"'), page.index('<details class="disabled-accounts fold">'))
 
     def test_send_console_filters_by_status_account_and_target_name(self):
         self._as(ADMIN)
@@ -269,8 +276,10 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertIn("群聊目标", page)
         self.assertNotIn("群聊目标（手动添加）", page)
         self.assertNotIn("已绑定群\n", page)
-        self.assertIn('\\u003cimg src=x onerror=alert(1)\\u003e', page)
+        self.assertNotIn('\\u003cimg src=x onerror=alert(1)\\u003e', page)
         self.assertNotIn('<img src=x onerror=alert(1)>', page)
+        self.assertIn('id="groups-cache-ref-1">[]</script>', page)
+        self.assertIn('/accounts/1001/picker-cache?ref=ref-1', page)
         self.assertIn('name="group_targets"', page)
         self.assertIn('data-group-targets="true"', page)
         self.assertIn("同名会话", page)
@@ -319,11 +328,10 @@ class RedesignedPagesTests(unittest.TestCase):
         with (
             patch.object(app_module, "validate_csrf", return_value=True),
             patch.object(app_module, "update_config"),
-            patch.object(app_module, "refresh_proxy"),
             patch.object(app_module, "create_web_user"),
         ):
             self.assertEqual("/settings?_anchor=messages", self.client.post("/config", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
-            self.assertEqual("/settings?_anchor=ops", self.client.post("/ops/proxy/refresh", data={"csrf_token": "t"}, follow_redirects=False).headers["location"])
+            self.assertEqual(403, self.client.post("/ops/proxy/refresh", data={"csrf_token": "t"}, follow_redirects=False).status_code)
             self.assertEqual("/settings?_anchor=users", self.client.post("/admin/users/create", data={"csrf_token": "t", "username": "a", "password": "b"}, follow_redirects=False).headers["location"])
 
     def test_theme_follows_the_system_until_the_user_picks_one(self):

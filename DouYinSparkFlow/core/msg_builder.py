@@ -5,11 +5,29 @@ Resolve configured message templates into concrete per-target messages.
 """
 
 import random
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date
 from typing import Dict, List, Optional
 
 from utils.config import get_config
 from utils.hitokoto import request_hitokoto
+
+
+_MESSAGE_CONFIG = ContextVar("message_config", default=None)
+
+
+def current_message_config():
+    return _MESSAGE_CONFIG.get()
+
+
+@contextmanager
+def using_message_config(config):
+    token = _MESSAGE_CONFIG.set(config)
+    try:
+        yield
+    finally:
+        _MESSAGE_CONFIG.reset(token)
 
 
 FESTIVAL_WINDOW_START = date(2026, 2, 16)
@@ -50,7 +68,7 @@ def _render_regular_message(template: str) -> str:
 
 
 def build_message_candidates(config: Optional[dict] = None) -> List[str]:
-    active_config = config or get_config()
+    active_config = config or current_message_config() or get_config()
     today = date.today()
 
     if _is_holiday_mode_enabled(active_config, today):
@@ -58,7 +76,7 @@ def build_message_candidates(config: Optional[dict] = None) -> List[str]:
 
     candidates: List[str] = []
     for template in _get_message_templates(active_config):
-        message = _render_regular_message(template)
+        message = template.strip() if active_config.get("literalMessageTemplates") else _render_regular_message(template)
         if message and message not in candidates:
             candidates.append(message)
 
@@ -103,7 +121,7 @@ def build_messages_for_targets(
     previous_messages: Optional[dict] = None,
     config: Optional[dict] = None,
 ) -> Dict[str, str]:
-    active_config = config or get_config()
+    active_config = config or current_message_config() or get_config()
     strategy = active_config.get("sendStrategy", {}) or {}
 
     ordered_targets = []

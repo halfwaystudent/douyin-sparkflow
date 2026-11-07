@@ -1,4 +1,5 @@
 import unittest
+from tests.auth_helpers import login_form
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -105,9 +106,13 @@ class LoginRouteThrottleTests(unittest.TestCase):
         from webui import app as app_module
 
         self.app_module = app_module
+        self.live_identity = {"username": "admin", "role": "admin", "account_refs": [], "auth_version": 0}
         patches = [
             patch.object(app_module, "is_bootstrapped", return_value=True),
             patch("webui.users.authenticate", side_effect=self._auth),
+            # The fake password verifier and the live identity lookup describe
+            # the same account; refreshed_identity itself remains real.
+            patch("webui.passkeys.login_identity", side_effect=lambda username: dict(self.live_identity) if username == "admin" else None),
         ]
         for item in patches:
             item.start()
@@ -123,7 +128,7 @@ class LoginRouteThrottleTests(unittest.TestCase):
 
     def _login(self, password):
         return self.client.post(
-            "/login", data={"username": "admin", "password": password}, follow_redirects=False
+            "/login", data=login_form(self.client, "admin", password), follow_redirects=False
         )
 
     def test_sixth_attempt_is_refused_without_checking_the_password(self):
@@ -145,6 +150,12 @@ class LoginRouteThrottleTests(unittest.TestCase):
         response = self._login("right-password-1")
 
         self.assertEqual("/", response.headers["location"])
+
+    def test_correct_password_with_a_stale_credential_version_does_not_sign_in(self):
+        self.live_identity["auth_version"] = 1
+        response = self._login("right-password-1")
+        self.assertEqual("/login", response.headers["location"])
+        self.assertEqual(1, self.calls)
 
 
 class PasswordPolicyRouteTests(unittest.TestCase):
@@ -282,5 +293,5 @@ class SaturatedLoginRouteTests(unittest.TestCase):
             for i in range(login_guard.USER_SLOW_AFTER):
                 throttle.record_failure(f"10.200.0.{i}", "admin")
             self.assertGreater(throttle.retry_after("testclient", "admin"), 0)
-            response = client.post("/login", data={"username": "admin", "password": "x"}, follow_redirects=False)
+            response = client.post("/login", data=login_form(client, "admin", "x"), follow_redirects=False)
             self.assertEqual("/login", response.headers["location"])

@@ -4,6 +4,7 @@ No real browser runs here: the page, context, lock and notification channel are
 fakes, and the account store is a temporary file.
 """
 import asyncio
+from html import unescape
 import json
 import os
 import tempfile
@@ -11,13 +12,15 @@ import unittest
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 import main as main_module
 from core import browser as browser_module
-from core import friend_identity, notifications, patrol, streak_state, tasks
+from core import friend_identity, notifications, patrol, profile_cookies, streak_state, tasks
 from core import identity as account_identity
 from core.friends import CHAT_PAGE_URL, FriendRefreshError, FriendScanResult
 from scripts.cron_runner import line_should_run
@@ -231,9 +234,9 @@ class PatrolHarness:
         test_case.addCleanup(state_dir.cleanup)
         self.state_path = Path(state_dir.name) / "notify_state.json"
 
-        async def open_session(user, network_mode, profile_config):
+        async def open_session(user, network_mode, profile_config, *, operation_tasks=None):
             self.sessions += 1
-            return None, None, self.context
+            return None, None, self.context, None
 
         async def detect_login_prompt(page):
             return (True, "visible selector .login-mask") if login_prompt else (False, "")
@@ -1051,7 +1054,12 @@ class PatrolWebTests(unittest.TestCase):
 
         self.assertIn("账号巡查", page)
         self.assertIn("立即巡查", page)
-        self.assertIn(f'data-patrol-url="/accounts/{ACCOUNT_ID}/patrol"', page)
+        patrol_url = unescape(page.split('data-patrol-url="', 1)[1].split('"', 1)[0])
+        parsed_patrol_url = urlparse(patrol_url)
+        self.assertEqual(f"/accounts/{ACCOUNT_ID}/patrol", parsed_patrol_url.path)
+        patrol_query = parse_qs(parsed_patrol_url.query, keep_blank_values=True)
+        self.assertEqual(["acc-1"], patrol_query["ref"])
+        self.assertIn("generation", patrol_query)
         self.assertIn("发现问题", page)
         self.assertIn("抹茶叔叔 → 抹茶", page)
         self.assertIn('data-patrol-target="missing"', page)
@@ -1153,6 +1161,10 @@ class PatrolCancellationAndPushTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(browser_module, "BROWSER_ACCOUNT_LOCK_DIR", directory))
             stack.enter_context(patch.object(patrol, "get_persistent_browser_context", side_effect=slow_start))
+            stack.enter_context(patch.object(
+                profile_cookies, "prepare_profile_cookies",
+                new=AsyncMock(return_value=SimpleNamespace(account=base_account())),
+            ))
             stack.enter_context(patch.object(patrol, "release_browser_account_lock", side_effect=release))
             stack.enter_context(patch.object(patrol, "douyin_network_modes", return_value=["direct"]))
             stack.enter_context(patch.object(patrol, "account_timeout_seconds", return_value=0.01))
@@ -1177,13 +1189,13 @@ class PatrolCancellationAndPushTests(unittest.TestCase):
     def test_startup_cookie_failure_also_closes_handles(self):
         context = MagicMock()
         playwright = MagicMock()
-        context.add_cookies = AsyncMock(side_effect=RuntimeError("cookie setup failed"))
+        prepare = AsyncMock(side_effect=RuntimeError("cookie setup failed"))
         context.close = AsyncMock()
         playwright.stop = AsyncMock()
         with patch.object(
             patrol, "get_persistent_browser_context",
             new=AsyncMock(return_value=(playwright, context, "fake-profile")),
-        ):
+        ), patch.object(profile_cookies, "prepare_profile_cookies", prepare):
             with self.assertRaisesRegex(RuntimeError, "cookie setup failed"):
                 asyncio.run(patrol._open_session(base_account(), "direct", {
                     "enabled": True, "root": "fake-profile",

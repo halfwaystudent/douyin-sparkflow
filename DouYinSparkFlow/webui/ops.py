@@ -7,6 +7,9 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+import threading
+from copy import deepcopy
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,6 +51,9 @@ TASK_SCHEDULE_MARKERS = (
     PATROL_SCHEDULE_MARKER,
 )
 HOST_CRONTAB_PATH = Path("/host-spool-cron/root")
+_display_crontab = None
+_host_status_cache = None
+_host_status_lock = threading.Lock()
 # The scheduler container mounts ./DouYinSparkFlow/logs at /app/logs, so trigger
 # output written here stays readable from both the scheduler and the web
 # container (the panel). /var/log is not mounted and silently diverges.
@@ -64,6 +70,11 @@ CONFIRMATION_LABELS = {
 }
 
 FAILURE_CATEGORY_LABELS = {
+    "browser_dialog_blocked": "页面弹窗需人工检查，已停止自动操作",
+    "browser_stage_timeout": "页面阶段超时（整轮暂停）",
+    "friend_identity_mismatch": "聊天对象身份不一致，已停止发送",
+    "friend_identity_unavailable": "聊天对象身份无法确认，已停止发送",
+    "browser_cleanup_blocked": "浏览器清理未完成，需检查后恢复",
     "send_unconfirmed": "待核验",
     "login_required": "登录失效",
     "login_verification_pending": "登录态待核验",
@@ -538,17 +549,32 @@ def read_log_tail(lines=200):
     log_path = log_file_path()
     if not log_path.exists():
         return ""
-    content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(content[-lines:])
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, 2)
+            offset = max(0, handle.tell() - 512 * 1024)
+            handle.seek(offset)
+            content = handle.read(512 * 1024).decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        logger.warning("Task log is temporarily unavailable")
+        return ""
+    if offset:
+        content = content[1:]
+    return "\n".join(content[-max(1, min(int(lines), 2000)):])
 
 
 def read_crontab():
+    global _display_crontab
     if running_in_container() and HOST_CRONTAB_PATH.exists():
-        return HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+        text = HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+        _display_crontab = text
+        return text
     try:
         result = subprocess.run(["crontab", "-l"], text=True, capture_output=True, timeout=10)
         if result.returncode != 0:
+            _display_crontab = ""
             return ""
+        _display_crontab = result.stdout
         return result.stdout
     except FileNotFoundError:
         # Native Windows installs do not provide ``crontab``. The caller can
@@ -569,7 +595,7 @@ def _format_window_schedule(window_config):
     )
 
 
-def schedule_window_state(now=None):
+def schedule_window_state(now=None, *, allow_host_commands=True):
     """Report whether right now sits inside today's configured send window.
 
     The window may only be edited from outside it, so the save route and the
@@ -577,7 +603,7 @@ def schedule_window_state(now=None):
     """
     current = now or datetime.now(_schedule_timezone())
     try:
-        parsed = parse_schedule_string(current_daily_schedule())
+        parsed = parse_schedule_string(current_daily_schedule(allow_host_commands=allow_host_commands))
     except ValueError:
         parsed = None
     if not parsed or parsed.get("mode") != "window":
@@ -659,7 +685,7 @@ def schedule_line_kind(line):
     """Classify a douyin task line as a windowed schedule or a single fixed run."""
     if is_patrol_schedule_line(line):
         return "patrol"
-    if "SPARKFLOW_FALLBACK_PHASE=1" in str(line or ""):
+    if "SPARKFLOW_FALLBACK_PHASE=1" in str(line or "") or "SPARKFLOW_8610_RETRY_ONLY=1" in str(line or ""):
         # The end-of-window fallback runs at one fixed minute but only exists
         # as part of a window schedule.
         return "window"
@@ -821,6 +847,9 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
             f"{scheduled_command} >> {CRON_LOG_PATH} 2>&1"
         )
 
+    # Eligible refusals are handled by the normal planner and the same
+    # end-of-window fallback. Never add an extra send hour beyond user config.
+
     # One daily account patrol before the first scheduled send of the day.
     patrol_line = patrol_cron_line(schedule)
     if patrol_line:
@@ -855,18 +884,21 @@ def persist_schedule_config(time_string):
 
 
 def update_daily_schedule(time_string):
+    global _display_crontab
     persist_schedule_config(time_string)
     current = read_crontab()
     updated = replace_douyin_cron_schedule(current, time_string)
     if running_in_container() and HOST_CRONTAB_PATH.parent.exists():
         try:
             HOST_CRONTAB_PATH.write_text(updated, encoding="utf-8")
+            _display_crontab = updated
             return subprocess.CompletedProcess(args=["write-host-crontab"], returncode=0, stdout="", stderr="")
         except Exception as exc:
             logger.error("update_daily_schedule failed: %s", exc)
             return _empty_result(stderr=str(exc))
     try:
         process = subprocess.run(["crontab", "-"], input=updated, text=True, capture_output=True, check=True, timeout=10)
+        _display_crontab = updated
         return process
     except Exception as exc:
         logger.error("update_daily_schedule failed: %s", exc)
@@ -1006,7 +1038,7 @@ def _sync_fixed_schedule_patrol(send_lines, all_lines):
         return _empty_result(stderr=str(exc))
 
 
-def current_daily_schedule():
+def current_daily_schedule(*, allow_host_commands=True):
     config = get_config(force_reload=True)
     window = dict(config.get("dailySendWindow") or {})
     if window.get("enabled"):
@@ -1015,7 +1047,15 @@ def current_daily_schedule():
         except Exception:
             logger.warning("current_daily_schedule found invalid dailySendWindow=%s", window)
 
-    for line in read_crontab().splitlines():
+    if allow_host_commands:
+        crontab = read_crontab()
+    elif HOST_CRONTAB_PATH.exists():
+        crontab = HOST_CRONTAB_PATH.read_text(encoding="utf-8", errors="replace")
+    else:
+        crontab = _display_crontab
+    if crontab is None:
+        return "状态待查询"
+    for line in crontab.splitlines():
         if is_patrol_schedule_line(line):
             # The patrol line is not a send time.
             continue
@@ -1185,10 +1225,10 @@ def preview_daily_schedule(time_string):
     }
 
 
-def get_schedule_snapshot(now=None):
+def get_schedule_snapshot(now=None, *, allow_host_commands=True):
     now = now or datetime.now(_schedule_timezone())
     window = _normalize_send_window()
-    label = current_daily_schedule()
+    label = current_daily_schedule(allow_host_commands=allow_host_commands)
     if window.get("enabled"):
         next_trigger = _next_window_trigger(now, window)
     else:
@@ -1202,7 +1242,8 @@ def get_schedule_snapshot(now=None):
     return {
         "label": label,
         "nextTriggerAt": next_trigger.isoformat(timespec="seconds") if next_trigger else "",
-        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M") if next_trigger else "",
+        "nextTriggerDisplay": next_trigger.strftime("%m-%d %H:%M") if next_trigger else ("状态待查询" if label == "状态待查询" else ""),
+        "statusPending": label == "状态待查询",
     }
 
 
@@ -1254,9 +1295,12 @@ def _account_failure_pause_after_attempts():
 
 
 def _account_failure_pause_active(account_failure, now, pause_after):
-    if _coerce_attempt_count(account_failure) < pause_after:
-        return False
     category = str(account_failure.get("category") or "")
+    if category in {"browser_cleanup_blocked", "friend_identity_mismatch"}:
+        # Sending is unsafe or impossible until a human looks at the chat page.
+        return True
+    if category not in {"browser_stage_timeout", "browser_dialog_blocked"} and _coerce_attempt_count(account_failure) < pause_after:
+        return False
     if category not in TEMPORARY_ACCOUNT_FAILURE_CATEGORIES:
         return True
     last_attempt_at = _parse_sent_at(
@@ -1301,6 +1345,9 @@ def _format_duration_seconds(seconds):
 
 
 def _account_failure_entry_today(account, now):
+    cleanup_block = dict(account.get("browser_cleanup_blocked") or {})
+    if cleanup_block:
+        return cleanup_block
     entry = dict(account.get("account_failure") or {})
     last_attempt_at = _parse_sent_at(entry.get("lastAttemptAt"), now.tzinfo)
     category = str(entry.get("category") or "")
@@ -1370,14 +1417,20 @@ def _account_blocked_target_status(account, item, account_failure, now):
             "status": "account_blocked",
             "category": category,
             "reason": str(account_failure.get("reason") or ""),
-            "attemptCount": _coerce_attempt_count(account_failure),
-            "lastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
+            # The account fault is not an attempt to this target. Keep the
+            # target ledger fields untouched and expose the batch separately.
+            "accountAttemptCount": _coerce_attempt_count(account_failure),
+            "accountLastAttemptAt": str(account_failure.get("lastAttemptAt") or ""),
             "accountFailureAffected": account_failure_affected,
             "cooldownRemainingSeconds": remaining,
             "skipReason": (
-                f"账号冷却中（{category_label}），剩余 {remaining_label} 后才会再尝试"
+                f"该目标未执行发送；账号冷却中（{category_label}），剩余 {remaining_label} 后才会再尝试"
                 if remaining_label
-                else f"账号异常（{category_label}），今天不再发送，明天恢复"
+                else (
+                    "该目标未执行发送；账号需要重新登录后才能恢复"
+                    if category in {"login_required", "browser_login_required", "protocol_login_required", "expired_cookies"}
+                    else f"该目标未执行发送；账号异常（{category_label}），需等待恢复或人工处理"
+                )
             ),
         }
     )
@@ -1544,9 +1597,49 @@ def _build_target_status(account, target_name, now, send_window):
         )
         return _finalize_target_status(item, now)
 
+    # The durable pre-Enter barrier intentionally has no message_history row:
+    # dispatch/receipt can be interrupted before delivery is known. Do not render
+    # that no-resend state as an ordinary pending target.
+    barrier_at = _parse_sent_at(state.get("sentAt"), now.tzinfo)
+    if (
+        state.get("status") == streak_state.STATE_SENT_UNVERIFIED
+        and state.get("lastEvidenceDetail") == "pre_enter_outcome_unknown_barrier"
+        and barrier_at and barrier_at.date() == now.date()
+    ):
+        item.update({
+            "status": "unconfirmed",
+            "lastAttemptAt": barrier_at.isoformat(timespec="seconds"),
+            "category": "send_unconfirmed",
+            "reason": "已建立发送保护记录，但是否实际发出尚未确认",
+            "attemptCount": int(state.get("attemptCount") or 0),
+            "confirmationLevel": "weak",
+            "confirmationSource": "pre_enter_outcome_unknown_barrier",
+            "confirmationDetail": "发送结果不明，不自动重发",
+            "needsVerification": True,
+            "skipReason": "可能已发出，不自动重发；请先核验发送结果",
+        })
+        return _finalize_target_status(item, now)
+
     failure_entry = streak_state.failure_entry(account, target_name, now.tzinfo)
     last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"), now.tzinfo)
     failure_is_today = bool(last_attempt_at and last_attempt_at.date() == now.date())
+    state_attempt_at = _parse_sent_at(state.get("lastAttemptAt"), now.tzinfo)
+    if (
+        state.get("status") in streak_state.FAILED_STATES
+        and state_attempt_at and state_attempt_at.date() == now.date()
+        and (last_attempt_at != state_attempt_at
+             or failure_entry.get("category") != state.get("lastErrorCategory"))
+    ):
+        # A lost/stale queue row must not turn a known failed attempt into a
+        # normal pending target. Never manufacture receipt evidence to retry.
+        item.update({
+            "status": "failed",
+            "lastAttemptAt": state_attempt_at.isoformat(timespec="seconds"),
+            "category": str(state.get("lastErrorCategory") or ""),
+            "reason": "失败记录不一致，自动补试受阻；" + str(state.get("lastErrorReason") or ""),
+            "attemptCount": int(state.get("attemptCount") or 0),
+        })
+        return _finalize_target_status(item, now)
 
     if sent_at and sent_at.date() == now.date():
         confirmation_level = str(history_entry.get("confirmationLevel") or "legacy")
@@ -1934,7 +2027,7 @@ def get_overview_snapshot(account_refs=None):
     return {
         "now": send_console["now"],
         "schedule": {
-            **get_schedule_snapshot(),
+            **get_schedule_snapshot(allow_host_commands=False),
             # The next cron trigger is only meaningful while something is still
             # waiting to be sent; otherwise the window just spins empty.
             "remainingTargets": int(summary["today_pending_targets"])
@@ -1979,12 +2072,28 @@ def _check_image_present():
         return False
 
 
+def resolve_log_file(configured):
+    root = Path(os.getenv("SPARKFLOW_LOG_DIRECTORY") or repo_root() / "logs").resolve()
+    candidate = Path(configured or root / "douyin-sparkflow.log")
+    if candidate.is_relative_to(Path("/app/logs")):
+        candidate = root / candidate.relative_to("/app/logs")
+    elif not candidate.is_absolute():
+        candidate = repo_root() / candidate
+    candidate = candidate.resolve()
+    key_file = os.getenv("SPARKFLOW_STORAGE_KEY_FILE", "")
+    if not candidate.is_relative_to(root) or candidate.suffix != ".log" or (key_file and candidate == Path(key_file).resolve()):
+        raise ValueError("日志文件只能是应用 logs 目录内的 .log 文件。")
+    return candidate
+
+
 def log_file_path():
     """Path of the task log the panel reads and offers for download."""
     configured = str(get_app_settings().get("ops_log_file") or "").strip()
-    if configured:
-        return Path(configured)
-    return Path(CRON_LOG_PATH)
+    try:
+        return resolve_log_file(configured)
+    except ValueError:
+        logger.warning("Ignoring a log path outside the application log directory")
+        return resolve_log_file("")
 
 
 LOG_LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b")
@@ -2096,13 +2205,21 @@ def _cached(key, producer, ttl=CACHE_TTL_SECONDS):
     return value
 
 
-def get_ops_snapshot(account_refs=None):
+def get_ops_snapshot(account_refs=None, *, include_host_data=True):
     """Collect operational metrics for the dashboard.
 
     Every external call is individually guarded so the dashboard always
     renders, even when Docker or crontab are not available.
     """
     send_console = get_send_console_snapshot(account_refs=account_refs)
+    if account_refs is not None or not include_host_data:
+        schedule = get_schedule_snapshot(allow_host_commands=False)
+        return {
+            "send_console": send_console, "task_lock": task_run_lock_status(),
+            "schedule": schedule, "daily_schedule": schedule.get("label", ""),
+            "compose_root": "", "compose_file": "", "containers": [], "task_containers": [],
+            "schedule_alignment": {}, "recent_triggers": [], "crontab": "", "log_tail": [], "image_present": False,
+        }
     triggers = _cached("recent-triggers", recent_trigger_lines)
     return {
         "compose_root": str(compose_root()),
@@ -2119,3 +2236,33 @@ def get_ops_snapshot(account_refs=None):
         "log_tail": _cached("log-tail", lambda: read_log_tail(120)),
         "image_present": _cached("image-present", _check_image_present),
     }
+
+
+class HostStatusBusy(RuntimeError):
+    pass
+
+
+def get_host_status_snapshot():
+    """Slow host probes are requested separately from business-page HTML."""
+    global _host_status_cache
+    if not _host_status_lock.acquire(blocking=False):
+        raise HostStatusBusy("host status probe is already running")
+    try:
+        snapshot_file = os.getenv("SPARKFLOW_HOST_STATUS_FILE", "")
+        if snapshot_file:
+            # Read freshness on every request; a cached green status must not
+            # conceal a stopped host-side collector. Never fall back to Docker.
+            from utils.service_status import read_host_status_snapshot
+            return read_host_status_snapshot(snapshot_file)
+        if _host_status_cache is not None and time.monotonic() - _host_status_cache[0] < 5:
+            return deepcopy(_host_status_cache[1])
+        visible = {"douyin-web", "douyin-scheduler", "login-desktop", "mihomo"}
+        containers = [
+            {key: str(row.get(key) or "") for key in ("Names", "State", "Status")}
+            for row in get_container_status() if row.get("Names") in visible
+        ]
+        result = {"ok": True, "containers": containers, "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        _host_status_cache = (time.monotonic(), result)
+        return deepcopy(result)
+    finally:
+        _host_status_lock.release()

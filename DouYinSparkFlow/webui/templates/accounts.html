@@ -9,7 +9,7 @@
 {% block page_sub %}<p class="page-sub">管理每个账号要续火花的好友，以及登录态和启用状态。</p>{% endblock %}
 
 {% block topbar_actions %}
-<button class="button button-quiet" type="button" data-refresh-all-friends>
+<button class="button button-quiet" type="button" data-refresh-all-friends {% if not accounts %}hidden disabled{% endif %}>
   <i data-lucide="refresh-cw"></i><span>刷新全部好友</span>
 </button>
 <a class="button button-primary" href="/login-workspace">
@@ -25,6 +25,8 @@
   {% set enabled_accounts = accounts|rejectattr('enabled', 'equalto', false)|list %}
   {% set disabled_accounts = accounts|selectattr('enabled', 'equalto', false)|list %}
   {% if accounts %}
+  {% set legacy_anchors = namespace(ids=[]) %}
+  {% set visible_record_refs = accounts|map(attribute='account_ref')|list %}
   {% for account in enabled_accounts + disabled_accounts %}
   {% if loop.index0 == enabled_accounts|length and disabled_accounts %}
   <details class="disabled-accounts fold">
@@ -33,18 +35,19 @@
   {% endif %}
   {% set duplicate_count = duplicates.get(account.username, 0) %}
   {% set enabled = account.enabled|default(true) %}
-  <details class="fold" id="account-{{ account.unique_id }}">
+  <details class="fold" id="account-{{ account.account_ref|urlencode }}">
     <summary>
       <span class="account-ident">
         <span class="account-avatar">{{ (account.username or "A")[:1] }}</span>
         <span class="account-name">
-          <strong>{{ account.username }}</strong>
-          <small>{{ account.targets|length }} 个目标好友 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
+          <strong data-account-saved-name>{{ account.username }}</strong>
+          <small><span data-account-target-count>{{ account.targets|length }}</span> 个发送目标 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
           {% set ident_ids = identity_view(account) %}
           <small class="identity-ids">{% if ident_ids.platform_uid %}平台 UID {{ ident_ids.platform_uid }}{% else %}历史 ID {{ account.unique_id }}（类型未知）{% endif %}{% if ident_ids.display_id %} · 页面显示 ID {{ ident_ids.display_id }}{% endif %}</small>
         </span>
       </span>
       <span class="summary-metrics">
+        <span class="pill warning" data-account-draft hidden>未保存</span>
         {% if duplicate_count > 1 %}
         <span class="pill warning" title="同名账号通常来自重复保存登录态，建议确认后合并或删除多余的记录">同名 {{ duplicate_count }} 个</span>
         {% endif %}
@@ -56,13 +59,20 @@
         <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
         {% set patrol = patrol_view(account) %}
         {% if patrol.has %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">{% if patrol.conclusion == 'ok' %}巡查正常{% else %}巡查：{{ patrol.conclusionLabel }}{% endif %}</span>{% endif %}
-        <span class="pill {% if enabled %}success{% else %}warning{% endif %}">{% if enabled %}已启用{% else %}已停用{% endif %}</span>
+        <span class="pill {% if enabled %}success{% else %}warning{% endif %}" data-account-enabled>{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>
     </summary>
     <div class="fold-body">
-      <form method="post" action="/accounts/{{ account.unique_id }}/update" class="form-stack">
+      {% if account.unique_id not in legacy_anchors.ids and account.unique_id not in visible_record_refs %}
+      <span id="account-{{ account.unique_id|urlencode }}" aria-hidden="true"></span>
+      {% set legacy_anchors.ids = legacy_anchors.ids + [account.unique_id] %}
+      {% endif %}
+      <form method="post" action="/accounts/{{ account.unique_id }}/update" class="form-stack" data-editor-form data-editor-kind="account" data-review-url="/accounts?_anchor=account-{{ account.account_ref|urlencode }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+        <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
+        <input type="hidden" name="edit_revision" value="{{ account_edit_revision(account) }}">
         <div class="form-grid">
           <label class="field">
             <span>显示名</span>
@@ -76,7 +86,9 @@
         <div
           class="friend-picker"
           data-account-id="{{ account.unique_id }}"
-          data-refresh-url="/accounts/{{ account.unique_id }}/friends/refresh"
+          data-record-key="{{ account.account_ref }}"
+          data-cache-url="/accounts/{{ account.unique_id }}/picker-cache?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
+          data-refresh-url="/accounts/{{ account.unique_id }}/friends/refresh?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
           data-csrf-token="{{ csrf_token }}"
         >
           <div class="friend-picker-toolbar">
@@ -93,27 +105,27 @@
           <input class="friend-search-input" type="search" placeholder="搜索好友昵称" aria-label="搜索好友">
           <p class="friend-picker-summary">已选 0 人</p>
           <div class="friend-picker-list"></div>
-          <script type="application/json" id="friends-cache-{{ account.unique_id }}">{{ account.friends_cache|default([], true)|tojson }}</script>
-          <script type="application/json" id="selected-targets-{{ account.unique_id }}">{{ account.targets|default([], true)|tojson }}</script>
+          <script type="application/json" id="friends-cache-{{ account.account_ref }}">[]</script>
+          <script type="application/json" id="selected-targets-{{ account.account_ref }}">{{ account.targets|default([], true)|tojson }}</script>
         </div>
         <label class="field">
           <span>手动补充好友</span>
           <textarea class="targets-textarea" name="targets" rows="3" placeholder="每行一个好友昵称；也可在上面的列表中勾选">{% for target in account.targets|default([], true) %}{% if not target.startswith(('群聊：', '群聊:')) %}{{ target }}
 {% endif %}{% endfor %}</textarea>
         </label>
-        <section class="group-target-editor" data-group-targets="true" aria-labelledby="group-targets-{{ account.unique_id }}">
+        <section class="group-target-editor" data-group-targets="true" aria-labelledby="group-targets-{{ account.account_ref }}">
           <div class="group-target-editor-heading">
             <div>
-              <strong id="group-targets-{{ account.unique_id }}">群聊目标</strong>
+              <strong id="group-targets-{{ account.account_ref }}">群聊目标</strong>
               <p class="friend-picker-status" data-group-status>{% if account.group_cache_updated_at %}上次刷新：{{ account.group_cache_updated_at }}{% else %}尚未读取群列表{% endif %}</p>
             </div>
             <button class="button button-quiet button-sm group-refresh-button" type="button">刷新群列表</button>
           </div>
-          <div class="group-picker" data-account-id="{{ account.unique_id }}" data-refresh-url="/accounts/{{ account.unique_id }}/groups/refresh" data-csrf-token="{{ csrf_token }}">
+          <div class="group-picker" data-account-id="{{ account.unique_id }}" data-record-key="{{ account.account_ref }}" data-cache-url="/accounts/{{ account.unique_id }}/picker-cache?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}" data-refresh-url="/accounts/{{ account.unique_id }}/groups/refresh?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}" data-csrf-token="{{ csrf_token }}">
             <div class="group-picker-notices">{% for target, notice in (account.group_target_notices|default({}, true)).items() %}<span class="pill {% if notice.kind == 'missing' %}danger{% else %}warning{% endif %}">{{ '未找到此群' if notice.kind == 'missing' else '已改名为 ' ~ notice.currentName }}</span>{% endfor %}</div>
-            <div class="group-picker-list"></div>
-            <script type="application/json" id="groups-cache-{{ account.unique_id }}">{{ account.group_cache|default([], true)|tojson }}</script>
-            <script type="application/json" id="group-bindings-{{ account.unique_id }}">{{ account.group_target_bindings|default({}, true)|tojson }}</script>
+            <div class="group-picker-list">{% for target, conversation_id in (account.group_target_bindings|default({}, true)).items() %}<label><input type="checkbox" name="group_bind" value="{{ conversation_id }}" checked><span>{{ target }}（{{ conversation_id }}）</span></label>{% endfor %}</div>
+            <script type="application/json" id="groups-cache-{{ account.account_ref }}">[]</script>
+            <script type="application/json" id="group-bindings-{{ account.account_ref }}">{{ account.group_target_bindings|default({}, true)|tojson }}</script>
           </div>
           <div class="group-target-editor-heading">
             <div>
@@ -128,12 +140,16 @@
           </label>
           <p class="group-target-editor-note">保存时会统一为“群聊：群名称”。同名好友与群聊可以同时保留；刷新好友列表不会修改这里的群聊目标。消息发送不代表群火花已成功，仍以发送明细中的结果为准。</p>
         </section>
-        <div class="form-actions">
-          <button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存</span></button>
-          <a class="button button-quiet" href="/login-workspace?relogin={{ account.unique_id|urlencode }}">
+        <div class="form-actions editor-actions" data-editor-actions>
+          <button class="button button-primary" type="submit" data-editor-save><i data-lucide="check"></i><span data-editor-save-label>保存这个账号</span></button>
+          <span class="muted compact" data-editor-state aria-live="polite"></span>
+          {% if request.session.get('setup_in_progress') %}<a class="button button-quiet" href="/setup?account={{ account.account_ref|urlencode }}" data-editor-next {% if not account.targets %}hidden{% endif %}>继续设置</a>{% endif %}
+          <a class="button button-quiet" href="/login-workspace?relogin_ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}">
             <i data-lucide="scan-qr-code"></i><span>重新登录</span>
           </a>
         </div>
+        <p class="notice-inline" data-editor-feedback role="status" aria-live="polite" hidden></p>
+        <a class="section-link" href="/accounts?_anchor=account-{{ account.unique_id|urlencode }}" data-editor-review target="_blank" rel="noopener" hidden>在新页核对已保存内容</a>
       </form>
       {% set patrol = patrol_view(account) %}
       <section class="patrol-panel" data-patrol-panel style="padding-top: 14px; border-top: 1px solid var(--line)">
@@ -147,8 +163,8 @@
           <button
             class="button button-quiet button-sm"
             type="button"
-            data-patrol-url="/accounts/{{ account.unique_id }}/patrol"
-            data-patrol-status-url="/accounts/{{ account.unique_id }}/patrol/status"
+            data-patrol-url="/accounts/{{ account.unique_id }}/patrol?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
+            data-patrol-status-url="/accounts/{{ account.unique_id }}/patrol/status?ref={{ account.account_ref|urlencode }}&amp;generation={{ account.login_generation|default('')|urlencode }}"
             data-csrf-token="{{ csrf_token }}"
             {% if not enabled %}disabled title="账号已停用，巡查只检查启用的账号"{% endif %}
           >
@@ -175,6 +191,8 @@
       <div class="form-actions" style="padding-top: 14px; border-top: 1px solid var(--line)">
         <form method="post" action="/accounts/{{ account.unique_id }}/toggle-enabled">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+          <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
           <button class="button button-ghost button-sm" type="submit">
             <i data-lucide="{% if enabled %}pause{% else %}play{% endif %}"></i>
             <span>{% if enabled %}停用自动发送{% else %}启用自动发送{% endif %}</span>
@@ -190,10 +208,13 @@
           data-confirm-accept="确认合并"
         >
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+          <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
+          <input type="hidden" name="target_login_generation" value="">
           <select class="inline-select" name="target_account_ref" aria-label="保留哪个账号">
             {% for other in accounts %}
-            {% if other.unique_id != account.unique_id and other.username == account.username %}
-            <option value="{{ other.account_ref }}">保留 {{ other.username }}（{{ other.unique_id }}）</option>
+            {% if other.account_ref != account.account_ref and other.username == account.username %}
+            <option value="{{ other.account_ref }}" data-login-generation="{{ other.login_generation|default('') }}">保留 {{ other.username }}（{{ other.unique_id }}）</option>
             {% endif %}
             {% endfor %}
           </select>
@@ -209,6 +230,8 @@
           data-confirm-accept="确认删除"
         >
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+          <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
           <button class="button button-danger button-sm" type="submit"><i data-lucide="trash-2"></i><span>删除账号</span></button>
         </form>
       </div>

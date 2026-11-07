@@ -1,8 +1,16 @@
 import hashlib
 import hmac
 import secrets
+import time
 
-from utils.config import get_app_settings, save_app_settings
+from filelock import FileLock
+
+from utils.config import app_settings_path, get_app_settings, read_app_settings, save_app_settings
+from webui import sessions
+
+
+class BootstrapAlreadyConfigured(ValueError):
+    pass
 
 
 def hash_password(password, salt=None):
@@ -12,6 +20,8 @@ def hash_password(password, salt=None):
 
 
 def verify_password(password, stored_hash):
+    if len(password) > 1024:
+        return False
     if not stored_hash or "$" not in stored_hash:
         return False
     try:
@@ -25,7 +35,7 @@ def verify_password(password, stored_hash):
 
 
 def is_bootstrapped():
-    return bool(get_app_settings().get("admin_password_hash"))
+    return bool(read_app_settings().get("admin_password_hash"))
 
 
 def _session_version(value):
@@ -36,11 +46,14 @@ def _session_version(value):
 
 
 def bootstrap_admin_password(password, username="admin"):
-    settings = get_app_settings(force_reload=True)
-    settings["admin_username"] = username.strip() or "admin"
-    settings["admin_password_hash"] = hash_password(password)
-    settings["admin_session_version"] = _session_version(settings.get("admin_session_version")) + 1
-    return save_app_settings(settings)
+    with FileLock(f"{app_settings_path()}.bootstrap.lock", timeout=30):
+        settings = get_app_settings(force_reload=True)
+        if settings.get("admin_password_hash"):
+            raise BootstrapAlreadyConfigured("Admin login is already configured.")
+        settings["admin_username"] = username.strip() or "admin"
+        settings["admin_password_hash"] = hash_password(password)
+        settings["admin_session_version"] = _session_version(settings.get("admin_session_version")) + 1
+        return save_app_settings(settings)
 
 
 def update_admin_password(password):
@@ -54,18 +67,37 @@ def issue_session(request, username, *, role="admin", account_refs=None, auth_ve
     request.session.clear()
     request.session["user"] = username
     request.session["role"] = role
-    request.session["account_refs"] = list(account_refs or [])
+    # Account assignments are resolved from the user store on every request.
     request.session["auth_version"] = _session_version(auth_version)
     request.session["session_id"] = secrets.token_urlsafe(24)
     request.session["csrf_token"] = secrets.token_urlsafe(24)
+    lifetime = max(1, min(int(get_app_settings().get("session_max_age_seconds", 28800)), 86400))
+    request.session["expires_at"] = time.time() + lifetime
 
 
-def clear_session(request):
+def clear_session(request, *, revoke=True):
+    expires_at = request.session.get("expires_at", 0)
+    if revoke:
+        sessions.revoke(request.session.get("session_id", ""), expires_at)
     request.session.clear()
 
 
 def current_user(request):
     return request.session.get("user")
+
+
+def refreshed_identity(identity):
+    """Recheck the live credential version after asynchronous verification."""
+    if not identity:
+        return None
+    from webui.passkeys import login_identity
+    live = login_identity(identity["username"])
+    keys = ("username", "role", "auth_version")
+    if "user_key" in identity:
+        keys += ("user_key",)
+    if not live or any(live.get(key) != identity.get(key) for key in keys):
+        return None
+    return live
 
 
 def current_principal(request):
@@ -74,12 +106,18 @@ def current_principal(request):
     if not username:
         return None
     session_id = request.session.get("session_id", "")
+    expires_at = request.session.get("expires_at", 0)
+    if not session_id or not isinstance(expires_at, (int, float)) or expires_at <= time.time() or sessions.is_revoked(session_id):
+        return None
     role = request.session.get("role")
     session_version = _session_version(request.session.get("auth_version"))
-    admin_username = str(get_app_settings().get("admin_username", "admin")).strip() or "admin"
+    if role in {"admin", None}:
+        settings = read_app_settings()
+        admin_username = str(settings.get("admin_username", "admin")).strip() or "admin"
+    else:
+        settings, admin_username = {}, ""
     if role == "admin" or (role is None and username.casefold() == admin_username.casefold()):
-        settings = get_app_settings()
-        if session_version != _session_version(settings.get("admin_session_version")):
+        if username.casefold() != admin_username.casefold() or session_version != _session_version(settings.get("admin_session_version")):
             return None
         return {
             "username": admin_username,
@@ -122,7 +160,7 @@ def csrf_token(request):
 
 def validate_csrf(request, submitted_token):
     stored_token = request.session.get("csrf_token")
-    return bool(stored_token and submitted_token and hmac.compare_digest(stored_token, submitted_token))
+    return bool(stored_token and submitted_token and hmac.compare_digest(stored_token.encode("utf-8"), submitted_token.encode("utf-8")))
 
 
 def is_https_request(request):

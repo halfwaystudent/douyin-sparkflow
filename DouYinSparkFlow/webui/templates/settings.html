@@ -11,7 +11,7 @@
 {% if is_admin %}
 {% set summary = ops.send_console.summary %}
 {% set total = summary.total_targets or 0 %}
-<div class="settings-layout">
+<div class="settings-layout" data-settings-tabs>
   <nav class="settings-nav" aria-label="设置分区">
     <a href="#messages"><i data-lucide="message-circle-heart"></i>消息</a>
     <a href="#schedule"><i data-lucide="calendar-clock"></i>发送窗口</a>
@@ -19,6 +19,8 @@
     <a href="#system"><i data-lucide="server-cog"></i>系统</a>
     <a href="#notify"><i data-lucide="bell"></i>推送通知</a>
     <a href="#users"><i data-lucide="users-round"></i>Web 用户</a>
+    <a href="#registration"><i data-lucide="user-plus"></i>注册邀请</a>
+    <a href="#passkeys"><i data-lucide="fingerprint"></i>通行密钥</a>
   </nav>
 
   <div>
@@ -29,6 +31,7 @@
           <p>每次续火花发出去的内容和节奏。</p>
         </div>
       </div>
+      <p class="notice-inline">这里是全局默认消息模板。“我的续火花”的发送内容留空时，使用这里已有的固定模板、消息变体和节日模板，保留 [API] 等原有规则。已在“我的续火花”保存个人发送内容的用户，优先使用个人内容，不与这里的固定模板、变体或节日模板混用；个人内容中的 [API] 等标记按普通文字发送。修改全局模板会影响选择留空继承的个人计划。</p>
       <form method="post" action="/config" class="form-stack">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label class="field"><span>固定消息模板</span><input type="text" name="messageTemplate" value="{{ runtime_config.messageTemplate }}"><small>填写了消息变体时会优先从变体里随机挑选。</small></label>
@@ -115,6 +118,7 @@
             <i data-lucide="send"></i><span>全部重发</span>
           </button>
         </form>
+        {% if host_operations_enabled %}
         <form method="post" action="/ops/proxy/refresh">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="button button-quiet" type="submit"><i data-lucide="cloud-download"></i><span>刷新代理订阅</span></button>
@@ -129,6 +133,7 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="button button-danger" type="submit"><i data-lucide="power"></i><span>重启代理</span></button>
         </form>
+        {% endif %}
       </div>
     </section>
 
@@ -143,7 +148,7 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="form-grid">
           <label class="field"><span>Compose 根目录</span><input type="text" name="compose_root" value="{{ app_settings.compose_root }}"></label>
-          <label class="field"><span>任务日志文件</span><input type="text" name="ops_log_file" value="{{ app_settings.ops_log_file }}"></label>
+          <label class="field"><span>任务日志文件</span><input type="text" name="ops_log_file" value="{{ app_settings.ops_log_file }}"><small>仅允许应用 logs 目录内的 .log 文件。</small></label>
           <label class="field"><span>代理刷新脚本</span><input type="text" name="proxy_refresh_script" value="{{ app_settings.proxy_refresh_script }}"></label>
           <label class="field"><span>登录桌面 API</span><input type="text" name="login_desktop_api_url" value="{{ app_settings.login_desktop_api_url }}"></label>
           <label class="field">
@@ -158,6 +163,7 @@
         </div>
         <fieldset>
           <legend>修改管理员密码（留空表示不修改）</legend>
+          <label class="field"><span>当前密码</span><input type="password" name="current_password" autocomplete="current-password"></label>
           <div class="form-grid">
             <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种"></label>
             <label class="field"><span>确认新密码</span><input type="password" name="confirm_password" autocomplete="new-password"></label>
@@ -239,6 +245,8 @@
     </section>
     {% endif %}
 
+    {% include 'passkeys.html' %}
+    {% if registration is defined %}{% include 'registration_settings.html' %}{% endif %}
     <section class="card settings-section" id="users">
       <div class="card-head">
         <div>
@@ -287,7 +295,7 @@
               <span class="account-avatar">{{ (web_user.username or "U")[:1] }}</span>
               <span class="account-name"><strong>{{ web_user.username }}</strong><small>{{ web_user.account_refs|length }} 个绑定账号</small></span>
             </span>
-            <span class="summary-metrics"><span class="pill {% if web_user.enabled %}success{% else %}warning{% endif %}">{% if web_user.enabled %}可登录{% else %}已停用{% endif %}</span></span>
+            <span class="summary-metrics"><span class="pill {% if web_user.enabled %}success{% else %}warning{% endif %}">{% if web_user.registration_pending %}待审核{% elif web_user.enabled %}可登录{% else %}已停用{% endif %}</span></span>
             <i class="fold-chevron" data-lucide="chevron-down"></i>
           </summary>
           <div class="fold-body">
@@ -310,6 +318,16 @@
               </fieldset>
               <div class="form-actions"><button class="button button-primary" type="submit"><i data-lucide="check"></i><span>保存用户</span></button></div>
             </form>
+            <form method="post" action="/admin/users/{{ web_user.username }}/revoke-sessions" data-confirm="撤销该用户的所有登录会话？用户可以用原密码重新登录。">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="button button-secondary button-sm" type="submit"><i data-lucide="log-out"></i><span>退出所有会话</span></button>
+            </form>
+            {% if passkeys_enabled %}
+            <form method="post" action="/admin/users/{{ web_user.username }}/revoke-passkeys" data-confirm="移除该用户的全部通行密钥并撤销会话？用户仍可用密码登录。">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="button button-danger button-sm" type="submit">移除全部通行密钥</button>
+            </form>
+            {% endif %}
             <form method="post" action="/admin/users/{{ web_user.username }}/delete" data-confirm-title="删除 Web 用户" data-confirm="只删除 Web 用户并解除账号绑定，不删除抖音账号数据。确认继续吗？" data-confirm-accept="确认删除">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button class="button button-danger button-sm" type="submit"><i data-lucide="trash-2"></i><span>删除用户</span></button>
@@ -322,6 +340,7 @@
   </div>
 </div>
 {% else %}
+{% include 'passkeys.html' %}
 <section class="card settings-section" id="password" style="max-width: 560px">
   <div class="card-head">
     <div>
@@ -330,6 +349,7 @@
     </div>
   </div>
   <form method="post" action="/account/password" class="form-stack">
+    <label class="field"><span>当前密码</span><input type="password" name="current_password" autocomplete="current-password" required></label>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="field"><span>新密码</span><input type="password" name="new_password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种" required></label>
     <label class="field"><span>确认新密码</span><input type="password" name="confirm_password" autocomplete="new-password" required></label>

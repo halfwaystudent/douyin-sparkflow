@@ -76,8 +76,12 @@ class DeploymentContractTests(unittest.TestCase):
         scheduler = text.split("  scheduler:", 1)[1].split("\n  task:", 1)[0]
         task = text.split("  task:", 1)[1]
 
-        self.assertIn("/var/run/docker.sock:/var/run/docker.sock", web)
-        self.assertIn(".:/opt/douyin-sparkflow", web)
+        self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", web)
+        self.assertNotIn(".:/opt/douyin-sparkflow", web)
+        self.assertIn("${WEB_BIND_ADDRESS:-127.0.0.1}", web)
+        for service in (web, scheduler, task):
+            self.assertIn("no-new-privileges:true", service)
+            self.assertIn("cap_drop: [ALL]", service)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", scheduler)
         self.assertNotIn(".:/opt/douyin-sparkflow", scheduler)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", task)
@@ -189,8 +193,16 @@ class DeploymentContractTests(unittest.TestCase):
 
     def test_docker_build_context_excludes_runtime_data(self):
         dockerignore = (SOURCE_ROOT / ".dockerignore").read_text(encoding="utf-8")
-        for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json"):
+        for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json", "webui_users.json", "webui_passkeys.json", ".data-backups/", "*.key"):
             self.assertIn(entry, dockerignore)
+
+    def test_login_desktop_has_no_platform_database_or_storage_key_mount(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        desktop = compose.split("  login-desktop:", 1)[1].split("  scheduler:", 1)[0]
+        self.assertNotIn("./DouYinSparkFlow:/app", desktop)
+        self.assertNotIn("./DouYinSparkFlow/logs:/app/logs", desktop)
+        self.assertNotIn("/run/storage-key", desktop)
+        self.assertNotIn("SPARKFLOW_STORAGE_KEY_FILE", desktop)
 
     def test_login_desktop_uses_direct_first_network_route(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -230,6 +242,15 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn('reduced_motion="reduce"', server)
         self.assertIn('"/creator-micro/" in page.url', server)
         self.assertIn('"qr_ready": qr_ready', server)
+
+    def test_login_desktop_novnc_metadata_is_repaired_before_websockify(self):
+        start_script = (SOURCE_ROOT / "scripts" / "start_login_desktop.sh").read_text(encoding="utf-8")
+        command = "python /app/scripts/ensure_novnc_metadata.py --web-root /usr/share/novnc"
+        websockify = 'run_forever novnc websockify --web=/usr/share/novnc'
+
+        self.assertIn(command, start_script)
+        self.assertIn(f"if ! {command}; then", start_script)
+        self.assertLess(start_script.index(command), start_script.index(websockify))
 
     def test_login_desktop_uses_fastapi_lifespan(self):
         server = (SOURCE_ROOT / "login_desktop_server.py").read_text(encoding="utf-8")

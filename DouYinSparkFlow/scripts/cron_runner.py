@@ -123,12 +123,19 @@ def read_crontab(path):
 
 
 def run_loop(crontab_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from core.personal_dispatcher import PersonalDispatcher
+    personal = PersonalDispatcher()
     crontab_path.parent.mkdir(parents=True, exist_ok=True)
     if migrate_legacy_crontab(crontab_path):
         print(f"[cron_runner] migrated legacy task commands in {crontab_path}", flush=True)
     last_minute_key = None
     print(f"[cron_runner] watching {crontab_path}", flush=True)
     while True:
+        try:
+            personal.tick()
+        except Exception as exc:
+            print(f"[cron_runner] personal dispatch unavailable: {type(exc).__name__}", flush=True)
         now = datetime.now()
         minute_key = now.strftime("%Y-%m-%d %H:%M")
         if minute_key != last_minute_key:

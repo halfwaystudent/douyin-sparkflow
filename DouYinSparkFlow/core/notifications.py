@@ -31,7 +31,14 @@ RUN_FAILED_CATEGORY = "run_failed"
 UNFINISHED_CATEGORY = "unfinished"
 SKIPPED_STATUSES = {"skipped_task_in_progress", "skipped_no_enabled_accounts"}
 
+BROWSER_BATCH_FAILURES = {"browser_dialog_blocked", "browser_stage_timeout", "browser_cleanup_blocked", "browser_cleanup_timeout", "browser_account_timeout"}
+
 CATEGORY_LABELS = {
+    "browser_dialog_blocked": "页面弹窗需人工检查，已停止自动操作",
+    "browser_stage_timeout": "页面检查或加载超时",
+    "browser_cleanup_blocked": "浏览器清理未完成，已暂停自动操作",
+    "browser_cleanup_timeout": "浏览器清理未完成，已暂停自动操作",
+    "browser_account_timeout": "本轮浏览器任务超时",
     "login_required": "需要重新登录",
     "protocol_login_required": "需要重新登录",
     "browser_login_required": "需要重新登录",
@@ -138,6 +145,12 @@ def _target_rows(users, now, today, tz, *, final):
         account_key = _account_key(account)
         name = _account_name(account)
         preflight = _preflight_category(account, today, tz)
+        batch = dict(account.get("browser_cleanup_blocked") or account.get("account_failure") or {})
+        batch_today = (
+            batch.get("category") in BROWSER_BATCH_FAILURES
+            and (bool(account.get("browser_cleanup_blocked"))
+                 or _as_local_date(batch.get("lastAttemptAt"), tz) == today)
+        )
         for target in account.get("targets") or []:
             target_name = streak_state.normalize_target_name(target)
             if not target_name:
@@ -154,6 +167,11 @@ def _target_rows(users, now, today, tz, *, final):
             source = "target" if category else ""
             if not category and preflight:
                 category, source = preflight, "preflight"
+            if not category and batch_today and any(
+                streak_state.target_keys_match(account, target_name, t)
+                for t in batch.get("affectedTargets") or []
+            ):
+                category, source = batch["category"], "account"
             if not category and final:
                 category, source = UNFINISHED_CATEGORY, "target"
             rows.append(
@@ -166,6 +184,15 @@ def _target_rows(users, now, today, tz, *, final):
 def _failure_entries(users, rows, today, tz):
     entries = []
     for account in users:
+        batch_rows = [r for r in rows if r["account_key"] == _account_key(account)
+                      and r["source"] == "account" and not r["confirmed"]]
+        if batch_rows:
+            category = batch_rows[0]["category"]
+            entries.append({
+                "key": f"{today.isoformat()}|{_account_key(account)}|-|{category}",
+                "account": _account_name(account), "target": "", "category": category,
+                "batch_count": len(batch_rows),
+            })
         preflight = _preflight_category(account, today, tz)
         if preflight:
             entries.append(
@@ -194,6 +221,8 @@ def _failure_line(entry):
     if entry["category"] == RUN_FAILED_CATEGORY:
         return "- 整次运行异常退出，请查看运行日志"
     label = category_label(entry["category"])
+    if entry.get("batch_count"):
+        return f"- 账号「{entry['account']}」：本轮{label}，{entry['batch_count']}个目标未完成（不是各自一次发送失败）"
     if entry["target"]:
         return f"- 账号「{entry['account']}」 目标「{entry['target']}」：{label}"
     return f"- 账号「{entry['account']}」：预检失败，{label}"
