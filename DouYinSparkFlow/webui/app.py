@@ -2209,7 +2209,7 @@ def create_app():
             if not live or not can_access_account(live, account):
                 raise LoginSavePermissionDenied("账号权限已变化，请刷新页面后重试。")
             revision = account_edit_revision(account)
-            missing_revision = shared and not submitted_revision
+            missing_revision = not submitted_revision
             changed_revision = submitted_revision and (not submitted_revision.isascii() or not hmac.compare_digest(submitted_revision, revision))
             if missing_revision or changed_revision:
                 raise AccountEditConflict(account)

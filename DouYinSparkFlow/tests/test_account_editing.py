@@ -1,9 +1,12 @@
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
+import os
 import unittest
+from unittest.mock import patch
 
 from tests import test_shared_security as fixtures
 from utils import config
+from webui import app as app_module
 from webui.account_editing import account_edit_revision
 
 
@@ -47,6 +50,11 @@ class AccountEditingTests(unittest.TestCase):
         before = self.account()
         self.assertEqual(409, self.save().status_code)
         self.assertEqual(403, self.save(revision=account_edit_revision(before), csrf_token="wrong").status_code)
+        self.assertEqual(before, self.account())
+
+    def test_shared_mode_rejects_an_empty_revision(self):
+        before = self.account()
+        self.assertEqual(409, self.save(revision="").status_code)
         self.assertEqual(before, self.account())
 
     def test_cache_health_and_login_updates_do_not_make_edits_conflict(self):
@@ -129,3 +137,26 @@ class AccountEditingTests(unittest.TestCase):
         self.assertEqual(303, response.status_code)
         self.assertEqual(["群聊：暂时不在缓存中的群"], self.account()["targets"])
         self.assertEqual({"群聊：暂时不在缓存中的群": "1234567890123"}, self.account()["group_target_bindings"])
+
+
+class PrivateAccountEditingTests(AccountEditingTests):
+    def setUp(self):
+        super().setUp()
+        with patch.dict(os.environ, {"SPARKFLOW_SHARED_MODE": "0"}):
+            self.fixture.application = app_module.create_app()
+        self.client = self.fixture.login()
+        self.csrf = self.fixture.token(self.client)
+
+    def test_private_mode_requires_revision_for_ajax(self):
+        before = self.account()
+        response = self.save(targets="私有模式旧页面草稿")
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("edit_conflict", response.json()["category"])
+        self.assertEqual(before, self.account())
+
+    def test_private_mode_rejects_an_empty_revision(self):
+        before = self.account()
+        response = self.save(revision="", targets="私有模式空令牌草稿")
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("edit_conflict", response.json()["category"])
+        self.assertEqual(before, self.account())

@@ -32,8 +32,10 @@ class WebGroupBindingTests(unittest.TestCase):
         self.principal = {"username": "admin", "role": "admin", "account_refs": [], "session_id": "s"}
 
     def _save(self, group_bind=(), group_targets=(), targets=("Friend",)):
+        from webui.account_editing import account_edit_revision
         data = {
             "csrf_token": "t",
+            "edit_revision": account_edit_revision(stored_accounts(self.path)[0]),
             "username": "Tester",
             "enabled": "on",
             "targets": list(targets),
@@ -85,8 +87,10 @@ class WebGroupBindingTests(unittest.TestCase):
         self.assertEqual(1, saved["targets"].count("群聊：普通群"))
         self.assertIn("群聊：手动群", saved["targets"])
 
-    def test_unknown_cached_id_is_ignored_and_manual_legacy_name_is_saved(self):
-        self._save(["not-cached"], ["群聊:历史手动群"])
+    def test_unknown_cached_id_conflicts_without_changing_saved_settings(self):
+        before = stored_accounts(self.path)[0]
+        response = self._save(["not-cached"], ["群聊:历史手动群"])
         saved = stored_accounts(self.path)[0]
-        self.assertEqual({}, saved["group_target_bindings"])
-        self.assertIn("群聊：历史手动群", saved["targets"])
+        self.assertEqual(409, response.status_code)
+        self.assertIn("群列表已变化", response.text)
+        self.assertEqual(before, saved)

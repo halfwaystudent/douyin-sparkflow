@@ -820,8 +820,10 @@ class WebSelectionBindingTests(unittest.TestCase):
         }
 
     def _save(self, targets, group_targets=None):
+        from webui.account_editing import account_edit_revision
         data = {
             "csrf_token": "t",
+            "edit_revision": account_edit_revision(stored_accounts(self.path)[0]),
             "username": "Tester",
             "targets": targets,
             "enabled": "on",
