@@ -327,6 +327,38 @@
     });
   };
 
+  const updateTodaySummary = (summary) => {
+    const confirmed = Number(summary.confirmed) || 0;
+    const pageEcho = Number(summary.pageEcho) || 0;
+    const receiptOnly = Number(summary.receiptOnly) || 0;
+    const unconfirmed = Number(summary.unconfirmed) || 0;
+    const failed = Number(summary.failed) || 0;
+    const blocked = Number(summary.blocked) || 0;
+    const attention = Number(summary.attention) || 0;
+    const pending = (Number(summary.pending) || 0) + (Number(summary.unprocessed) || 0);
+    const total = Number(summary.total) || 0;
+    const enabledAccounts = Number(summary.enabledAccounts) || 0;
+    const needsReview = attention > 0 || pageEcho > 0 || receiptOnly > 0;
+    const state = needsReview ? "attention" : "good";
+    const iconName = needsReview ? "triangle-alert" : "circle-check";
+    const text = `今日结论：强确认 ${confirmed} · 弱证据（仅页面回显 ${pageEcho} · 仅回执未确认 ${receiptOnly}） · 待核验 ${unconfirmed} · 失败 ${failed} · 受账号阻断 ${blocked} · 待发送 ${pending}（共 ${total} 个目标，${enabledAccounts} 个启用账号）`;
+
+    document.querySelectorAll("[data-today-summary]").forEach((node) => {
+      node.dataset.summaryState = state;
+      node.classList.toggle("good", state === "good");
+      const textNode = node.querySelector("[data-today-summary-text]");
+      if (textNode) textNode.textContent = text;
+      const icon = node.querySelector("[data-today-summary-icon]");
+      if (icon && icon.getAttribute("data-lucide") !== iconName) {
+        const glyph = document.createElement("i");
+        glyph.dataset.todaySummaryIcon = "";
+        glyph.dataset.lucide = iconName;
+        icon.replaceWith(glyph);
+      }
+    });
+    if (window.lucide) window.lucide.createIcons({ attrs: { "aria-hidden": "true" } });
+  };
+
   const updateAccounts = (accounts) => {
     accounts.forEach((account) => {
       const selector = `[data-account-overview="${CSS.escape(account.uniqueId)}"]`;
@@ -394,11 +426,12 @@
     const summary = data.summary || {};
     const task = data.task || {};
     updateTaskBanner(task);
+    updateTodaySummary(summary);
     setText("[data-overview-value='total']", summary.total || 0);
     setText("[data-overview-value='confirmed']", summary.confirmed || 0);
     setText(
       "[data-overview-value='sentTotal']",
-      (summary.confirmed || 0) + (summary.pageEcho || 0),
+      (summary.confirmed || 0) + (summary.pageEcho || 0) + (summary.receiptOnly || 0),
     );
     setText("[data-overview-value='pageEcho']", summary.pageEcho || 0);
     setText("[data-overview-value='receiptOnly']", summary.receiptOnly || 0);
@@ -431,10 +464,12 @@
     const remaining = Math.max(0, totalCount - strongCount - weakCount);
     document.querySelectorAll("[data-overview-headline]").forEach((node) => {
       node.textContent = !totalCount
-        ? "还没有要续的火花"
+        ? "还没有发送目标"
         : remaining
-          ? `今天还差 ${remaining} 个火花`
-          : "今天的火花都续上了";
+          ? `今天还有 ${remaining} 个目标未确认发送`
+          : weakCount
+            ? "今日发送记录待核验"
+            : "今日目标均已确认发送";
     });
     const attentionCount = summary.attention || 0;
     document.querySelectorAll("[data-attention-callout]").forEach((node) => {
@@ -553,7 +588,7 @@
   let pageActive = true, lifecycleVersion = 0, resumeChecking = false;
   let statusController = null, statusAgain = false, statusFailures = 0;
   let qrController = null, qrRequestPending = false, qrManualPending = false, qrVersion = 0;
-  let lastHeartbeatAt = 0, browserLoginLabel = "";
+  let lastHeartbeatAt = 0, browserLoginLabel = "", desktopState = {};
   const transientRequests = new Set();
   const canUseWorkspace = () => pageActive && !resumeChecking && !bindingBusy && !bindingNeedsReview && document.visibilityState === "visible";
   const publishWorkspace = () => {
@@ -606,10 +641,10 @@
       button.disabled = bindingBusy || bindingNeedsReview;
     });
   };
-  const showBindingResult = (account, message, { pending = false, uncertain = false } = {}) => {
+  const showBindingResult = (account, message, { pending = false, uncertain = false, failed = false } = {}) => {
     if (!bindingResult) return;
     bindingResult.hidden = false;
-    bindingResult.querySelector("[data-binding-result-title]").textContent = uncertain ? "保存结果待核对" : pending ? "账号已保存，登录待确认" : "账号已保存";
+    bindingResult.querySelector("[data-binding-result-title]").textContent = uncertain ? "保存结果待核对" : failed ? "账号已保存，核验未通过" : pending ? "账号已保存，登录待确认" : "账号已保存";
     bindingResult.querySelector("[data-binding-result-message]").textContent = message;
     const next = bindingResult.querySelector("[data-binding-next]");
     next.hidden = false;
@@ -658,7 +693,7 @@
           : state === "login_required" || state === "identity_conflict" || current.identity_state === "conflict"
             ? `账号需要重新登录。${reason}`
             : `账号身份已保存，暂时未能确认登录状态。${reason} 可以先配置目标和消息，并在账号页核对后续结果。`;
-        showBindingResult(current, message, { pending: state !== "verified" || current.identity_state !== "verified" });
+        showBindingResult(current, message, { pending: state !== "verified" || current.identity_state !== "verified", failed: state === "login_required" || state === "identity_conflict" || current.identity_state === "conflict" });
         return;
       } catch { /* Keep the saved result and its account link visible. */ }
       finally { window.clearTimeout(deadline); }
@@ -765,6 +800,22 @@
     return `${label ? `【${label}】` : ""}${error.message}${hint}${retry}`;
   };
 
+  const reusableAccountSession = () => desktopState.profile_mode === "account" && desktopState.reusable_session === true;
+  const updateDesktopState = (desktop) => {
+    if (!desktop || typeof desktop !== "object") return;
+    // Status replies are snapshots, not deltas. Merging let a prior ticket's
+    // logged_in:true survive a new ticket, a false/unknown result, or a rescan.
+    desktopState = { ...desktop };
+    if (desktopState.profile_mode === "account" && desktopState.reusable_session === true) {
+      document.querySelectorAll("[data-refresh-login-qr] span").forEach((label) => { label.textContent = "重新扫码"; });
+    }
+  };
+  const clearDesktopState = () => {
+    desktopState = {};
+    browserLoginLabel = "";
+  };
+  const reusableAccountHint = () => reusableAccountSession() ? "沿用账号浏览器环境，可保存登录态。" : "";
+
   const loadFrame = (force = false) => {
     if (displayMode === "native") return;
     if (frame && (force || frame.dataset.loaded !== "1") && frame.dataset.src) {
@@ -792,7 +843,7 @@
     frame.dataset.loaded = "0";
   };
 
-  const renderWorkspace = (next) => {
+  const renderWorkspace = (next, desktop = null) => {
     if (!pageActive) return;
     const previousState = workspace.state;
     const previousTicket = workspace.ticket;
@@ -801,9 +852,16 @@
     publishWorkspace();
     if (workspace.state !== previousState || workspace.ticket !== previousTicket) {
       cancelQr();
-      browserLoginLabel = "";
+      if (workspace.ticket !== previousTicket) {
+        qrStoppedTicket = "";
+        clearDesktopState();
+        setQrButtons("刷新二维码");
+      }
       scheduleStatus(workspace.state === "queued" || workspace.state === "resetting" ? 4000 : workspace.state === "active" ? 20000 : 30000);
     }
+    // Bind a fresh desktop snapshot only after retiring the previous ticket.
+    // Applying it before clearDesktopState erased the successful open response.
+    if (desktop) updateDesktopState(desktop);
     const progress = root.querySelector("[data-login-progress]");
     if (progress) progress.textContent = workspace.state === "queued" ? "第 1 步：排队等待，轮到你后自动显示二维码。"
       : workspace.state === "active" && workspace.active ? "第 2 步：扫码，按提示完成验证码或密码验证。"
@@ -838,7 +896,12 @@
         if (canUseWorkspace()) loadFrame(true);
         qrPollStartedAt = Date.now();
         setQrButtons("读取中…", { busy: true });
-        if (canUseWorkspace()) refreshLoginQr(100);
+        if (desktopState.logged_in) {
+          setQrButtons(reusableAccountSession() ? "重新扫码" : "刷新二维码");
+          if (qrStatus) qrStatus.textContent = `${reusableAccountHint()} 当前浏览器已登录，请核对并保存登录态。`;
+        } else if (canUseWorkspace()) {
+          refreshLoginQr(100);
+        }
       }
       if (displayMode === "native") {
         if (nativePanel) nativePanel.hidden = false;
@@ -857,7 +920,7 @@
         setStatus(
           promoted
             ? `已轮到你：登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`
-            : `登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`,
+            : `${reusableAccountHint()} 登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`,
           tone,
         );
       }
@@ -867,6 +930,7 @@
   };
 
   let qrPollStartedAt = 0;
+  let qrStoppedTicket = "";
   let lastPromotedTicket = "";
   // How long to keep waiting for a QR code after the workspace opened. Each
   // GET /qr already waits upstream for the code, so the page only re-asks
@@ -877,6 +941,7 @@
   let recoverAttempts = 0;
   let acquiringWorkspace = false;
   const setQrButtons = (label, { busy = false, stopped = false } = {}) => {
+    if (stopped) qrStoppedTicket = workspace.ticket;
     document.querySelectorAll("[data-refresh-login-qr]").forEach((button) => {
       const text = button.querySelector("span");
       if (text) text.textContent = label;
@@ -936,7 +1001,7 @@
   };
 
   const refreshLoginQr = async (delay = 0, retries = 40) => {
-    if (!qrImage || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview) return;
+    if (!qrImage || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview || (workspace.ticket && qrStoppedTicket === workspace.ticket)) return;
     window.clearTimeout(qrRefreshTimer);
     const heldTicket = workspace.ticket, heldVersion = qrVersion;
     const current = () => canUseWorkspace() && heldTicket === workspace.ticket && heldVersion === qrVersion;
@@ -974,8 +1039,16 @@
         }
         if (response.status === 202) {
           const data = await response.json().catch(() => ({}));
-          if (data.logged_in || data.state === "qr_logged_in") {
-            if (qrStatus) qrStatus.textContent = data.message || "检测到浏览器里还保留着登录状态，已重置，正在生成新的二维码...";
+          if (data.logged_in || data.state === "qr_logged_in" || data.state === "logged_in") {
+            updateDesktopState(data);
+            if (qrStatus) qrStatus.textContent = data.message || `${reusableAccountHint()} 当前浏览器已登录，请保存登录态。`;
+            setQrButtons(reusableAccountSession() ? "重新扫码" : "刷新二维码");
+            return;
+          }
+          if (data.retryable === false) {
+            if (qrStatus) qrStatus.textContent = data.message || data.error || "登录页未能生成二维码，已停止自动重试。";
+            setQrButtons("已停止，点此重试", { stopped: true });
+            return;
           }
           // GET /qr only reads the page, and a healthy login page produces its
           // code within a few seconds on its own. If none appears after a few
@@ -996,6 +1069,11 @@
         }
         if (response.status === 503) {
           const data = await response.json().catch(() => ({}));
+          if (data.retryable === false || data.recovery?.exhausted) {
+            if (qrStatus) qrStatus.textContent = data.message || data.recovery?.message || "登录页恢复失败，已停止自动重试。";
+            setQrButtons("已停止，点此重试", { stopped: true });
+            return;
+          }
           const retryAfter = Number(response.headers.get("Retry-After") || data.retry_after || 0);
           retryLater(
             data.message || "登录页正在处理上一个请求",
@@ -1112,11 +1190,11 @@
       }
       statusFailures = 0;
       resumeChecking = false;
-      renderWorkspace(data.workspace);
+      renderWorkspace(data.workspace, data.desktop || data);
       if (workspace.state === "active" && workspace.active) {
         if (Object.prototype.hasOwnProperty.call(data, "logged_in") && !data.logged_in) browserLoginLabel = "";
         loadFrame();
-        if (qrImage?.hidden && !qrRequestPending && !bindingNeedsReview) refreshLoginQr(100);
+        if (qrImage?.hidden && !qrRequestPending && !bindingNeedsReview && !desktopState.logged_in) refreshLoginQr(100);
         if (statusHeld()) {
           // An in-progress save or its error owns the status line.
         } else if (data.logged_in) {
@@ -1189,7 +1267,7 @@
         resetRecoveryBudget();
         const data = await postForm("/login-desktop/open", workspaceRequest());
         const promotedBefore = lastPromotedTicket;
-        renderWorkspace(data.workspace);
+        renderWorkspace(data.workspace, data.desktop);
         if (data.state === "queued") {
           stopOpening();
           return;
@@ -1242,7 +1320,13 @@
       return;
     }
     qrManualPending = true;
+    qrStoppedTicket = "";
     cancelQr();
+    clearDesktopState();
+    const progress = root.querySelector("[data-login-progress]");
+    if (progress) progress.textContent = "第 2 步：正在生成新的二维码，请扫码完成登录。";
+    setStatus("正在重新生成二维码，请扫码完成登录。", "warning");
+    setQrButtons("读取中…", { busy: true });
     const heldTicket = workspace.ticket, heldVersion = qrVersion;
     const controller = new AbortController();
     qrController = controller;
@@ -1474,7 +1558,7 @@
           if (data.state === "uncertain") throw saveUncertain(data.result?.error || data.message || "服务器暂时无法确认最终保存结果。");
           if (data.state !== "running") throw saveUncertain("保存任务返回了未知状态，请重新检查。");
           failures = 0;
-          showSaveProgress(operation, "服务器仍在处理，请保留当前页面。");
+          showSaveProgress(operation, data.message || "服务器仍在处理，请保留当前页面。");
         } catch (error) {
           if (!valid() || error.saveSuspended || error.bindingUncertain || error.payload) throw error;
           failures += 1;
@@ -1515,7 +1599,7 @@
         "danger",
       );
       closeFrame();
-      showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true });
+      showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true, failed: true });
       return;
     }
     // A login save starts a friend refresh; when it could not start, say why
@@ -1677,9 +1761,9 @@
   };
   const applyWorkspace = (data, { openFrame = false, pollQr = false } = {}) => {
     const previousTicket = workspace.ticket;
-    renderWorkspace(trackWorkspace(data.workspace));
+    renderWorkspace(trackWorkspace(data.workspace), data.desktop || null);
     if (openFrame && data.state !== "queued" && canUseWorkspace()) loadFrame();
-    if (pollQr && data.state !== "queued" && workspace.active && previousTicket === workspace.ticket && qrImage?.hidden) refreshLoginQr(100);
+    if (pollQr && !desktopState.logged_in && data.state !== "queued" && workspace.active && previousTicket === workspace.ticket && qrImage?.hidden) refreshLoginQr(100);
   };
   const acquireWorkspace = async () => {
     if (!pageActive || acquiringWorkspace || bindingBusy || bindingNeedsReview) return;
@@ -2050,8 +2134,35 @@
     const timeout = window.setTimeout(() => controller.abort(), 12000);
     const pending = (async () => {
       const response = await fetch(url, {credentials: "same-origin", cache: "no-store", signal: controller.signal});
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || "列表暂时无法加载，请重试。");
+      // Defer immediate HTTP errors by one task so both visible pickers share
+      // the same failed request before the retryable promise is discarded.
+      if (response.status !== 200 || response.redirected) {
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+      if (response.status === 401 || response.redirected) {
+        throw new Error("控制台登录状态已失效，请重新登录控制台后重试。当前选择已保留。");
+      }
+      if (response.status === 403) {
+        throw new Error("当前账号的访问权限已变化，请重新打开账号页核对。当前选择已保留。");
+      }
+      if (response.status >= 500) {
+        throw new Error("服务暂时不可用，请稍后重试。当前选择已保留。");
+      }
+      if (response.status !== 200) {
+        throw new Error("列表暂时无法加载，请稍后重试。当前选择已保留。");
+      }
+      if (!response.headers.get("content-type")?.toLowerCase().includes("application/json")) {
+        throw new Error("列表响应不是有效的 JSON，当前选择已保留。");
+      }
+      let result;
+      try {
+        result = await response.json();
+      } catch {
+        throw new Error("列表响应不是有效的 JSON，当前选择已保留。");
+      }
+      if (!result || Array.isArray(result) || typeof result !== "object") {
+        throw new Error("列表响应不是有效的 JSON，当前选择已保留。");
+      }
       return result;
     })().catch((error) => {
       if (cacheReads.get(url) === pending) cacheReads.delete(url);
@@ -2423,9 +2534,26 @@
         body,
         credentials: "same-origin",
       });
-      render(await response.json().catch(() => ({})));
-    } catch (error) {
-      result.textContent = `预览失败：${error.message}`;
+      if (response.status === 401 || response.redirected) {
+        result.textContent = "控制台登录已失效，请重新登录后预览；配置尚未保存。";
+      } else if (response.status === 403) {
+        result.textContent = "页面已过期或没有权限，请刷新页面后重试；配置尚未保存。";
+      } else if (response.status >= 500) {
+        result.textContent = "服务器暂时不可用，请稍后重试；配置尚未保存。";
+      } else if (!response.ok) {
+        result.textContent = "预览失败：请求未被接受，请刷新页面后重试；配置尚未保存。";
+      } else if (!response.headers.get("content-type")?.toLowerCase().includes("application/json")) {
+        result.textContent = "预览失败：服务器返回了无法识别的内容；配置尚未保存。";
+      } else {
+        const data = await response.json().catch(() => null);
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          result.textContent = "预览失败：服务器返回的数据无法解析；配置尚未保存。";
+        } else {
+          render(data);
+        }
+      }
+    } catch {
+      result.textContent = "预览失败：无法连接服务器，请检查网络后重试；配置尚未保存。";
     } finally {
       button.disabled = false;
     }

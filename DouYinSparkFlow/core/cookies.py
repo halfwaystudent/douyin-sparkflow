@@ -94,7 +94,22 @@ def normalize_cookie(entry):
             cookie[flag] = bool(entry.get(flag))
     same_site = entry.get("sameSite")
     if isinstance(same_site, str) and same_site.strip():
-        cookie["sameSite"] = same_site.strip().capitalize()
+        # Extension exports use unspecified when no SameSite attribute exists.
+        # Omitting it preserves browser defaults; this is not SameSite=None.
+        if same_site.strip().casefold() == "unspecified":
+            return cookie
+        normalized_same_site = {
+            "lax": "Lax",
+            "strict": "Strict",
+            "none": "None",
+            "no_restriction": "None",
+        }.get(same_site.strip().casefold())
+        if normalized_same_site is None:
+            raise CookieParseError(
+                f"cookie {name!r} has an unsupported sameSite value",
+                category="cookie_format_invalid",
+            )
+        cookie["sameSite"] = normalized_same_site
     return cookie
 
 

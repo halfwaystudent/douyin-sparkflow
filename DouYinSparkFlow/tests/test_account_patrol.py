@@ -4,7 +4,6 @@ No real browser runs here: the page, context, lock and notification channel are
 fakes, and the account store is a temporary file.
 """
 import asyncio
-from html import unescape
 import json
 import os
 import tempfile
@@ -13,7 +12,6 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -1054,12 +1052,14 @@ class PatrolWebTests(unittest.TestCase):
 
         self.assertIn("账号巡查", page)
         self.assertIn("立即巡查", page)
-        patrol_url = unescape(page.split('data-patrol-url="', 1)[1].split('"', 1)[0])
-        parsed_patrol_url = urlparse(patrol_url)
-        self.assertEqual(f"/accounts/{ACCOUNT_ID}/patrol", parsed_patrol_url.path)
-        patrol_query = parse_qs(parsed_patrol_url.query, keep_blank_values=True)
-        self.assertEqual(["acc-1"], patrol_query["ref"])
-        self.assertIn("generation", patrol_query)
+        self.assertIn(
+            f'data-patrol-url="/accounts/{ACCOUNT_ID}/patrol?ref=acc-1&amp;generation="',
+            page,
+        )
+        self.assertIn(
+            f'data-patrol-status-url="/accounts/{ACCOUNT_ID}/patrol/status?ref=acc-1&amp;generation="',
+            page,
+        )
         self.assertIn("发现问题", page)
         self.assertIn("抹茶叔叔 → 抹茶", page)
         self.assertIn('data-patrol-target="missing"', page)

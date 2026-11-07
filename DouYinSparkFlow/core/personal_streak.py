@@ -217,7 +217,7 @@ def account_groups(config, accounts, *, manual=False, profile_key="", revision="
         key = owners.get(ref, "admin")
         person, profile = people.get(key), profiles.get(key)
         legacy = (
-            key != "admin" and profile is None
+            profile is None
             and bool(account.get("enabled", True))
             and ref in legacy_refs.get(key, set())
         )

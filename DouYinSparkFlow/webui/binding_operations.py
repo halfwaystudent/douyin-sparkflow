@@ -19,6 +19,13 @@ ACCOUNT_FIELDS = ("account_ref", "login_generation", "unique_id", "username", "p
 CANDIDATE_FIELDS = ("account_ref", "username", "unique_id")
 CONFIRMATION_FIELDS = ("token", "account_ref", "username", "history_id", "history_id_type", "platform_uid", "display_id", "expires_in")
 WORKSPACE_FIELDS = ("state", "position", "ticket", "remaining_seconds", "queue_length", "active", "active_username")
+SAVE_STAGES = {
+    "accepted": "保存请求已接收，尚未保存账号，请不要重复提交。",
+    "exporting": "正在读取当前登录信息；尚未写入账号记录。",
+    "checking_identity": "正在核对抖音账号身份；尚未写入账号记录。",
+    "saving": "正在写入账号记录，请不要重复提交。",
+    "saved": "账号已保存，正在等待后台登录核验。",
+}
 
 
 def _fields(source, allowed):
@@ -49,6 +56,7 @@ class BindingOperation:
         self.ticket = ticket
         self.created = time.monotonic()
         self.state = "running"
+        self.stage = "accepted"
         self.result = None
         self.http_status = 202
         self.write_started = False
@@ -59,10 +67,19 @@ class BindingOperation:
     def begin_write(self):
         with self.lock:
             self.write_started = True
+            self.stage = "saving"
+
+    def set_stage(self, stage):
+        if stage not in SAVE_STAGES:
+            raise ValueError("Unknown save stage")
+        with self.lock:
+            if self.state == "running" and self.saved_result is None:
+                self.stage = stage
 
     def record_saved(self, account, action):
         # Keep only the same small projection already returned to the owner.
         with self.lock:
+            self.stage = "saved"
             self.saved_result = {
                 "ok": True, "action": action, "verification": "pending",
                 "account": _fields(account, ("account_ref", "login_generation", "unique_id", "username")),
@@ -80,6 +97,7 @@ class BindingOperation:
     def payload(self):
         with self.lock:
             return {"ok": True, "operation_id": self.operation_id, "ticket": self.ticket, "state": self.state,
+                    "stage": self.stage, "message": SAVE_STAGES[self.stage],
                     "status_url": "/login-desktop/save/status?operation_id=" + self.operation_id,
                     "result": self.result, "http_status": self.http_status}
 

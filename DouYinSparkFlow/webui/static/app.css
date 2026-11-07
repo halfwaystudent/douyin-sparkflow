@@ -90,6 +90,19 @@ small { font-size: 12px; }
 [hidden] { display: none !important; }
 .num, .tabular { font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
 .muted { color: var(--ink-3); }
+/* Keep labels in the accessibility tree without reserving a visible line. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
 .compact { font-size: 13px; }
 svg.lucide { width: 18px; height: 18px; stroke-width: 1.9; flex: none; }
 i[data-lucide] { display: inline-block; width: 18px; height: 18px; flex: none; }

@@ -27,7 +27,7 @@
   let pageActive = true, lifecycleVersion = 0, resumeChecking = false;
   let statusController = null, statusAgain = false, statusFailures = 0;
   let qrController = null, qrRequestPending = false, qrManualPending = false, qrVersion = 0;
-  let lastHeartbeatAt = 0, browserLoginLabel = "";
+  let lastHeartbeatAt = 0, browserLoginLabel = "", desktopState = {};
   const transientRequests = new Set();
   const canUseWorkspace = () => pageActive && !resumeChecking && !bindingBusy && !bindingNeedsReview && document.visibilityState === "visible";
   const publishWorkspace = () => {
@@ -80,10 +80,10 @@
       button.disabled = bindingBusy || bindingNeedsReview;
     });
   };
-  const showBindingResult = (account, message, { pending = false, uncertain = false } = {}) => {
+  const showBindingResult = (account, message, { pending = false, uncertain = false, failed = false } = {}) => {
     if (!bindingResult) return;
     bindingResult.hidden = false;
-    bindingResult.querySelector("[data-binding-result-title]").textContent = uncertain ? "保存结果待核对" : pending ? "账号已保存，登录待确认" : "账号已保存";
+    bindingResult.querySelector("[data-binding-result-title]").textContent = uncertain ? "保存结果待核对" : failed ? "账号已保存，核验未通过" : pending ? "账号已保存，登录待确认" : "账号已保存";
     bindingResult.querySelector("[data-binding-result-message]").textContent = message;
     const next = bindingResult.querySelector("[data-binding-next]");
     next.hidden = false;
@@ -132,7 +132,7 @@
           : state === "login_required" || state === "identity_conflict" || current.identity_state === "conflict"
             ? `账号需要重新登录。${reason}`
             : `账号身份已保存，暂时未能确认登录状态。${reason} 可以先配置目标和消息，并在账号页核对后续结果。`;
-        showBindingResult(current, message, { pending: state !== "verified" || current.identity_state !== "verified" });
+        showBindingResult(current, message, { pending: state !== "verified" || current.identity_state !== "verified", failed: state === "login_required" || state === "identity_conflict" || current.identity_state === "conflict" });
         return;
       } catch { /* Keep the saved result and its account link visible. */ }
       finally { window.clearTimeout(deadline); }
@@ -239,6 +239,22 @@
     return `${label ? `【${label}】` : ""}${error.message}${hint}${retry}`;
   };
 
+  const reusableAccountSession = () => desktopState.profile_mode === "account" && desktopState.reusable_session === true;
+  const updateDesktopState = (desktop) => {
+    if (!desktop || typeof desktop !== "object") return;
+    // Status replies are snapshots, not deltas. Merging let a prior ticket's
+    // logged_in:true survive a new ticket, a false/unknown result, or a rescan.
+    desktopState = { ...desktop };
+    if (desktopState.profile_mode === "account" && desktopState.reusable_session === true) {
+      document.querySelectorAll("[data-refresh-login-qr] span").forEach((label) => { label.textContent = "重新扫码"; });
+    }
+  };
+  const clearDesktopState = () => {
+    desktopState = {};
+    browserLoginLabel = "";
+  };
+  const reusableAccountHint = () => reusableAccountSession() ? "沿用账号浏览器环境，可保存登录态。" : "";
+
   const loadFrame = (force = false) => {
     if (displayMode === "native") return;
     if (frame && (force || frame.dataset.loaded !== "1") && frame.dataset.src) {
@@ -266,7 +282,7 @@
     frame.dataset.loaded = "0";
   };
 
-  const renderWorkspace = (next) => {
+  const renderWorkspace = (next, desktop = null) => {
     if (!pageActive) return;
     const previousState = workspace.state;
     const previousTicket = workspace.ticket;
@@ -275,9 +291,16 @@
     publishWorkspace();
     if (workspace.state !== previousState || workspace.ticket !== previousTicket) {
       cancelQr();
-      browserLoginLabel = "";
+      if (workspace.ticket !== previousTicket) {
+        qrStoppedTicket = "";
+        clearDesktopState();
+        setQrButtons("刷新二维码");
+      }
       scheduleStatus(workspace.state === "queued" || workspace.state === "resetting" ? 4000 : workspace.state === "active" ? 20000 : 30000);
     }
+    // Bind a fresh desktop snapshot only after retiring the previous ticket.
+    // Applying it before clearDesktopState erased the successful open response.
+    if (desktop) updateDesktopState(desktop);
     const progress = root.querySelector("[data-login-progress]");
     if (progress) progress.textContent = workspace.state === "queued" ? "第 1 步：排队等待，轮到你后自动显示二维码。"
       : workspace.state === "active" && workspace.active ? "第 2 步：扫码，按提示完成验证码或密码验证。"
@@ -312,7 +335,12 @@
         if (canUseWorkspace()) loadFrame(true);
         qrPollStartedAt = Date.now();
         setQrButtons("读取中…", { busy: true });
-        if (canUseWorkspace()) refreshLoginQr(100);
+        if (desktopState.logged_in) {
+          setQrButtons(reusableAccountSession() ? "重新扫码" : "刷新二维码");
+          if (qrStatus) qrStatus.textContent = `${reusableAccountHint()} 当前浏览器已登录，请核对并保存登录态。`;
+        } else if (canUseWorkspace()) {
+          refreshLoginQr(100);
+        }
       }
       if (displayMode === "native") {
         if (nativePanel) nativePanel.hidden = false;
@@ -331,7 +359,7 @@
         setStatus(
           promoted
             ? `已轮到你：登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`
-            : `登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`,
+            : `${reusableAccountHint()} 登录工作区已分配给当前会话，剩余 ${remaining} 秒。完成扫码后请保存登录态。`,
           tone,
         );
       }
@@ -341,6 +369,7 @@
   };
 
   let qrPollStartedAt = 0;
+  let qrStoppedTicket = "";
   let lastPromotedTicket = "";
   // How long to keep waiting for a QR code after the workspace opened. Each
   // GET /qr already waits upstream for the code, so the page only re-asks
@@ -351,6 +380,7 @@
   let recoverAttempts = 0;
   let acquiringWorkspace = false;
   const setQrButtons = (label, { busy = false, stopped = false } = {}) => {
+    if (stopped) qrStoppedTicket = workspace.ticket;
     document.querySelectorAll("[data-refresh-login-qr]").forEach((button) => {
       const text = button.querySelector("span");
       if (text) text.textContent = label;
@@ -410,7 +440,7 @@
   };
 
   const refreshLoginQr = async (delay = 0, retries = 40) => {
-    if (!qrImage || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview) return;
+    if (!qrImage || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview || (workspace.ticket && qrStoppedTicket === workspace.ticket)) return;
     window.clearTimeout(qrRefreshTimer);
     const heldTicket = workspace.ticket, heldVersion = qrVersion;
     const current = () => canUseWorkspace() && heldTicket === workspace.ticket && heldVersion === qrVersion;
@@ -448,8 +478,16 @@
         }
         if (response.status === 202) {
           const data = await response.json().catch(() => ({}));
-          if (data.logged_in || data.state === "qr_logged_in") {
-            if (qrStatus) qrStatus.textContent = data.message || "检测到浏览器里还保留着登录状态，已重置，正在生成新的二维码...";
+          if (data.logged_in || data.state === "qr_logged_in" || data.state === "logged_in") {
+            updateDesktopState(data);
+            if (qrStatus) qrStatus.textContent = data.message || `${reusableAccountHint()} 当前浏览器已登录，请保存登录态。`;
+            setQrButtons(reusableAccountSession() ? "重新扫码" : "刷新二维码");
+            return;
+          }
+          if (data.retryable === false) {
+            if (qrStatus) qrStatus.textContent = data.message || data.error || "登录页未能生成二维码，已停止自动重试。";
+            setQrButtons("已停止，点此重试", { stopped: true });
+            return;
           }
           // GET /qr only reads the page, and a healthy login page produces its
           // code within a few seconds on its own. If none appears after a few
@@ -470,6 +508,11 @@
         }
         if (response.status === 503) {
           const data = await response.json().catch(() => ({}));
+          if (data.retryable === false || data.recovery?.exhausted) {
+            if (qrStatus) qrStatus.textContent = data.message || data.recovery?.message || "登录页恢复失败，已停止自动重试。";
+            setQrButtons("已停止，点此重试", { stopped: true });
+            return;
+          }
           const retryAfter = Number(response.headers.get("Retry-After") || data.retry_after || 0);
           retryLater(
             data.message || "登录页正在处理上一个请求",
@@ -586,11 +629,11 @@
       }
       statusFailures = 0;
       resumeChecking = false;
-      renderWorkspace(data.workspace);
+      renderWorkspace(data.workspace, data.desktop || data);
       if (workspace.state === "active" && workspace.active) {
         if (Object.prototype.hasOwnProperty.call(data, "logged_in") && !data.logged_in) browserLoginLabel = "";
         loadFrame();
-        if (qrImage?.hidden && !qrRequestPending && !bindingNeedsReview) refreshLoginQr(100);
+        if (qrImage?.hidden && !qrRequestPending && !bindingNeedsReview && !desktopState.logged_in) refreshLoginQr(100);
         if (statusHeld()) {
           // An in-progress save or its error owns the status line.
         } else if (data.logged_in) {
@@ -663,7 +706,7 @@
         resetRecoveryBudget();
         const data = await postForm("/login-desktop/open", workspaceRequest());
         const promotedBefore = lastPromotedTicket;
-        renderWorkspace(data.workspace);
+        renderWorkspace(data.workspace, data.desktop);
         if (data.state === "queued") {
           stopOpening();
           return;
@@ -716,7 +759,13 @@
       return;
     }
     qrManualPending = true;
+    qrStoppedTicket = "";
     cancelQr();
+    clearDesktopState();
+    const progress = root.querySelector("[data-login-progress]");
+    if (progress) progress.textContent = "第 2 步：正在生成新的二维码，请扫码完成登录。";
+    setStatus("正在重新生成二维码，请扫码完成登录。", "warning");
+    setQrButtons("读取中…", { busy: true });
     const heldTicket = workspace.ticket, heldVersion = qrVersion;
     const controller = new AbortController();
     qrController = controller;
@@ -948,7 +997,7 @@
           if (data.state === "uncertain") throw saveUncertain(data.result?.error || data.message || "服务器暂时无法确认最终保存结果。");
           if (data.state !== "running") throw saveUncertain("保存任务返回了未知状态，请重新检查。");
           failures = 0;
-          showSaveProgress(operation, "服务器仍在处理，请保留当前页面。");
+          showSaveProgress(operation, data.message || "服务器仍在处理，请保留当前页面。");
         } catch (error) {
           if (!valid() || error.saveSuspended || error.bindingUncertain || error.payload) throw error;
           failures += 1;
@@ -989,7 +1038,7 @@
         "danger",
       );
       closeFrame();
-      showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true });
+      showBindingResult(data.account, data.verification_error || "账号已保存，但登录验证没有通过，请在账号页重新登录。", { pending: true, failed: true });
       return;
     }
     // A login save starts a friend refresh; when it could not start, say why
@@ -1151,9 +1200,9 @@
   };
   const applyWorkspace = (data, { openFrame = false, pollQr = false } = {}) => {
     const previousTicket = workspace.ticket;
-    renderWorkspace(trackWorkspace(data.workspace));
+    renderWorkspace(trackWorkspace(data.workspace), data.desktop || null);
     if (openFrame && data.state !== "queued" && canUseWorkspace()) loadFrame();
-    if (pollQr && data.state !== "queued" && workspace.active && previousTicket === workspace.ticket && qrImage?.hidden) refreshLoginQr(100);
+    if (pollQr && !desktopState.logged_in && data.state !== "queued" && workspace.active && previousTicket === workspace.ticket && qrImage?.hidden) refreshLoginQr(100);
   };
   const acquireWorkspace = async () => {
     if (!pageActive || acquiringWorkspace || bindingBusy || bindingNeedsReview) return;

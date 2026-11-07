@@ -120,7 +120,7 @@ async def fetch_account_groups(account):
             cookie_session = await _run_browser_stage(
                 'seed_cookies', prepare_profile_cookies(context, account, profile, profile_dir))
         else:
-            playwright, browser = await get_browser(GUI=False, network_mode=mode); context = await browser.new_context(); await context.add_cookies(cookies)
+            playwright, browser = await get_browser(GUI=False, network_mode=mode, profile_name=account_profile_name(account)); context = await browser.new_context(); await context.add_cookies(cookies)
         async def guard_write_routes(route):
             if refresh_request_allowed(route.request.method, route.request.url):
                 await route.continue_()

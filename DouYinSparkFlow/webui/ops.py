@@ -310,6 +310,36 @@ def build_unsent_fallback_task_command():
     )
 
 
+def _automatic_recovery_enabled(config=None):
+    config = get_config(force_reload=True) if config is None else config
+    return dict(config or {}).get("automaticRecovery", {}).get("enabled") is True
+
+
+def build_recovery_task_command():
+    return build_scheduled_task_command(
+        {"SPARKFLOW_RECOVERY_PASS": "1", "PYTHONUNBUFFERED": "1"},
+        trigger_label="recovery pass",
+    )
+
+
+def build_reconcile_task_command():
+    return build_scheduled_task_command(
+        {"SPARKFLOW_RECONCILE_ONLY": "1", "PYTHONUNBUFFERED": "1"},
+        trigger_label="end-of-window reconciliation",
+    )
+
+
+def build_recovery_close_task_command():
+    return build_scheduled_task_command(
+        {
+            "SPARKFLOW_RECONCILE_ONLY": "1",
+            "SPARKFLOW_RECOVERY_CLOSE": "1",
+            "PYTHONUNBUFFERED": "1",
+        },
+        trigger_label="recovery close reconciliation",
+    )
+
+
 def build_patrol_task_command():
     return build_scheduled_task_command(
         {
@@ -682,14 +712,19 @@ def douyin_schedule_lines(crontab_text=None):
 
 
 def schedule_line_kind(line):
-    """Classify a douyin task line as a windowed schedule or a single fixed run."""
-    if is_patrol_schedule_line(line):
+    """Classify a douyin task line by its scheduler role."""
+    text = str(line or "")
+    if is_patrol_schedule_line(text):
         return "patrol"
-    if "SPARKFLOW_FALLBACK_PHASE=1" in str(line or "") or "SPARKFLOW_8610_RETRY_ONLY=1" in str(line or ""):
+    if "SPARKFLOW_RECOVERY_PASS=1" in text:
+        return "recovery"
+    if "SPARKFLOW_RECONCILE_ONLY=1" in text:
+        return "reconcile"
+    if "SPARKFLOW_FALLBACK_PHASE=1" in text or "SPARKFLOW_8610_RETRY_ONLY=1" in text:
         # The end-of-window fallback runs at one fixed minute but only exists
         # as part of a window schedule.
         return "window"
-    fields = str(line or "").split()
+    fields = text.split()
     if len(fields) < 5:
         return "unknown"
     minute, hour = fields[0], fields[1]
@@ -708,11 +743,32 @@ def get_schedule_alignment(recent_triggers=None):
     """
     window = dict(get_config(force_reload=True).get("dailySendWindow") or {})
     enabled = bool(window.get("enabled"))
+    recovery_mode = enabled and _automatic_recovery_enabled()
     all_lines = douyin_schedule_lines()
     patrol_lines = [line for line in all_lines if is_patrol_schedule_line(line)]
     lines = [line for line in all_lines if not is_patrol_schedule_line(line)]
     kinds = sorted({schedule_line_kind(line) for line in lines})
-    if enabled:
+    if recovery_mode:
+        recovery_lines = [line for line in lines if schedule_line_kind(line) == "recovery"]
+        reconcile_lines = [line for line in lines if schedule_line_kind(line) == "reconcile"]
+        close_lines = [line for line in reconcile_lines if "SPARKFLOW_RECOVERY_CLOSE=1" in line]
+        end_reconcile_lines = [line for line in reconcile_lines if "SPARKFLOW_RECOVERY_CLOSE=1" not in line]
+        try:
+            expected_end_reconciles = 0 if int(window.get("endHour")) == 24 else 1
+        except (TypeError, ValueError):
+            expected_end_reconciles = 1
+        aligned = (
+            kinds == ["reconcile", "recovery"]
+            and len(recovery_lines) == 1
+            and len(close_lines) == 1
+            and len(end_reconcile_lines) == expected_end_reconciles
+        )
+        detail = (
+            "恢复队列轮询与结束本地对账一致"
+            if aligned
+            else "恢复模式已启用，但 spool 中缺少或混入了恢复轮询/本地对账任务行"
+        )
+    elif enabled:
         aligned = bool(lines) and kinds == ["window"]
         detail = (
             "配置与实际任务行一致"
@@ -727,7 +783,13 @@ def get_schedule_alignment(recent_triggers=None):
             detail = "按单次固定时间调度（该模式的时间保存在任务行内）"
         else:
             detail = "配置未启用发送窗口，但 spool 中仍存在窗口式任务行"
-    patrol = _patrol_alignment(enabled, window, lines, patrol_lines)
+    patrol = _patrol_alignment(
+        enabled,
+        window,
+        lines,
+        patrol_lines,
+        recovery_mode=recovery_mode,
+    )
     if not patrol["aligned"]:
         aligned = False
         detail = f"{detail}；{patrol['detail']}"
@@ -758,8 +820,10 @@ def get_schedule_alignment(recent_triggers=None):
     }
 
 
-def _expected_patrol_time(enabled, window, send_lines):
+def _expected_patrol_time(enabled, window, send_lines, *, recovery_mode=False):
     """Patrol (hour, minute) the live send lines call for, or None."""
+    if recovery_mode:
+        return 9, 30
     if enabled:
         try:
             return patrol_time_for_schedule(
@@ -778,8 +842,17 @@ def _expected_patrol_time(enabled, window, send_lines):
     )
 
 
-def _patrol_alignment(enabled, window, send_lines, patrol_lines):
-    expected = _expected_patrol_time(enabled, window, send_lines) if send_lines else None
+def _patrol_alignment(enabled, window, send_lines, patrol_lines, *, recovery_mode=False):
+    expected = (
+        _expected_patrol_time(
+            enabled,
+            window,
+            send_lines,
+            recovery_mode=recovery_mode,
+        )
+        if send_lines
+        else None
+    )
     expected_label = f"{expected[0]:02d}:{expected[1]:02d}" if expected else ""
     actual = []
     for line in patrol_lines:
@@ -805,6 +878,7 @@ def _patrol_alignment(enabled, window, send_lines, patrol_lines):
 
 def replace_douyin_cron_schedule(crontab_text, time_string):
     schedule = parse_schedule_string(time_string)
+    recovery_mode = schedule["mode"] == "window" and _automatic_recovery_enabled()
     scheduled_command = build_scheduled_task_command()
     fallback_command = build_unsent_fallback_task_command()
     updated = []
@@ -815,7 +889,24 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
             continue
         updated.append(line)
 
-    if schedule["mode"] == "window":
+    if recovery_mode:
+        recovery_command = build_recovery_task_command()
+        reconcile_command = build_reconcile_task_command()
+        recovery_close_command = build_recovery_close_task_command()
+        updated.append(
+            f"*/{WINDOW_INTERVAL_MINUTES} 10-23 * * * "
+            f"{recovery_command} >> {CRON_LOG_PATH} 2>&1"
+        )
+        if schedule["endHour"] < 24:
+            updated.append(
+                f"0 {schedule['endHour']} * * * "
+                f"{reconcile_command} >> {CRON_LOG_PATH} 2>&1"
+            )
+        updated.append(
+            "50 23 * * * "
+            f"{recovery_close_command} >> {CRON_LOG_PATH} 2>&1"
+        )
+    elif schedule["mode"] == "window":
         end_hour = schedule["endHour"]
         if end_hour == 24:
             if schedule["startHour"] < 23:
@@ -850,8 +941,14 @@ def replace_douyin_cron_schedule(crontab_text, time_string):
     # Eligible refusals are handled by the normal planner and the same
     # end-of-window fallback. Never add an extra send hour beyond user config.
 
-    # One daily account patrol before the first scheduled send of the day.
-    patrol_line = patrol_cron_line(schedule)
+    # Recovery mode has one non-sending morning patrol independent of the
+    # operator's business send window; legacy schedules keep their old lead time.
+    patrol_schedule = (
+        {"mode": "fixed", "hour": 10, "minute": 0}
+        if recovery_mode
+        else schedule
+    )
+    patrol_line = patrol_cron_line(patrol_schedule)
     if patrol_line:
         updated.append(patrol_line)
 
@@ -1058,6 +1155,10 @@ def current_daily_schedule(*, allow_host_commands=True):
     for line in crontab.splitlines():
         if is_patrol_schedule_line(line):
             # The patrol line is not a send time.
+            continue
+        if schedule_line_kind(line) in {"recovery", "reconcile"}:
+            # Recovery queue and local reconciliation are not user-selected
+            # fixed send times; the configured window remains authoritative.
             continue
         if any(marker in line for marker in TASK_SCHEDULE_MARKERS):
             parts = line.split(maxsplit=5)
@@ -1610,7 +1711,7 @@ def _build_target_status(account, target_name, now, send_window):
             "status": "unconfirmed",
             "lastAttemptAt": barrier_at.isoformat(timespec="seconds"),
             "category": "send_unconfirmed",
-            "reason": "已建立发送保护记录，但是否实际发出尚未确认",
+            "reason": "发送前已建立防重复记录，不代表已经发出，也不代表页面有回显；实际结果尚未确认。",
             "attemptCount": int(state.get("attemptCount") or 0),
             "confirmationLevel": "weak",
             "confirmationSource": "pre_enter_outcome_unknown_barrier",

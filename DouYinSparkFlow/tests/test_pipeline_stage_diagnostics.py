@@ -15,10 +15,9 @@ class FriendListStageDiagnosticsTests(unittest.TestCase):
             async def no_sleep(*_args, **_kwargs):
                 return None
 
-            page = Mock(evaluate=AsyncMock())
-            # This fixture has no dialogs; its row-list read is what wedges.
-            page.locator.return_value.count = AsyncMock(return_value=0)
-            page.locator.return_value.first.count = AsyncMock(return_value=0)
+            dialog = Mock(count=AsyncMock(return_value=0))
+            dialog.first = dialog
+            page = Mock(evaluate=AsyncMock(), locator=Mock(return_value=dialog))
             locator = Mock(all=AsyncMock(side_effect=hang))
             generator = tasks.scroll_and_select_user(
                 page,

@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 import tempfile
 
@@ -133,7 +133,14 @@ class AccountRecordRefRoutingTests(unittest.TestCase):
         async def fetch_friends(_account, **_kwargs):
             return friends.FriendScanResult(["second fresh friend"], complete=True)
 
-        with patch.object(app_module.asyncio, "create_task", side_effect=friend_tasks.append):
+        def capture_task(coro):
+            # The production launcher registers a cancellation callback on the
+            # returned task, so the double must return a task-like object
+            # instead of the list.append return value (None).
+            friend_tasks.append(coro)
+            return Mock()
+
+        with patch.object(app_module.asyncio, "create_task", side_effect=capture_task):
             friend_start = self.alice.post(
                 "/accounts/111/friends/refresh/async?ref=a3&generation=gen-a3",
                 data={"csrf_token": self.token},

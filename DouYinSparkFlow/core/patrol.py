@@ -303,7 +303,11 @@ async def _open_session(user, network_mode, profile_config, *, operation_tasks=N
                     prepare_profile_cookies(context, user, profile_config, _profile_dir),
                 )
             else:
-                playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
+                playwright, browser = await get_browser(
+                    GUI=False,
+                    network_mode=network_mode,
+                    profile_name=account_profile_name(user),
+                )
                 context = await browser.new_context()
                 await context.add_cookies(cookies)
             return playwright, browser, context, cookie_session

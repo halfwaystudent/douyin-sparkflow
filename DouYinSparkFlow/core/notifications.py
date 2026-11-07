@@ -372,6 +372,12 @@ def _notify_run_finished(
     # The fallback run is the end-of-window point; with the window disabled the
     # single scheduled run is. Manual runs that are not the fallback never reach it.
     final = bool(fallback_run or (not manual_run and not window_enabled))
+    from core import recovery_queue
+    recovering = recovery_queue.enabled(config)
+    if recovering:
+        # Ending the normal window does not end the recovery day. The 23:50
+        # local-only close task may summarize, but never submits a message.
+        final = bool(not manual_run and (local_now.hour, local_now.minute) >= (23, 50))
 
     failure_message = None
     summary_message = None
@@ -406,6 +412,8 @@ def _notify_run_finished(
             if final or confirmed_trigger:
                 if all_confirmed:
                     reason = "全部目标已确认成功"
+                elif recovering:
+                    reason = "当日恢复已截止，未确认目标保留失败记录"
                 elif window_enabled:
                     reason = "发送窗口末次兜底运行结束，未确认的目标计为失败"
                 else:

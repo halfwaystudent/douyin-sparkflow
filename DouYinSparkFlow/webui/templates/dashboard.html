@@ -24,14 +24,14 @@
 <span class="live" data-overview-live-state>实时</span>
 {% endblock %}
 
-{% block page_title %}<span data-overview-headline>{% if not total %}还没有要续的火花{% elif remaining %}今天还差 {{ remaining }} 个火花{% else %}今天的火花都续上了{% endif %}</span>{% endblock %}
+{% block page_title %}<span data-overview-headline>{% if not total %}还没有发送目标{% elif remaining %}今天还有 {{ remaining }} 个目标未确认发送{% elif weak %}今日发送记录待核验{% else %}今日目标均已确认发送{% endif %}</span>{% endblock %}
 
 {% block topbar_actions %}
 <form
   method="post"
   action="/ops/run-failed"
   data-confirm-title="补发异常目标"
-  data-confirm="将补发 {{ attention }} 个待核验、失败或受账号异常影响的目标。确认继续吗？"
+  data-confirm="将检查可重试的异常目标；显示数量包含待核验和受阻对象，不等于实际发送数。结果不明的目标不会自动重发。确认继续吗？"
   data-confirm-accept="开始补发"
   data-confirm-tone="primary"
 >

@@ -42,6 +42,8 @@ services:
       - proxy
       - login-desktop
     environment:
+      SPARKFLOW_FINGERPRINT_BROWSER_ENABLED: "0"
+      SPARKFLOW_LOGIN_PROFILE_CONTINUITY: "1"
       TZ: ${TZ:-Asia/Shanghai}
       SPARKFLOW_STORAGE_KEY_FILE: ${SPARKFLOW_STORAGE_KEY_FILE:-}
       FORWARDED_ALLOW_IPS: ${SPARKFLOW_TRUSTED_PROXY_IPS:-127.0.0.1}
@@ -55,6 +57,7 @@ services:
       SPARKFLOW_PASSKEY_RP_ID: ${SPARKFLOW_PASSKEY_RP_ID:-}
       SPARKFLOW_PASSKEY_ORIGIN: ${SPARKFLOW_PASSKEY_ORIGIN:-}
       DOCKER_API_VERSION: ${DOCKER_API_VERSION:-}
+      SPARKFLOW_HOST_STATUS_FILE: /run/service-status/status.json
     ports:
       - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8787}:8787"
     command: python main.py --web --host 0.0.0.0 --port 8787
@@ -65,12 +68,25 @@ services:
       - ./state/login-api:/run/login-api:ro
       - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
       - ./state/keys:/run/storage-key:ro
+      - ./state/service-status:/run/service-status:ro
 
   login-desktop:
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
     cap_add: [DAC_OVERRIDE]
+    build:
+      context: ./DouYinSparkFlow
+      dockerfile: Dockerfile.server
+      network: host
+      args:
+        PLAYWRIGHT_BASE_IMAGE: ${PLAYWRIGHT_BASE_IMAGE:-mcr.microsoft.com/playwright/python:v1.56.0-jammy}
+        NODE_RUNTIME_IMAGE: ${NODE_RUNTIME_IMAGE:-node:22-bookworm-slim}
+        HTTP_PROXY: ${HTTP_PROXY_BUILD:-}
+        HTTPS_PROXY: ${HTTPS_PROXY_BUILD:-}
+        ALL_PROXY: ${ALL_PROXY_BUILD:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
     image: douyin-sparkflow:local
     container_name: login-desktop
     restart: unless-stopped
@@ -78,6 +94,7 @@ services:
     depends_on:
       - proxy
     environment:
+      SPARKFLOW_FINGERPRINT_BROWSER_ENABLED: "0"
       TZ: ${TZ:-Asia/Shanghai}
       DISPLAY: :99
       LOGIN_DESKTOP_API_PORT: "18090"
@@ -92,6 +109,8 @@ services:
       LOGIN_DESKTOP_NETWORK_CACHE_SECONDS: ${LOGIN_DESKTOP_NETWORK_CACHE_SECONDS:-30}
       LOGIN_DESKTOP_API_BIND_ADDRESS: "0.0.0.0"
       LOGIN_DESKTOP_API_TOKEN_FILE: /run/login-api/token
+      LOGIN_ACCOUNT_PROFILE_ROOT: /opt/douyin-sparkflow/state/browser-profiles
+      LOGIN_ACCOUNT_LOCK_ROOT: /app/logs/browser-account-locks
 
     ports:
       - "${LOGIN_DESKTOP_BIND_ADDRESS:-127.0.0.1}:${LOGIN_DESKTOP_WEB_PORT:-8788}:6080"
@@ -103,6 +122,10 @@ services:
       - ./DouYinSparkFlow/logs/login_desktop:/app/logs/login_desktop
       - ./state/login-profile:/data/login-profile
       - ./state/login-api:/run/login-api
+      # Re-login uses the sender's actual profile and physical-account guard.
+      # Keep account stores and unrelated logs out of the login container.
+      - ./state/browser-profiles:/opt/douyin-sparkflow/state/browser-profiles
+      - ./DouYinSparkFlow/logs/browser-account-locks:/app/logs/browser-account-locks
 
   scheduler:
     security_opt:
@@ -115,6 +138,7 @@ services:
     depends_on:
       - proxy
     environment:
+      SPARKFLOW_FINGERPRINT_BROWSER_ENABLED: "0"
       TZ: ${TZ:-Asia/Shanghai}
       SPARKFLOW_STORAGE_KEY_FILE: ${SPARKFLOW_STORAGE_KEY_FILE:-}
       PYTHONUNBUFFERED: "1"
@@ -136,6 +160,7 @@ services:
     depends_on:
       - proxy
     environment:
+      SPARKFLOW_FINGERPRINT_BROWSER_ENABLED: "0"
       TZ: ${TZ:-Asia/Shanghai}
       SPARKFLOW_STORAGE_KEY_FILE: ${SPARKFLOW_STORAGE_KEY_FILE:-}
       PYTHONUNBUFFERED: "1"

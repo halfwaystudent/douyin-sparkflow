@@ -68,6 +68,7 @@ def _account(**extra):
         "target_states": {"阿杰": {"status": "sent"}},
         "failure_queue": {"阿杰": {"category": "protocol_user_blocked", "attempts": 1}},
         "enabled": True,
+        "login_generation": "initial-generation",
     }
     base.update(extra)
     return base
@@ -119,14 +120,10 @@ class Issue41ReloginRegressionTests(unittest.TestCase):
     def _relogin(self, exported, uid_for_cookie):
         """Save a scan re-login into acc-1, as the operator's re-login button does."""
         row = next(item for item in self._rows() if item["account_ref"] == "acc-1")
-        generation = str(row.get("login_generation", ""))
+        generation = str(row["login_generation"])
         active = {
-            "mode": "relogin",
-            "account_ref": row["account_ref"],
-            "login_generation": generation,
-            "ticket": "t1",
-            "username": "admin",
-            "session_id": "s-1",
+            "mode": "relogin", "account_ref": "acc-1", "login_generation": generation,
+            "ticket": "t1", "username": "admin", "session_id": "s-1",
         }
         opener = _FakeOpener(uid_for_cookie)
         with (
@@ -144,11 +141,8 @@ class Issue41ReloginRegressionTests(unittest.TestCase):
             response = self.client.post(
                 "/login-desktop/save",
                 data={
-                    "csrf_token": "t",
-                    "ticket": "t1",
-                    "relogin_unique_id": row["unique_id"],
-                    "relogin_account_ref": row["account_ref"],
-                    "login_generation": generation,
+                    "csrf_token": "t", "relogin_unique_id": row["unique_id"],
+                    "relogin_account_ref": row["account_ref"], "login_generation": generation,
                 },
             )
         return response

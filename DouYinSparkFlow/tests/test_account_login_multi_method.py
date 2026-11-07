@@ -1725,18 +1725,8 @@ class MergeRedirectContractTests(unittest.TestCase):
         }
 
     def _post_merge(self):
-        source = {
-            "unique_id": ACCOUNT_ID,
-            "username": "Same",
-            "account_ref": "acc-1",
-            "login_generation": "source-generation",
-        }
-        target = {
-            "unique_id": "999",
-            "username": "Other",
-            "account_ref": "acc-2",
-            "login_generation": "target-generation",
-        }
+        source = {"unique_id": ACCOUNT_ID, "username": "Same", "account_ref": "acc-1", "login_generation": "source-gen"}
+        target = {"unique_id": "999", "username": "Other", "account_ref": "acc-2", "login_generation": "target-gen"}
         with (
             patch.object(app_module, "current_user", return_value="admin"),
             patch.object(app_module, "current_principal", return_value=self.principal),
@@ -1749,10 +1739,7 @@ class MergeRedirectContractTests(unittest.TestCase):
             patch.object(
                 app_module,
                 "account_by_ref",
-                side_effect=lambda _accounts, ref: {
-                    source["account_ref"]: source,
-                    target["account_ref"]: target,
-                }.get(ref),
+                side_effect=lambda _accounts, ref: source if ref == "acc-1" else target if ref == "acc-2" else None,
             ),
             patch.object(app_module, "can_access_account", return_value=True),
         ):
@@ -1760,10 +1747,10 @@ class MergeRedirectContractTests(unittest.TestCase):
                 f"/accounts/{ACCOUNT_ID}/merge-into",
                 data={
                     "csrf_token": "t",
-                    "account_ref": source["account_ref"],
-                    "login_generation": source["login_generation"],
-                    "target_account_ref": target["account_ref"],
-                    "target_login_generation": target["login_generation"],
+                    "account_ref": "acc-1",
+                    "login_generation": "source-gen",
+                    "target_account_ref": "acc-2",
+                    "target_login_generation": "target-gen",
                 },
                 follow_redirects=False,
             )

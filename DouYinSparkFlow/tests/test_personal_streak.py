@@ -297,6 +297,14 @@ class PersonalStreakTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.save(**changes)
 
+        with patch.object(streak, "get_config", return_value={"messageTemplate": "全局模板"}):
+            saved = self.save(messages=[])
+        self.assertEqual([], saved["messages"])
+
+        with patch.object(streak, "get_config", return_value={}):
+            with self.assertRaises(ValueError):
+                self.save(messages=[])
+
     def test_account_required_and_disabled_principal_cannot_save(self):
         with self.assertRaises(ValueError):
             self.save({"username": "owner", "role": "admin"})

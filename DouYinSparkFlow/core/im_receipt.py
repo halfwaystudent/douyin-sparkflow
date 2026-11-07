@@ -293,5 +293,13 @@ def parse_send_response(raw):
         "checkCode": check_code,
         "hasServerMessageId": has_message_id,
         "checkCodes": check_codes,
+        # Diagnostic refusal provenance only; does not alter acceptance. A raw
+        # numeric match inside malformed JSON/unknown schema is not a known
+        # embedded rejection suitable for an automatic retry policy.
+        "refusalUnderstood": bool(
+            cmd == SEND_CMD and status_code == 0 and error_desc == "OK"
+            and send is not None and check_understood and check_codes
+            and not unknown_send_fields and not unknown_body_fields
+        ),
         "logId": log_id[:120],
     }

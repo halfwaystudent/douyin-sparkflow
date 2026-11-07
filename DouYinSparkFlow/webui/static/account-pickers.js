@@ -171,8 +171,35 @@
     const timeout = window.setTimeout(() => controller.abort(), 12000);
     const pending = (async () => {
       const response = await fetch(url, {credentials: "same-origin", cache: "no-store", signal: controller.signal});
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || "列表暂时无法加载，请重试。");
+      // Defer immediate HTTP errors by one task so both visible pickers share
+      // the same failed request before the retryable promise is discarded.
+      if (response.status !== 200 || response.redirected) {
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+      if (response.status === 401 || response.redirected) {
+        throw new Error("控制台登录状态已失效，请重新登录控制台后重试。当前选择已保留。");
+      }
+      if (response.status === 403) {
+        throw new Error("当前账号的访问权限已变化，请重新打开账号页核对。当前选择已保留。");
+      }
+      if (response.status >= 500) {
+        throw new Error("服务暂时不可用，请稍后重试。当前选择已保留。");
+      }
+      if (response.status !== 200) {
+        throw new Error("列表暂时无法加载，请稍后重试。当前选择已保留。");
+      }
+      if (!response.headers.get("content-type")?.toLowerCase().includes("application/json")) {
+        throw new Error("列表响应不是有效的 JSON，当前选择已保留。");
+      }
+      let result;
+      try {
+        result = await response.json();
+      } catch {
+        throw new Error("列表响应不是有效的 JSON，当前选择已保留。");
+      }
+      if (!result || Array.isArray(result) || typeof result !== "object") {
+        throw new Error("列表响应不是有效的 JSON，当前选择已保留。");
+      }
       return result;
     })().catch((error) => {
       if (cacheReads.get(url) === pending) cacheReads.delete(url);

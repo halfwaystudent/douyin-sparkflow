@@ -14,6 +14,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 from playwright.async_api import async_playwright
 from rich.console import Console
 
+from core.browser_engine import prepare_profile_engine, resolve_browser_engine
 from utils.config import (
     DEBUG,
     Environment,
@@ -95,29 +96,37 @@ def _douyin_browser_proxy(network_mode=None):
     return douyin_proxy_url(settings) or None
 
 
-def _browser_launch_options(GUI=False, network_mode=None):
+def _browser_launch_options(GUI=False, network_mode=None, *, engine_selection=None):
     args = _browser_args()
     proxy = _douyin_browser_proxy(network_mode=network_mode)
     if proxy:
-        return {
+        options = {
             "headless": _headless_for(GUI),
             "args": args,
             "proxy": {"server": proxy},
         }
-    args.append("--no-proxy-server")
-    return {
-        "headless": _headless_for(GUI),
-        "args": args,
-    }
+    else:
+        args.append("--no-proxy-server")
+        options = {
+            "headless": _headless_for(GUI),
+            "args": args,
+        }
+    if engine_selection is not None:
+        overrides = dict(engine_selection.launch_overrides())
+        options["args"].extend(list(overrides.pop("args", [])))
+        options.update(overrides)
+    return options
 
 
-async def select_douyin_network_mode(target_url):
+async def select_douyin_network_mode(target_url, profile_name=None):
     # Select the first route that can load the target before a task starts.
     failures = []
     for network_mode in douyin_network_modes():
         playwright = browser = page = None
         try:
-            playwright, browser = await get_browser(network_mode=network_mode)
+            playwright, browser = await get_browser(
+                network_mode=network_mode, profile_name=profile_name
+            )
             page = await browser.new_page()
             response = await page.goto(target_url, wait_until="commit", timeout=30000)
             status = response.status if response is not None else None
@@ -343,13 +352,18 @@ async def install_browser():
         console.print(f"[bold red]Browser install failed: {exc}[/bold red]")
 
 
-async def get_browser(GUI=False, network_mode=None):
+async def get_browser(GUI=False, network_mode=None, profile_name=None):
     configure_playwright_environment()
+    engine_selection = resolve_browser_engine(profile_name)
     playwright = None
 
     try:
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(**_browser_launch_options(GUI, network_mode=network_mode))
+        browser = await playwright.chromium.launch(
+            **_browser_launch_options(
+                GUI, network_mode=network_mode, engine_selection=engine_selection
+            )
+        )
         return playwright, browser
     except Exception as exc:
         if playwright is not None:
@@ -357,7 +371,11 @@ async def get_browser(GUI=False, network_mode=None):
                 await playwright.stop()
             except Exception:
                 pass
-        if "Executable doesn't exist" in str(exc) and get_environment() != Environment.GITHUBACTION:
+        if (
+            engine_selection.name == "stock"
+            and "Executable doesn't exist" in str(exc)
+            and get_environment() != Environment.GITHUBACTION
+        ):
             console.print("[bold red]Playwright browser is missing.[/bold red]")
             await install_browser()
             raise RuntimeError(
@@ -371,12 +389,16 @@ async def get_persistent_browser_context(profile_name, GUI=False, root=None, net
     configure_playwright_environment()
 
     profile_dir = browser_profile_root(root) / sanitize_profile_name(profile_name)
+    engine_selection = resolve_browser_engine(profile_name)
+    prepare_profile_engine(profile_dir, engine_selection)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     playwright = None
     try:
         playwright = await async_playwright().start()
-        launch_options = _browser_launch_options(GUI, network_mode=network_mode)
+        launch_options = _browser_launch_options(
+            GUI, network_mode=network_mode, engine_selection=engine_selection
+        )
         launch_options["viewport"] = {"width": 1600, "height": 1000}
         context = await playwright.chromium.launch_persistent_context(
             str(profile_dir),
@@ -389,7 +411,11 @@ async def get_persistent_browser_context(profile_name, GUI=False, root=None, net
                 await playwright.stop()
             except Exception:
                 pass
-        if "Executable doesn't exist" in str(exc) and get_environment() != Environment.GITHUBACTION:
+        if (
+            engine_selection.name == "stock"
+            and "Executable doesn't exist" in str(exc)
+            and get_environment() != Environment.GITHUBACTION
+        ):
             console.print("[bold red]Playwright browser is missing.[/bold red]")
             await install_browser()
             raise RuntimeError(

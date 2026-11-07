@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     "dailySendWindow": {
         "enabled": True,
         "startHour": 10,
-        "endHour": 18,
+        "endHour": 17,
         "scheduleIntervalMinutes": 20
     },
     "hitokotoTypes": [

@@ -17,7 +17,7 @@
   method="post"
   action="/ops/run-failed"
   data-confirm-title="补发异常目标"
-  data-confirm="将补发 {{ top_summary.today_attention_targets }} 个待核验、失败或受账号异常影响的目标。确认继续吗？"
+  data-confirm="将检查可重试的异常目标；显示数量包含待核验和受阻对象，不等于实际发送数。结果不明的目标不会自动重发。确认继续吗？"
   data-confirm-accept="开始补发"
   data-confirm-tone="primary"
 >
@@ -81,10 +81,15 @@
     </button>
   </div>
 
-  <div class="callout {% if not summary.today_attention_targets %}good{% endif %}" data-today-summary>
-    <i data-lucide="{% if summary.today_attention_targets %}triangle-alert{% else %}circle-check{% endif %}"></i>
-    <p>
-      今日结论：强确认 {{ summary.today_confirmed_targets }} · 仅页面回显 {{ summary.today_page_echo_targets }} · 仅回执未确认 {{ summary.today_receipt_only_targets }} ·
+  {% set summary_warning = summary.today_attention_targets or summary.today_page_echo_targets or summary.today_receipt_only_targets %}
+  <div
+    class="callout {% if not summary_warning %}good{% endif %}"
+    data-today-summary
+    data-summary-state="{{ 'attention' if summary_warning else 'good' }}"
+  >
+    <i data-today-summary-icon data-lucide="{% if summary_warning %}triangle-alert{% else %}circle-check{% endif %}"></i>
+    <p data-today-summary-text>
+      今日结论：强确认 {{ summary.today_confirmed_targets }} · 弱证据（仅页面回显 {{ summary.today_page_echo_targets }} · 仅回执未确认 {{ summary.today_receipt_only_targets }}） ·
       待核验 {{ summary.today_unconfirmed_targets }} · 失败 {{ summary.today_failed_targets }} ·
       受账号阻断 {{ summary.today_account_blocked_targets }} · 待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
       （共 {{ summary.total_targets }} 个目标，{{ summary.enabled_accounts }} 个启用账号）
@@ -98,9 +103,9 @@
       <div class="metric-help">{{ summary.enabled_accounts }} 个启用账号</div>
     </article>
     <article class="metric-card success">
-      <div class="metric-label">已发送（今日）</div>
-      <div class="metric-value" data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets }}</div>
-      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> · 仅回执未确认 <b data-overview-value="receiptOnly">{{ summary.today_receipt_only_targets }}</b></div>
+      <div class="metric-label">已发送（今日，含弱证据）</div>
+      <div class="metric-value" data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets + summary.today_receipt_only_targets }}</div>
+      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 弱证据：仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> · 仅回执未确认 <b data-overview-value="receiptOnly">{{ summary.today_receipt_only_targets }}</b></div>
     </article>
     <article class="metric-card danger">
       <div class="metric-label">需要处理</div>

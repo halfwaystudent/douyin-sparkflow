@@ -36,6 +36,8 @@ class PipelineConsoleTests(unittest.TestCase):
         self.assertTrue(item["needsVerification"])
         self.assertEqual(item["confirmationSource"], "pre_enter_outcome_unknown_barrier")
         self.assertIn("不自动重发", item["skipReason"])
+        self.assertIn("不代表已经发出", item["reason"])
+        self.assertIn("不代表页面有回显", item["reason"])
 
     def test_strong_history_precedes_a_conservative_unknown_barrier(self):
         account = self.account()

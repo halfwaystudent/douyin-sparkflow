@@ -140,3 +140,19 @@
     });
   });
 })();
+
+(() => {
+  document.querySelectorAll("form[data-merge-duplicate-form]").forEach((form) => {
+    const target = form.querySelector("select[data-target-account-ref]");
+    const generation = form.querySelector("input[data-target-login-generation]");
+    if (!target || !generation) return;
+
+    const syncTargetGeneration = () => {
+      generation.value = target.selectedOptions[0]?.dataset.loginGeneration || "";
+    };
+    syncTargetGeneration();
+    target.addEventListener("change", syncTargetGeneration);
+    form.addEventListener("submit", syncTargetGeneration, true);
+  });
+})();
+

@@ -28,7 +28,13 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Playwright's base image bundles a virtualenv bootstrap tool pinned to
+# filelock<4. It is not used by this application and conflicts with our lock
+# dependency; remove that unused tool rather than shipping an inconsistent
+# environment or downgrading the application's lock implementation.
+RUN python -m pip uninstall --yes virtualenv \
+    && pip install --no-cache-dir -r requirements.txt \
+    && python -m pip check
 
 RUN sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list \
     && sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list \

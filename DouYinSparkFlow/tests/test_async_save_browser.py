@@ -198,8 +198,6 @@ class AsyncSaveBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(await self.posts()))
 
     async def test_status_timeout_is_bounded_and_manual_recheck_can_finish(self):
-        # Keep deliberate run_for advances independent from driver wall time.
-        await self.page.clock.pause_at(await self.page.evaluate("Date.now() + 100"))
         await self.page.evaluate("pending['/login-desktop/save/status?']=[]")
         await self.save()
         await self.page.clock.run_for(11999)

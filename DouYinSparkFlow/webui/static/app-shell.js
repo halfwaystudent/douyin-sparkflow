@@ -327,6 +327,38 @@
     });
   };
 
+  const updateTodaySummary = (summary) => {
+    const confirmed = Number(summary.confirmed) || 0;
+    const pageEcho = Number(summary.pageEcho) || 0;
+    const receiptOnly = Number(summary.receiptOnly) || 0;
+    const unconfirmed = Number(summary.unconfirmed) || 0;
+    const failed = Number(summary.failed) || 0;
+    const blocked = Number(summary.blocked) || 0;
+    const attention = Number(summary.attention) || 0;
+    const pending = (Number(summary.pending) || 0) + (Number(summary.unprocessed) || 0);
+    const total = Number(summary.total) || 0;
+    const enabledAccounts = Number(summary.enabledAccounts) || 0;
+    const needsReview = attention > 0 || pageEcho > 0 || receiptOnly > 0;
+    const state = needsReview ? "attention" : "good";
+    const iconName = needsReview ? "triangle-alert" : "circle-check";
+    const text = `今日结论：强确认 ${confirmed} · 弱证据（仅页面回显 ${pageEcho} · 仅回执未确认 ${receiptOnly}） · 待核验 ${unconfirmed} · 失败 ${failed} · 受账号阻断 ${blocked} · 待发送 ${pending}（共 ${total} 个目标，${enabledAccounts} 个启用账号）`;
+
+    document.querySelectorAll("[data-today-summary]").forEach((node) => {
+      node.dataset.summaryState = state;
+      node.classList.toggle("good", state === "good");
+      const textNode = node.querySelector("[data-today-summary-text]");
+      if (textNode) textNode.textContent = text;
+      const icon = node.querySelector("[data-today-summary-icon]");
+      if (icon && icon.getAttribute("data-lucide") !== iconName) {
+        const glyph = document.createElement("i");
+        glyph.dataset.todaySummaryIcon = "";
+        glyph.dataset.lucide = iconName;
+        icon.replaceWith(glyph);
+      }
+    });
+    if (window.lucide) window.lucide.createIcons({ attrs: { "aria-hidden": "true" } });
+  };
+
   const updateAccounts = (accounts) => {
     accounts.forEach((account) => {
       const selector = `[data-account-overview="${CSS.escape(account.uniqueId)}"]`;
@@ -394,11 +426,12 @@
     const summary = data.summary || {};
     const task = data.task || {};
     updateTaskBanner(task);
+    updateTodaySummary(summary);
     setText("[data-overview-value='total']", summary.total || 0);
     setText("[data-overview-value='confirmed']", summary.confirmed || 0);
     setText(
       "[data-overview-value='sentTotal']",
-      (summary.confirmed || 0) + (summary.pageEcho || 0),
+      (summary.confirmed || 0) + (summary.pageEcho || 0) + (summary.receiptOnly || 0),
     );
     setText("[data-overview-value='pageEcho']", summary.pageEcho || 0);
     setText("[data-overview-value='receiptOnly']", summary.receiptOnly || 0);
@@ -431,10 +464,12 @@
     const remaining = Math.max(0, totalCount - strongCount - weakCount);
     document.querySelectorAll("[data-overview-headline]").forEach((node) => {
       node.textContent = !totalCount
-        ? "还没有要续的火花"
+        ? "还没有发送目标"
         : remaining
-          ? `今天还差 ${remaining} 个火花`
-          : "今天的火花都续上了";
+          ? `今天还有 ${remaining} 个目标未确认发送`
+          : weakCount
+            ? "今日发送记录待核验"
+            : "今日目标均已确认发送";
     });
     const attentionCount = summary.attention || 0;
     document.querySelectorAll("[data-attention-callout]").forEach((node) => {
@@ -606,9 +641,26 @@
         body,
         credentials: "same-origin",
       });
-      render(await response.json().catch(() => ({})));
-    } catch (error) {
-      result.textContent = `预览失败：${error.message}`;
+      if (response.status === 401 || response.redirected) {
+        result.textContent = "控制台登录已失效，请重新登录后预览；配置尚未保存。";
+      } else if (response.status === 403) {
+        result.textContent = "页面已过期或没有权限，请刷新页面后重试；配置尚未保存。";
+      } else if (response.status >= 500) {
+        result.textContent = "服务器暂时不可用，请稍后重试；配置尚未保存。";
+      } else if (!response.ok) {
+        result.textContent = "预览失败：请求未被接受，请刷新页面后重试；配置尚未保存。";
+      } else if (!response.headers.get("content-type")?.toLowerCase().includes("application/json")) {
+        result.textContent = "预览失败：服务器返回了无法识别的内容；配置尚未保存。";
+      } else {
+        const data = await response.json().catch(() => null);
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          result.textContent = "预览失败：服务器返回的数据无法解析；配置尚未保存。";
+        } else {
+          render(data);
+        }
+      }
+    } catch {
+      result.textContent = "预览失败：无法连接服务器，请检查网络后重试；配置尚未保存。";
     } finally {
       button.disabled = false;
     }

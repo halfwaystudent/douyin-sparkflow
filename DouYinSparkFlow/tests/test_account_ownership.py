@@ -26,6 +26,7 @@ def _account(unique_id, account_ref, username, **extra):
         "targets": ["阿杰"],
         "target_states": {"阿杰": {"done": True}},
         "enabled": True,
+        "login_generation": f"generation-{account_ref}",
     }
     base.update(extra)
     return base
@@ -362,15 +363,9 @@ class AccountOwnershipTests(unittest.TestCase):
         )
         self._write_users([_web_user("zxb", ["acc-u"]), _web_user("zcf", ["acc-a"])])
         principal = self._principal("zxb", ["acc-u"])
-        own_row = next(row for row in self._accounts() if row["account_ref"] == "acc-u")
-        generation = str(own_row.get("login_generation", ""))
         active = {
-            "mode": "relogin",
-            "account_ref": own_row["account_ref"],
-            "login_generation": generation,
-            "ticket": "t1",
-            "username": "zxb",
-            "session_id": "s-1",
+            "mode": "relogin", "account_ref": "acc-u", "login_generation": "generation-acc-u",
+            "ticket": "t1", "username": "zxb", "session_id": "s-1",
         }
         exported = {"unique_id": "1001", "username": "主号", "cookies": [{"name": "ttwid", "value": "v"}]}
         with (
@@ -388,15 +383,13 @@ class AccountOwnershipTests(unittest.TestCase):
             response = self.client.post(
                 "/login-desktop/save",
                 data={
-                    "csrf_token": "t",
-                    "ticket": "t1",
-                    "relogin_unique_id": own_row["unique_id"],
-                    "relogin_account_ref": own_row["account_ref"],
-                    "login_generation": generation,
+                    "csrf_token": "t", "relogin_unique_id": "1001",
+                    "relogin_account_ref": "acc-u", "login_generation": "generation-acc-u",
                 },
             )
 
-        self.assertEqual(400, response.status_code)
+        self.assertEqual(400, response.status_code, response.text)
+        self.assertIn("已经绑定给其他用户", response.json()["error"])
         self.assertEqual(["acc-u", "acc-a"], [item["account_ref"] for item in self._accounts()])
         self.assertEqual(["acc-a"], self._refs("zcf"))
 

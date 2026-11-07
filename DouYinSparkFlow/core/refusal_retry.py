@@ -1,4 +1,4 @@
-"""One cooled retry for a narrowly identified browser 8610 rejection.
+"""One shared cooled retry for narrowly identified browser 8610/8101 refusals.
 
 This is not a change to receipt acceptance or the terminal-category set.
 The reservation lives outside replaceable target outcome rows.
@@ -124,7 +124,15 @@ def _integer(value, expected):
     return type(value) is int and value == expected
 
 
-def explicit_8610(account, target, now):
+def explicit_retryable_rejection(account, target, now):
+    """Require matching structured rejection evidence, never a reason string.
+
+    Keep 8610's existing 3/2/2 contract. The recorded 8101 layout is 0/0/1,
+    with the refusal inside check_message, despite outer fields saying OK.
+    Require understood protobuf/JSON provenance for that additional layout.
+    Self-visible-only results and incomplete historical receipts stay terminal.
+    Both refusal codes share the same reservation; changing code is no reset.
+    """
     state = streak_state.target_state(account, target, now)
     entry = streak_state.failure_entry(account, target, now.tzinfo)
     if state.get('status') != streak_state.STATE_FAILED_TERMINAL or state.get('lastErrorCategory') != 'send_rejected':
@@ -140,13 +148,29 @@ def explicit_8610(account, target, now):
         and r.get('protoParsed') is True and r.get('protoOk') is False
         and r.get('jsonOk') is not True
         and _integer(r.get('protoStatusCode'), 0)
-        and _integer(r.get('protoSendStatus'), 3)
-        and _integer(r.get('protoCheckCode'), 2)
         and isinstance(codes, dict) and set(codes) == {'status_code', 'raw_check_code'}
-        and _integer(codes.get('status_code'), 8610) and _integer(codes.get('raw_check_code'), 2)
+        and (
+            (_integer(codes.get('status_code'), 8610)
+             and _integer(r.get('protoSendStatus'), 3)
+             and _integer(r.get('protoCheckCode'), 2)
+             and _integer(codes.get('raw_check_code'), 2))
+            or (_integer(codes.get('status_code'), 8101)
+                and _integer(r.get('httpStatus'), 200)
+                and r.get('protoRefusalUnderstood') is True
+                and _integer(r.get('protoSendStatus'), 0)
+                and _integer(r.get('protoCheckCode'), 0)
+                and _integer(codes.get('raw_check_code'), 1))
+        )
         and isinstance(rejection, dict) and rejection.get('key') == 'status_code'
-        and _integer(rejection.get('value'), 8610)
+        and _integer(rejection.get('value'), codes['status_code'])
     )
+
+
+def explicit_8610(account, target, now):
+    """Compatibility predicate: preserve its original 8610-only meaning."""
+    return bool(explicit_retryable_rejection(account, target, now)
+                and streak_state.failure_entry(account, target, now.tzinfo)
+                ['serverReceipt']['protoCheckCodes']['status_code'] == 8610)
 
 
 def rejection_precedes_today(account, target, now, schedule_timezone=None):
@@ -169,7 +193,7 @@ def eligible(account, target, now, schedule_timezone=None):
     policy_timezone = _timezone_from_scope(account, schedule_timezone)
     if (policy_timezone is None
             or used_today(account, target, now, policy_timezone)
-            or not explicit_8610(account, target, now)):
+            or not explicit_retryable_rejection(account, target, now)):
         return False
     entry = streak_state.failure_entry(account, target, now.tzinfo)
     try:

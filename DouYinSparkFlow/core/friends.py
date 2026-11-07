@@ -322,7 +322,9 @@ async def _friend_list_dom_summary(page):
 async def _first_visible_locator(page, selectors):
     for selector in selectors:
         try:
-            locator = page.locator(selector)
+            # Cached inactive lists may precede the visible tab in DOM order.
+            # Keep readiness and downstream scans scoped to visible rows.
+            locator = page.locator(selector).filter(visible=True)
             count = await locator.count()
             for index in range(min(count, 5)):
                 item = locator.nth(index)
@@ -559,7 +561,11 @@ async def _fetch_account_friends_once(
                 prepare_profile_cookies(context, account, profile_config, _profile_dir),
             )
         else:
-            playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
+            playwright, browser = await get_browser(
+                GUI=False,
+                network_mode=network_mode,
+                profile_name=account_profile_name(account),
+            )
             if fresh_login:
                 # Pasted credentials have no stable account profile yet. Never
                 # seed the check from a previous caller's "unknown" profile.

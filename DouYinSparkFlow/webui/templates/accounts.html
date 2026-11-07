@@ -203,6 +203,7 @@
           method="post"
           action="/accounts/{{ account.unique_id }}/merge-into"
           class="form-actions"
+          data-merge-duplicate-form
           data-confirm-title="合并重复账号"
           data-confirm="将把“{{ account.username }}”这条记录的目标与发送账本合并到所选账号，然后删除这条重复记录。此操作无法撤销。"
           data-confirm-accept="确认合并"
@@ -210,8 +211,8 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
           <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
-          <input type="hidden" name="target_login_generation" value="">
-          <select class="inline-select" name="target_account_ref" aria-label="保留哪个账号">
+          <input type="hidden" name="target_login_generation" value="" data-target-login-generation>
+          <select class="inline-select" name="target_account_ref" aria-label="保留哪个账号" data-target-account-ref>
             {% for other in accounts %}
             {% if other.account_ref != account.account_ref and other.username == account.username %}
             <option value="{{ other.account_ref }}" data-login-generation="{{ other.login_generation|default('') }}">保留 {{ other.username }}（{{ other.unique_id }}）</option>

@@ -25,67 +25,6 @@ class RefusalRetryTests(unittest.TestCase):
         self.env = patch.dict('os.environ', {'SPARKFLOW_MANUAL_RUN': '', 'SPARKFLOW_FALLBACK_PHASE': '', 'SPARKFLOW_TIMEZONE': 'Asia/Shanghai'})
         self.env.start(); self.addCleanup(self.env.stop)
 
-    def test_personal_timezone_keeps_same_day_8610_eligible_across_global_midnight(self):
-        from core import refusal_retry
-        from zoneinfo import ZoneInfo
-        attempt = datetime(2026, 11, 3, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
-        fallback = datetime(2026, 11, 3, 23, 59, tzinfo=ZoneInfo("Asia/Tokyo"))
-        user = account()
-        receipt = deepcopy(user["failure_queue"]["friend"]["serverReceipt"])
-        streak_state.mark_failed(user, "friend", category="send_rejected", reason="8610", retryable=False, now=attempt)
-        user["failure_queue"] = {"friend": {"category": "send_rejected", "lastAttemptAt": attempt.isoformat(timespec="seconds"), "serverReceipt": receipt}}
-
-        self.assertTrue(refusal_retry.eligible(user, "friend", fallback, schedule_timezone=ZoneInfo("Asia/Tokyo")))
-
-    def test_timezone_change_cannot_bypass_existing_reservation(self):
-        from core import refusal_retry
-        from zoneinfo import ZoneInfo
-        tokyo = ZoneInfo("Asia/Tokyo")
-        shanghai = ZoneInfo("Asia/Shanghai")
-        user = account()
-        reserved_at = datetime(2026, 11, 3, 12, 0, tzinfo=tokyo)
-        refusal_retry.reserve(user, "friend", reserved_at, "reserved", schedule_timezone=tokyo)
-
-        # Tokyo has already rolled into Nov 4, but the reservation instant and
-        # current Shanghai policy are both still Nov 3.  Editing the policy
-        # must not create a second retry in that current policy day.
-        self.assertTrue(refusal_retry.used_today(
-            user, "friend", datetime(2026, 11, 3, 23, 30, tzinfo=shanghai), schedule_timezone=shanghai,
-        ))
-        self.assertTrue(refusal_retry.used_today(
-            user, "friend", datetime(2026, 11, 3, 23, 30, tzinfo=shanghai), schedule_timezone="Asia/Shanghai",
-        ))
-
-    def test_timezone_reservation_is_fail_closed_for_bad_or_future_provenance(self):
-        from core import refusal_retry
-        from zoneinfo import ZoneInfo
-        user = account()
-        now = datetime(2026, 11, 3, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-        base = {
-            "day": "2026-11-03", "timezone": "Asia/Tokyo",
-            "at": datetime(2026, 11, 3, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo")).isoformat(),
-            "runId": "reserved", "identityRefs": ["friend"],
-        }
-        for field, value in (
-            ("day", "not-a-date"), ("timezone", "not/a-zone"),
-            ("at", "not-a-time"),
-            ("at", datetime(2026, 11, 5, tzinfo=timezone.utc).isoformat()),
-        ):
-            with self.subTest(field=field, value=value):
-                row = dict(base)
-                row[field] = value
-                user[refusal_retry.KEY] = {"friend": row}
-                self.assertTrue(refusal_retry.used_today(user, "friend", now, schedule_timezone=now.tzinfo))
-
-    def test_legacy_reservation_without_timezone_remains_protective(self):
-        from core import refusal_retry
-        from zoneinfo import ZoneInfo
-        user = account()
-        at = datetime(2026, 10, 29, 16, 0, tzinfo=timezone.utc)
-        user[refusal_retry.KEY] = {"friend": {"day": "2026-10-30", "at": at.isoformat(), "runId": "old"}}
-
-        self.assertTrue(refusal_retry.used_today(user, "friend", at, schedule_timezone=ZoneInfo("Asia/Tokyo")))
-
     def test_cooled_8610_is_due_only_at_final_fallback(self):
         self.assertEqual(tasks._select_due_targets(account(), WINDOW, NOW)[0], [])
         with patch.dict('os.environ', {'SPARKFLOW_FALLBACK_PHASE': '1'}):
@@ -272,3 +211,69 @@ class RefusalRetryTests(unittest.TestCase):
             reloaded = json.loads(path.read_text())[0]
             self.assertTrue(refusal_retry.used_today(reloaded, 'friend', NOW))
             self.assertEqual(tasks._select_due_targets(reloaded, WINDOW, NOW+timedelta(minutes=40))[0], [])
+
+    def test_legacy_reservation_without_timezone_remains_protective(self):
+        from core import refusal_retry
+        from zoneinfo import ZoneInfo
+        user = account()
+        at = datetime(2026, 10, 29, 16, 0, tzinfo=timezone.utc)
+        user[refusal_retry.KEY] = {"friend": {"day": "2026-10-30", "at": at.isoformat(), "runId": "old"}}
+
+        self.assertTrue(refusal_retry.used_today(user, "friend", at, schedule_timezone=ZoneInfo("Asia/Tokyo")))
+
+    def test_personal_timezone_keeps_same_day_8610_eligible_across_global_midnight(self):
+        from core import refusal_retry
+        from zoneinfo import ZoneInfo
+        attempt = datetime(2026, 11, 3, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo"))
+        fallback = datetime(2026, 11, 3, 23, 59, tzinfo=ZoneInfo("Asia/Tokyo"))
+        user = account()
+        receipt = deepcopy(user["failure_queue"]["friend"]["serverReceipt"])
+        streak_state.mark_failed(user, "friend", category="send_rejected", reason="8610", retryable=False, now=attempt)
+        user["failure_queue"] = {"friend": {"category": "send_rejected", "lastAttemptAt": attempt.isoformat(timespec="seconds"), "serverReceipt": receipt}}
+
+        self.assertTrue(refusal_retry.eligible(user, "friend", fallback, schedule_timezone=ZoneInfo("Asia/Tokyo")))
+
+    def test_timezone_change_cannot_bypass_existing_reservation(self):
+        from core import refusal_retry
+        from zoneinfo import ZoneInfo
+        tokyo = ZoneInfo("Asia/Tokyo")
+        shanghai = ZoneInfo("Asia/Shanghai")
+        user = account()
+        reserved_at = datetime(2026, 11, 3, 12, 0, tzinfo=tokyo)
+        refusal_retry.reserve(user, "friend", reserved_at, "reserved", schedule_timezone=tokyo)
+
+        # Tokyo has already rolled into Nov 4, but the reservation instant and
+        # current Shanghai policy are both still Nov 3.  Editing the policy
+        # must not create a second retry in that current policy day.
+        self.assertTrue(refusal_retry.used_today(
+            user, "friend", datetime(2026, 11, 3, 23, 30, tzinfo=shanghai), schedule_timezone=shanghai,
+        ))
+        self.assertTrue(refusal_retry.used_today(
+            user, "friend", datetime(2026, 11, 3, 23, 30, tzinfo=shanghai), schedule_timezone="Asia/Shanghai",
+        ))
+
+    def test_timezone_reservation_is_fail_closed_for_bad_or_future_provenance(self):
+        from core import refusal_retry
+        from zoneinfo import ZoneInfo
+        user = account()
+        now = datetime(2026, 11, 3, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        base = {
+            "day": "2026-11-03", "timezone": "Asia/Tokyo",
+            "at": datetime(2026, 11, 3, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo")).isoformat(),
+            "runId": "reserved", "identityRefs": ["friend"],
+        }
+        for field, value in (
+            ("day", "not-a-date"), ("timezone", "not/a-zone"),
+            ("at", "not-a-time"),
+            ("at", datetime(2026, 11, 5, tzinfo=timezone.utc).isoformat()),
+        ):
+            with self.subTest(field=field, value=value):
+                row = dict(base)
+                row[field] = value
+                user[refusal_retry.KEY] = {"friend": row}
+                self.assertTrue(refusal_retry.used_today(user, "friend", now, schedule_timezone=now.tzinfo))
+
+
+
+
+

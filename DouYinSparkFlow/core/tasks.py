@@ -8,6 +8,9 @@ import os
 import random
 import re
 import unicodedata
+import time
+from core import send_diagnostics
+from core import action_report_gate
 import uuid
 from contextlib import contextmanager
 from functools import wraps
@@ -56,6 +59,7 @@ CREATOR_HOME_URL = "https://creator.douyin.com/"
 CREATOR_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 
 BROWSER_STAGE_TIMEOUT_SECONDS = 30
+BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS = 60
 BROWSER_CLEANUP_TIMEOUT_SECONDS = 5
 # Keep strong references to fail-closed locks: FileLock.__del__ releases them.
 _BLOCKED_BROWSER_LOCKS = {}
@@ -64,6 +68,7 @@ _BLOCKED_BROWSER_LOCKS = {}
 from contextvars import ContextVar
 _BROWSER_OPERATION_OWNER = ContextVar('browser_operation_owner', default=None)
 _PENDING_BROWSER_TASKS = set()
+_CURRENT_BROWSER_OPERATION_OWNER = object()
 
 
 class BrowserStageTimeout(RuntimeError):
@@ -79,9 +84,10 @@ def _consume_browser_task(task):
         task.exception()
 
 
-def _track_browser_operation(task):
+def _track_browser_operation(task, *, owner=_CURRENT_BROWSER_OPERATION_OWNER):
     """Keep every browser reader owned until it really acknowledges exit."""
-    owner = _BROWSER_OPERATION_OWNER.get()
+    if owner is _CURRENT_BROWSER_OPERATION_OWNER:
+        owner = _BROWSER_OPERATION_OWNER.get()
     if owner is not None:
         owner.add(task)
     _PENDING_BROWSER_TASKS.add(task)
@@ -114,10 +120,19 @@ async def _run_browser_stage(stage, operation, *, timeout_seconds=None,
     asyncio.wait_for alone waits indefinitely for cancellation acknowledgement.
     Logs deliberately contain only a static stage name and elapsed time.
     """
-    timeout = BROWSER_STAGE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    default_timeout = (BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS if stage == "login_check"
+                       else BROWSER_STAGE_TIMEOUT_SECONDS)
+    timeout = default_timeout if timeout_seconds is None else timeout_seconds
     loop = asyncio.get_running_loop()
     started = loop.time()
     logger.info("Browser stage begin stage=%s", stage)
+    resource_before = None
+    resource_stage = stage in {"whole_account", "dismiss_dialogs", "navigation", "confirm_message", "input_before_type", "input_after_type", "read_observer"}
+    if resource_stage:
+        try:
+            resource_before = send_diagnostics.cached_local_resources()
+        except Exception:
+            pass  # Diagnostic availability cannot change a browser operation.
     owner = _BROWSER_OPERATION_OWNER.get()
     owner_token = None
     if owner is None:
@@ -145,6 +160,19 @@ async def _run_browser_stage(stage, operation, *, timeout_seconds=None,
             _BROWSER_OPERATION_OWNER.reset(owner_token)
         logger.info("Browser stage end stage=%s outcome=%s duration=%.3fs",
                     stage, outcome, loop.time() - started)
+        if resource_stage and (outcome != "ok" or stage == "whole_account"):
+            try:
+                resource_after = send_diagnostics.cached_local_resources()
+                if resource_after is None:
+                    metrics = {'diagnostic_only': True, 'unavailable': True}
+                else:
+                    metrics = send_diagnostics.resource_interval(resource_before or resource_after, resource_after)
+                    metrics['interval_start_available'] = resource_before is not None
+                    metrics['sample_age_seconds'] = round(max(0, time.monotonic()-resource_after['monotonic']),3)
+                logger.warning("Browser stage resources stage=%s outcome=%s metrics=%s", stage, outcome,
+                               json.dumps(metrics, sort_keys=True))
+            except Exception:
+                pass  # Never replace the original result/exception during cleanup.
 
 
 def _bounded_browser_stage(stage, *, cancel_grace_seconds=.1):
@@ -236,12 +264,13 @@ def _route_reopen_cleanup_proven(session_state, operation_tasks):
     )
 
 
-async def _cleanup_browser_session(page, context, playwright, state):
+async def _cleanup_browser_session(page, context, playwright, state, *, browser=None):
     context_closed = context is None
     cancelled = False
     for stage, resource, method in (
         ("close_page", page, "close"),
         ("close_context", context, "close"),
+        ("close_browser", browser, "close"),
         ("stop_playwright", playwright, "stop"),
     ):
         if resource is None:
@@ -300,6 +329,19 @@ def _sender_scope_timezone(user):
     return schedule_timezone is not None, schedule_timezone
 
 
+def _is_global_recovery_context():
+    """True only for the global automatic path owned by recovery_queue."""
+    if os.getenv('SPARKFLOW_PERSONAL_USER_ID'):
+        return False
+    from core import recovery_queue
+    if not recovery_queue.enabled():
+        return False
+    if (os.getenv('SPARKFLOW_RECOVERY_PASS') == '1'
+            or os.getenv('SPARKFLOW_RECONCILE_ONLY') == '1'):
+        return True
+    return not _is_manual_run()
+
+
 def _browser_prelaunch_targets(user, targets, allow_retry, *, scope_user=None):
     from core import refusal_retry
     now = datetime.now(_schedule_timezone())
@@ -309,6 +351,15 @@ def _browser_prelaunch_targets(user, targets, allow_retry, *, scope_user=None):
     )
     if not scope_ok:
         return []
+    from core import recovery_queue, automatic_recovery
+    if recovery_queue.enabled():
+        source = user if scope_user is None else scope_user
+        ticket = source.get(automatic_recovery.TICKET) or {}
+        if not recovery_queue.allowed_now(now, day=ticket.get('day')):
+            return []
+        if ticket:
+            return [target for target in targets
+                    if automatic_recovery.permitted(user, target, now, source=source)]
     if allow_retry:
         # Preserve the existing explicit manual override for sent-unverified;
         # active attempts and confirmed sends still cannot be overridden.
@@ -528,11 +579,13 @@ class BrowserDialogBlocked(RuntimeError):
 async def _dismiss_non_login_dialogs(page, account_name, stage):
     # No harmless dialog content has been independently audited yet. A generic
     # "OK"/"Confirm" or close icon is not permission to accept unknown UI.
-    for selector in LOGIN_REQUIRED_DIALOG_SELECTORS:
+    for index, selector in enumerate(LOGIN_REQUIRED_DIALOG_SELECTORS):
         item = page.locator(f"{selector}:visible").first
+        logger.info("Dialog query phase=count selectorIndex=%s stage=%s", index, stage)
         if await item.count() == 0:
             continue
         try:
+            logger.info("Dialog query phase=text selectorIndex=%s stage=%s", index, stage)
             dialog_text = await item.inner_text(timeout=1000)
         except Exception:
             # A visible dialog whose contents cannot be read is also unsafe.
@@ -589,6 +642,10 @@ async def save_debug_artifacts(page, account_name, target_name, stage):
 @_bounded_browser_stage("locate_chat_input")
 async def locate_chat_input(page):
     selectors = [
+        # The recorded creator editor has chat-input-nSWBco on the editable
+        # itself; do not wait on an obsolete hashed class or global last editor.
+        "#sub-app [class*='chat-input-'][contenteditable='true']:visible, "
+        "#sub-app [class*='chat-input-'] [contenteditable='true']:visible",
         "xpath=//div[contains(@class, 'chat-input-dccKiL')]//div[@contenteditable='true']",
         "xpath=//div[@contenteditable='true' and @role='textbox']",
         "xpath=(//div[@contenteditable='true'])[last()]",
@@ -636,11 +693,34 @@ def _normalize_message_text(value):
     ).strip()
 
 
+async def _type_browser_message_checked(chat_input, message):
+    """Preserve drafts and require a DOM readback; never dispatch Enter here."""
+    async def read_exact():
+        value = await chat_input.evaluate(
+            '(node) => node.innerText ?? node.textContent ?? ""'
+        )
+        if not isinstance(value, str):
+            raise RuntimeError("input_read_unavailable")
+        return _normalize_message_text(value)
+
+    before = await _run_browser_stage("input_before_type", read_exact())
+    if before:
+        raise RuntimeError("input_nonempty_before_type")
+    lines = message.split("\n")
+    for index, line in enumerate(lines):
+        await _run_browser_stage("type_message", chat_input.type(line, delay=50))
+        if index < len(lines) - 1:
+            await _run_browser_stage("type_newline", chat_input.press("Shift+Enter"))
+    actual = await _run_browser_stage("input_after_type", read_exact())
+    if actual != _normalize_message_text(message):
+        raise RuntimeError("input_mismatch_after_type")
+    logger.info("Browser input checked emptyBefore=True exactAfter=True")
+
+
 async def _detect_send_failure_indicator(page):
-    """Return a short string describing a visible send-failure UI element, or ""."""
+    """Return the established failure indicator; extra UI flags are logs only."""
     try:
-        return await page.evaluate(
-            """() => {
+        indicator_js = """() => {
                 // Red exclamation icon commonly used by chat UIs for failed sends.
                 const failIcons = document.querySelectorAll(
                     "svg[class*='fail'], svg[class*='Fail'], svg[class*='error'], svg[class*='Error'],"
@@ -666,7 +746,14 @@ async def _detect_send_failure_indicator(page):
                 }
                 return "";
             }"""
-        )
+        from core.send_diagnostics import VISIBLE_UI_FEEDBACK_JS
+        # Reuse the existing confirmation poll: no extra RPC, click or timer.
+        # Keep legacy indicator independent if supplementary UI inspection fails.
+        result = await page.evaluate("() => { const indicator=(" + indicator_js + ")(); let feedback={}; try { feedback=(" + VISIBLE_UI_FEEDBACK_JS + ")(); } catch (_) {} return {indicator,feedback}; }")
+        feedback = result['feedback']
+        if any(feedback.get(k) for k in ('send_failed', 'verification', 'login', 'busy', 'restriction')):
+            logger.info("Visible send UI feedback: %s", json.dumps(feedback, sort_keys=True))
+        return result['indicator']
     except Exception:
         return ""
 
@@ -674,6 +761,8 @@ async def _detect_send_failure_indicator(page):
 
 async def start_im_send_observer(page, account_name, target_name):
     """Observe creator IM service calls for one browser send attempt."""
+    from core.send_diagnostics import attach_passive_send_diagnostics
+    diagnostics = attach_passive_send_diagnostics(page)
     state = {
         "enabled": False,
         "send_request_seen": False,
@@ -685,20 +774,42 @@ async def start_im_send_observer(page, account_name, target_name):
         "error": "",
     }
     pending = {}
+    body_tasks = set()
+    observer_owner = _BROWSER_OPERATION_OWNER.get()
+    observer_activity = asyncio.Event()
     session = None
+    finalized = False
+    finalized_summary = None
+    diagnostics_finished = False
+
+    def finish_diagnostics():
+        nonlocal diagnostics_finished
+        if diagnostics_finished:
+            return
+        diagnostics_finished = True
+        diagnostics.close()
+        state["passive_diagnostics"] = diagnostics.snapshot()
+        logger.info("Passive send diagnostics for %s/%s: %s", account_name, target_name,
+                    json.dumps(state["passive_diagnostics"], ensure_ascii=True, sort_keys=True))
 
     try:
         session = await page.context.new_cdp_session(page)
         await session.send("Network.enable")
         state["enabled"] = True
+    except asyncio.CancelledError:
+        finish_diagnostics()
+        raise
     except Exception as exc:
         state["error"] = f"cdp_unavailable: {exc}"
         logger.warning("IM observer unavailable for %s/%s: %s", account_name, target_name, exc)
 
         async def disabled_summary(extra_wait_seconds=0):
-            if extra_wait_seconds:
-                await asyncio.sleep(extra_wait_seconds)
-            return dict(state)
+            try:
+                if extra_wait_seconds:
+                    await asyncio.sleep(extra_wait_seconds)
+            finally:
+                finish_diagnostics()
+            return deepcopy(state)
 
         return disabled_summary
 
@@ -817,6 +928,7 @@ async def start_im_send_observer(page, account_name, target_name):
         if is_send_post:
             state["send_request_seen"] = True
             logger.info("IM observer saw message send request for %s/%s url=%s postLen=%s", account_name, target_name, _trim(_safe_url(url), 160), len(post_data))
+        observer_activity.set()
 
     def on_response(params):
         request_id = params.get("requestId")
@@ -837,6 +949,7 @@ async def start_im_send_observer(page, account_name, target_name):
             state["send_response_seen"] = True
             state["send_receipt"] = {"call": kind, "httpStatus": status, "ok": False, "pendingBody": True, "logid": _trim(logid, 120), "url": _safe_url(item.get("url"))}
             logger.info("IM observer saw message send response for %s/%s status=%s logid=%s", account_name, target_name, status, _trim(logid, 80))
+        observer_activity.set()
 
     async def fetch_body(request_id):
         item = pending.get(request_id) or {}
@@ -876,6 +989,7 @@ async def start_im_send_observer(page, account_name, target_name):
                         receipt["protoStatusCode"] = proto["statusCode"]
                         receipt["protoSendStatus"] = proto["sendStatus"]
                         receipt["protoCheckCode"] = proto["checkCode"]
+                        receipt["protoRefusalUnderstood"] = proto["refusalUnderstood"]
                         if proto["checkCodes"]:
                             receipt["protoCheckCodes"] = dict(proto["checkCodes"])
                         receipt["ok"] = bool(http_ok and proto["ok"])
@@ -897,45 +1011,107 @@ async def start_im_send_observer(page, account_name, target_name):
                         f"{code_text}; {reason_text}" if reason_text else code_text
                     )
                 receipt["reason"] = _trim(reason_text, 300)
-            if item.get("is_send_post"):
+            if item.get("is_send_post") and not finalized:
                 state["send_receipt"] = receipt
                 _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"], "jsonParsed": receipt["jsonParsed"], "protoParsed": bool(receipt.get("protoParsed")), "protoOk": receipt.get("protoOk"), "bodyBase64": receipt.get("bodyBase64"), "logid": receipt.get("logid", ""), "reason": receipt.get("reason", "")})
-            elif kind == "mark_read":
+            elif kind == "mark_read" and not finalized:
                 state["mark_read_calls"].append(receipt)
                 _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"]})
-            elif kind == "identity_security_token":
+            elif kind == "identity_security_token" and not finalized:
                 has_token = isinstance(data, dict) and bool((data.get("data") or {}).get("identity_security_token"))
                 receipt["hasToken"] = has_token
                 receipt.pop("reason", None)
                 state["identity_security_token_calls"].append(receipt)
                 _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"], "hasToken": has_token})
-            else:
+            elif not finalized:
                 _record({"kind": "body", "call": kind, "status": status, "ok": receipt["ok"]})
         except Exception as exc:
             error = _trim(exc, 160)
-            _record({"kind": "body_error", "call": kind, "url": _safe_url(url), "error": error})
-            if item.get("is_send_post"):
-                state["send_receipt"] = {"call": kind, "httpStatus": status, "ok": False, "logid": _trim(logid, 120), "url": _safe_url(url), "reason": f"response_body_unavailable: {error}"}
+            if not finalized:
+                _record({"kind": "body_error", "call": kind, "url": _safe_url(url), "error": error})
+                if item.get("is_send_post"):
+                    state["send_receipt"] = {"call": kind, "httpStatus": status, "ok": False, "logid": _trim(logid, 120), "url": _safe_url(url), "reason": f"response_body_unavailable: {error}"}
         finally:
             pending.pop(request_id, None)
+            observer_activity.set()
 
     def on_loading_finished(params):
         request_id = params.get("requestId")
-        if request_id in pending:
-            asyncio.create_task(fetch_body(request_id))
+        if request_id in pending and not finalized:
+            task = _track_browser_operation(
+                asyncio.create_task(fetch_body(request_id)), owner=observer_owner
+            )
+            body_tasks.add(task)
+            def body_finished(done):
+                body_tasks.discard(done)
+                observer_activity.set()
+            task.add_done_callback(body_finished)
+            observer_activity.set()
 
     session.on("Network.requestWillBeSent", on_request)
     session.on("Network.responseReceived", on_response)
     session.on("Network.loadingFinished", on_loading_finished)
 
     async def summary(extra_wait_seconds=3):
-        if extra_wait_seconds:
-            await asyncio.sleep(extra_wait_seconds)
+        nonlocal finalized, finalized_summary
+        if finalized_summary is not None:
+            return deepcopy(finalized_summary)
+        deadline = asyncio.get_running_loop().time() + max(0, extra_wait_seconds)
         try:
-            await session.detach()
-        except Exception:
-            pass
-        return dict(state)
+            while True:
+                receipt = state["send_receipt"]
+                # A parsed response body is a definitive server receipt. Without
+                # one, retain the caller's existing budget for late CDP events.
+                if (state["send_response_seen"] and receipt
+                        and not receipt.get("pendingBody")):
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                observer_activity.clear()
+                # Do not lose an event that landed before the wait was armed.
+                receipt = state["send_receipt"]
+                if ((state["send_response_seen"] and receipt
+                     and not receipt.get("pendingBody")) or observer_activity.is_set()):
+                    continue
+                try:
+                    await asyncio.wait_for(observer_activity.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+            # Do not extend the pre-existing receipt budget: readers that did
+            # not finish within it are cooperatively cancelled and stay owned
+            # by the account until they actually acknowledge cancellation.
+            for task in tuple(body_tasks):
+                if not task.done():
+                    task.cancel()
+        finally:
+            # Cancellation of the summary is also a reader shutdown request.
+            # It is deliberately non-blocking: an uncooperative reader remains
+            # in the account owner set and therefore prevents lock release.
+            for task in tuple(body_tasks):
+                if not task.done():
+                    task.cancel()
+            finalized = True
+            # A finalized observer must not accept a late response body into a
+            # later summary, nor keep receiving future CDP events.
+            for event, callback in (
+                ("Network.requestWillBeSent", on_request),
+                ("Network.responseReceived", on_response),
+                ("Network.loadingFinished", on_loading_finished),
+            ):
+                try:
+                    session.remove_listener(event, callback)
+                except Exception:
+                    pass
+            finish_diagnostics()
+            finalized_summary = deepcopy(state)
+            try:
+                await session.detach()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        return deepcopy(finalized_summary)
 
     return summary
 
@@ -1370,7 +1546,9 @@ async def _locator_count_with_timeout(locator, account_name, stage, label, timeo
 
 async def _first_non_empty_locator(page, selectors):
     for selector in selectors:
-        locator = page.locator(selector)
+        # Cached inactive tabs may precede the active list in DOM order.
+        # Filter before the bounded probe, and return only visible rows.
+        locator = page.locator(selector).filter(visible=True)
         count = await _locator_count_with_timeout(
             locator,
             "unknown",
@@ -1996,12 +2174,8 @@ async def _reopen_friend_chat_page(page, account_name):
         account_name,
     )
     await _dismiss_non_login_dialogs(page, account_name, "before_reopen_chat_page")
-    try:
-        await page.reload(wait_until="load", timeout=120000)
-        await asyncio.sleep(2)
-    except Exception as exc:
-        logger.warning("Account %s reload before reopen chat page failed: %s", account_name, exc)
-
+    # One navigation path is sufficient; a preceding reload initializes the
+    # same chat twice and adds another failure/timeout opportunity.
     await _navigate_with_retries(
         "reopen chat page after friend list wait",
         page.goto,
@@ -2162,7 +2336,7 @@ async def _scan_delivery_targets(page, user, account_name, targets,
     if _is_fallback_run():
         now = datetime.now(_schedule_timezone())
         retry_targets = [t for t in targets
-                         if refusal_retry.explicit_8610(user, t, now)
+                         if refusal_retry.explicit_retryable_rejection(user, t, now)
                          and not refusal_retry.rejection_precedes_today(user, t, now)]
         normal_targets = [t for t in targets if t not in retry_targets]
         if normal_targets and retry_targets:
@@ -2512,6 +2686,7 @@ async def scroll_and_select_user(
             if matched_target_name and normalized_target_name in remaining_targets:
                 if normalized_target_name != next_target_key:
                     continue
+                action_report_gate.begin_target()
                 if parse_chat_target(matched_target_name)[0] == "group":
                     # Groups keep the previous name-based selection; their chat
                     # identity is checked after opening (bound group id), not here.
@@ -2695,7 +2870,7 @@ def _normalize_send_window(config):
             end_minutes = -1
     else:
         try:
-            end_minutes = int(raw.get("endHour", 18)) * 60
+            end_minutes = int(raw.get("endHour", 17)) * 60
         except (TypeError, ValueError):
             end_minutes = -1
     normalized = {
@@ -2848,7 +3023,21 @@ def _account_paused_by_failure_today(user, now):
     if (user.get("browser_cleanup_blocked")
             or (user.get("account_failure") or {}).get("category") == "browser_cleanup_blocked"):
         return True
+    from core import recovery_queue
+    if recovery_queue.enabled() and recovery_queue.account_blocked(user, now):
+        return True
     entry = _account_failure_entry_today(user, now)
+    if recovery_queue.enabled():
+        planned = user.get(recovery_queue.ACCOUNT_KEY) or {}
+        if (entry.get('category') in {'browser_stage_timeout', 'friend_list_unavailable',
+                                      'network_unavailable', 'browser_page_unavailable'}
+                and isinstance(planned, dict)
+                and _parse_sent_at(planned.get('sourceAt'), now.tzinfo) is not None
+                and _parse_sent_at(planned.get('sourceAt'), now.tzinfo)
+                == _parse_sent_at(entry.get('lastAttemptAt'), now.tzinfo)):
+            # The persisted random account delay replaces the old fixed hour;
+            # malformed/active planned state was already refused above.
+            return False
     if (entry.get("category") not in {"browser_stage_timeout", "browser_dialog_blocked"}
             and _coerce_attempt_count(entry) < _account_failure_pause_after_attempts()):
         return False
@@ -3052,6 +3241,9 @@ def _select_due_targets(user, send_window, now):
     if os.getenv("SPARKFLOW_8610_RETRY_ONLY") == "1":
         # Retired extra-pass mode must never bypass the final fallback policy.
         return [], [], [], _dedupe_group_target_aliases(list(user.get("targets") or []))
+    from core import recovery_queue, automatic_recovery
+    if recovery_queue.enabled() and _is_global_recovery_context():
+        return automatic_recovery.project_due(user, send_window, now)
     # Scheduler decisions must use the same group namespace/alias rules as the
     # browser sender, otherwise 群聊：/群聊: aliases can each be scheduled.
     targets = _dedupe_group_target_aliases(list(user.get("targets") or []))
@@ -3423,6 +3615,9 @@ def _persist_account_send_failure(user, category, reason, attempted_at, affected
         # the bounded retry policy; deleting nickname keys can expose stale
         # stable-id entries and make the planner disagree with dispatch.
         matched["account_failure"] = entry
+        from core import automatic_recovery
+        at = parse_sent_at(attempted_at, timezone.utc) or datetime.now(timezone.utc)
+        automatic_recovery.record_account_fault(matched, at, category, attempted_at)
         if category == "browser_cleanup_blocked":
             # Independent sticky safety state: late results must never clear it.
             matched.setdefault("browser_cleanup_blocked", dict(entry))
@@ -3648,7 +3843,13 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         if server_receipt:
             queue[target_name]["serverReceipt"] = server_receipt
         matched["failure_queue"] = queue
-        return (dict(queue[target_name]), dict(matched)), True
+        # Recovery reads may canonicalize the nickname key to a stable target
+        # identity in this same mapping. Capture the new receipt before that
+        # rekey, otherwise the transaction raises and loses the failure result.
+        saved_failure = dict(queue[target_name])
+        from core import automatic_recovery
+        automatic_recovery.record_refusal(matched, target_name, state_now)
+        return (saved_failure, dict(matched)), True
 
     saved = update_user_data(mutate, force_reload=True)
     if saved is None:
@@ -3882,6 +4083,9 @@ def _persist_browser_send_success(
         matched["message_history"] = history
         streak_state.clear_failure_entries(matched, target_name)
         matched.pop("account_failure", None)
+        from core import recovery_queue
+        if strong_receipt and recovery_queue.enabled():
+            recovery_queue.finish_target(matched, target_name, state_now)
         return dict(matched), True
 
     matched_account = update_user_data(mutate, force_reload=True)
@@ -3997,7 +4201,7 @@ def _split_sender_modes(active_config, runnable_user_data):
             if (
                 target_kind == "group"
                 or account_requires_browser
-                or (refusal_retry.explicit_8610(user, target, now)
+                or (refusal_retry.explicit_retryable_rejection(user, target, now)
                     and not refusal_retry.rejection_precedes_today(user, target, now))
             ):
                 browser_targets.append(target)
@@ -4031,7 +4235,9 @@ def _browser_login_generation_current(user):
 
 async def _dispatch_browser_enter_if_current(user, chat_input):
     # Read inside the dispatch task, not before it is queued by the stage wrapper.
-    if (send_pause.should_pause_sending() or not personal_streak.authorized(user)
+    from core import automatic_recovery
+    if (not automatic_recovery.dispatch_allowed(user)
+            or send_pause.should_pause_sending() or not personal_streak.authorized(user)
             or not personal_streak.within_send_window(user)
             or not _browser_login_generation_current(user)):
         return False
@@ -4050,6 +4256,11 @@ def _mark_browser_target_in_flight(
     effective_run_id = str(run_id or _ACTIVE_RUN_ID or "")
     if not effective_run_id:
         return False
+    from core import automatic_recovery, recovery_queue
+    if user.get(automatic_recovery.TICKET):
+        return automatic_recovery.claim(user, target_name, effective_run_id)
+    if recovery_queue.enabled() and os.getenv('SPARKFLOW_RECOVERY_PASS') == '1':
+        return False  # A recovery tick requires its single-target ticket.
     from core import refusal_retry
     now = datetime.now(_schedule_timezone())
     scope_ok, schedule_timezone = _sender_scope_timezone(user)
@@ -4278,7 +4489,9 @@ def _append_streak_run_report(
         )
         for target_name in account.get("targets") or []:
             state = streak_state.target_state(account, target_name, completed_at)
-            history_entry = dict(account.get("message_history") or {}).get(target_name) or {}
+            history_entry = streak_state.history_entry(
+                account, target_name, completed_at.tzinfo
+            )
             report_sent_at = parse_sent_at(history_entry.get("sentAt"), timezone.utc)
             if report_sent_at and not streak_state.same_calendar_day(report_sent_at, completed_at):
                 report_sent_at = None
@@ -4425,6 +4638,13 @@ async def run_browser_tasks(
     if send_pause.should_pause_sending():
         logger.info("Skipping browser sender: sending is temporarily paused")
         return
+    from core import recovery_queue
+    ticket = next((user.get('_automatic_recovery') for user in browser_user_data
+                   if user.get('_automatic_recovery')), None)
+    if not recovery_queue.allowed_now(
+            datetime.now(_schedule_timezone()), day=ticket.get('day') if ticket else None):
+        logger.info('Skipping browser sender: daily sending protection')
+        return
     if browser_user_data and not all("_personal_scope" in user for user in browser_user_data):
         groups = personal_streak.account_groups(active_config, browser_user_data, manual=True)
         if not groups or any("_personal_scope" in user for _, accounts in groups for user in accounts):
@@ -4455,7 +4675,10 @@ async def _run_browser_tasks(
         network_mode = douyin_network_modes()[0]
     else:
         # Retain the established disposable-context preflight for legacy runs.
-        network_mode = await select_douyin_network_mode(CREATOR_HOME_URL)
+        network_mode = await select_douyin_network_mode(
+            CREATOR_HOME_URL,
+            profile_name=_account_profile_name(browser_user_data[0]),
+        )
     logger.info("Selected Douyin task network route=%s", network_mode)
     semaphore = asyncio.Semaphore(active_config["taskCount"] if active_config["multiTask"] else 1)
     tasks = []
@@ -4491,35 +4714,28 @@ async def _run_browser_tasks(
         await asyncio.gather(*tasks)
         return
 
-    playwright, browser = await get_browser(network_mode=network_mode)
-    try:
-        for user in browser_user_data:
-            logger.info(
-                "Using browser sender for user=%s targetCount=%s",
-                user.get("username", "unknown"),
-                len(user["targets"]),
+    for user in browser_user_data:
+        logger.info(
+            "Using browser sender for user=%s targetCount=%s",
+            user.get("username", "unknown"),
+            len(user["targets"]),
+        )
+        tasks.append(
+            do_user_task(
+                None,
+                user,
+                semaphore,
+                send_strategy,
+                profile_config,
+                friend_scan_config,
+                network_mode,
+                run_id=run_id,
+                fallback=fallback,
+                allow_retry=allow_retry,
             )
-            tasks.append(
-                do_user_task(
-                    browser,
-                    user,
-                    semaphore,
-                    send_strategy,
-                    profile_config,
-                    friend_scan_config,
-                    network_mode,
-                    run_id=run_id,
-                    fallback=fallback,
-                    allow_retry=allow_retry,
-                )
-            )
+        )
 
-        await asyncio.gather(*tasks)
-    finally:
-        try:
-            await browser.close()
-        finally:
-            await playwright.stop()
+    await asyncio.gather(*tasks)
 
 
 async def do_user_task(
@@ -4682,6 +4898,7 @@ async def _do_user_task_locked(
         return
 
     owned_playwright = None
+    owned_browser = None
     profile_dir = None
     context = None
     cookie_session = None
@@ -4701,19 +4918,28 @@ async def _do_user_task_locked(
                 "seed_cookies", prepare_profile_cookies(context, user, profile_config, profile_dir))
             _adopt_cookie_session_snapshot(user, cookie_session)
         else:
+            owned_playwright, owned_browser = await get_browser(
+                network_mode=network_mode,
+                profile_name=_account_profile_name(user),
+            )
+            browser = owned_browser
             context = await browser.new_context()
 
         session_state["launch_pending"] = False
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)
     except BaseException:
-        await _cleanup_browser_session(None, context, owned_playwright, session_state)
+        await _cleanup_browser_session(
+            None, context, owned_playwright, session_state, browser=owned_browser
+        )
         raise
     yielded_targets = set()
     group_scan_errors = []
     persisted_group_error_targets = set()
     page = None
     uid_collector = None
+    session_diagnostics = None
+    action_gate = None
     home_navigation = {"tracking": False, "committed": False, "completed": False}
 
     def note_home_commit(_frame):
@@ -4721,6 +4947,12 @@ async def _do_user_task_locked(
 
     try:
         page = await _run_browser_stage("new_page", context.new_page())
+        # Observe startup/navigation faults too, before any visit or target scan.
+        # The separate attempt collector/receipt and all send guards stay intact.
+        from core.send_diagnostics import attach_passive_send_diagnostics
+        session_diagnostics = attach_passive_send_diagnostics(page)
+        action_gate = action_report_gate.attach(page)
+        await _run_browser_stage("attach_session_console", session_diagnostics.enable_cdp_console())
         # Passively read the friend uids the chat page requests by itself; no
         # request is built or replayed here.
         uid_collector = friend_identity.UserDetailCollector(account_name, purpose="send").attach(page)
@@ -4756,6 +4988,10 @@ async def _do_user_task_locked(
                 delay=5,
                 url=CREATOR_CHAT_URL,
             )
+            from core import recovery_queue
+            if recovery_queue.enabled():
+                from core.page_readiness import ensure_chat_page_ready
+                await ensure_chat_page_ready(page, account_name)
             await asyncio.sleep(3)
             await _run_browser_stage("login_check", ensure_not_login_required(page, account_name, "open_chat_page"))
             cookie_export_safe = True
@@ -4817,7 +5053,7 @@ async def _do_user_task_locked(
                     if parse_chat_target(target_name)[0] != "group":
                         await _require_friend_chat(page, user, target_name, wait=True)
 
-                    previous_entry = dict(user.get("message_history") or {}).get(target_name) or {}
+                    previous_entry = streak_state.history_entry(user, target_name, schedule_now.tzinfo)
                     previous_message = str(previous_entry.get("message") or "")
                     message = build_message(previous_message=previous_message, last_message=last_message)
                     last_message = message
@@ -4853,11 +5089,7 @@ async def _do_user_task_locked(
                             target_name,
                         )
                         continue
-                    lines = message.split("\n")
-                    for index, line in enumerate(lines):
-                        await _run_browser_stage("type_message", chat_input.type(line, delay=50))
-                        if index < len(lines) - 1:
-                            await _run_browser_stage("type_newline", chat_input.press("Shift+Enter"))
+                    await _type_browser_message_checked(chat_input, message)
 
                     await _run_browser_stage("debug_typed", save_debug_artifacts(page, account_name, target_name, "typed-message"))
 
@@ -4925,6 +5157,16 @@ async def _do_user_task_locked(
                             logger.error("Aborting before Enter: durable resend barrier unavailable")
                             return
                         await _require_friend_chat(page, user, target_name, arm=True)
+                    if action_gate is not None:
+                        gate_result = await _run_browser_stage("action_report_gate", action_gate.ensure_before_enter())
+                        logger.info(
+                            "Action report gate for %s/%s status=%s waited_ms=%s reports=%s",
+                            account_name,
+                            target_name,
+                            gate_result.get("status"),
+                            gate_result.get("waited_ms"),
+                            gate_result.get("reports"),
+                        )
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
                     if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input)):
                         cookie_export_safe = False
@@ -5172,6 +5414,20 @@ async def _do_user_task_locked(
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
             _browser_not_started_targets(user, targets))
     finally:
+        if action_gate is not None:
+            try:
+                action_gate.close()
+                logger.info("Action report gate summary for %s: %s", account_name, json.dumps(action_gate.snapshot(), ensure_ascii=True, sort_keys=True))
+            except Exception as exc:
+                logger.warning("Action report gate cleanup failed: %s", type(exc).__name__)
+        if session_diagnostics is not None:
+            try:
+                session_diagnostics.close()
+                logger.info("Passive browser session diagnostics for %s: %s", account_name,
+                            json.dumps(session_diagnostics.snapshot(), ensure_ascii=True, sort_keys=True))
+            except Exception as exc:
+                # Diagnostic publication must never bypass normal cleanup.
+                logger.warning("Passive session diagnostic publication failed: %s", type(exc).__name__)
         try:
             if (cookie_session is not None and cookie_export_safe
                     and profile_config["refreshStoredCookiesAfterLogin"]):
@@ -5193,7 +5449,13 @@ async def _do_user_task_locked(
                     )
             finally:
                 # A cancelled export/reader must still close the browser session.
-                await _cleanup_browser_session(page, context, owned_playwright, session_state)
+                await _cleanup_browser_session(
+                    page,
+                    context,
+                    owned_playwright,
+                    session_state,
+                    browser=owned_browser,
+                )
 
 
 async def runTasks():
@@ -5202,6 +5464,11 @@ async def runTasks():
         logger.info("Skipping task run: sending is temporarily paused")
         return "skipped_sending_paused"
     active_config = get_config(force_reload=True)
+    from core import recovery_queue, automatic_recovery
+    if recovery_queue.enabled(active_config) and _is_global_recovery_context():
+        return await automatic_recovery.run(
+            active_config, reconcile_only=os.getenv('SPARKFLOW_RECONCILE_ONLY') == '1',
+            close=os.getenv('SPARKFLOW_RECOVERY_CLOSE') == '1')
     all_user_data = get_userData(force_reload=True)
     requested_refs = _requested_account_refs()
     if requested_refs is not None:

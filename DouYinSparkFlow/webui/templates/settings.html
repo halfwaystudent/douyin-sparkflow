@@ -97,7 +97,7 @@
           method="post"
           action="/ops/run-failed"
           data-confirm-title="补发异常目标"
-          data-confirm="将补发 {{ summary.today_attention_targets }} 个异常目标。确认继续吗？"
+          data-confirm="将检查可重试的异常目标；显示数量不等于实际发送数。结果不明的目标不会自动重发。确认继续吗？"
           data-confirm-accept="开始补发"
           data-confirm-tone="primary"
         >

@@ -464,10 +464,11 @@ class WebUiSafetyTests(unittest.TestCase):
 
     def test_login_workspace_contains_mobile_qr_controls(self):
         page = (Path(app_module.TEMPLATES_DIR) / "login_workspace.html").read_text(encoding="utf-8")
+        controller = (Path(app_module.STATIC_DIR) / "login-workspace.js").read_text(encoding="utf-8")
         self.assertIn("data-login-qr", page)
         self.assertIn("data-refresh-login-qr", page)
-        self.assertIn('data-open-login-qr hidden', page)
-        self.assertNotIn('href="/login-desktop/qr"', page)
+        self.assertIn('fetch(`/login-desktop/qr?t=${Date.now()}`', controller)
+        self.assertIn('fetch("/login-desktop/qr/refresh"', controller)
 
     def test_login_workspace_loads_inside_dashboard_frame(self):
         script = (Path(app_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
@@ -480,7 +481,7 @@ class WebUiSafetyTests(unittest.TestCase):
         self.assertIn("new URL(configuredPublicUrl, window.location.href).href", script)
         self.assertIn("refreshLoginQr(500)", block)
         self.assertIn('data.state === "queued"', block)
-        self.assertIn("renderWorkspace(data.workspace)", block)
+        self.assertRegex(block, r"renderWorkspace\(data\.workspace(?:,\s*data\.desktop)?\)")
         self.assertIn("retries - 1", script)
         self.assertIn('/login-desktop/qr/refresh', script)
 
@@ -527,7 +528,7 @@ class WebUiSafetyTests(unittest.TestCase):
         block = script[block_start:script.index('document.querySelectorAll("[data-focus-native-browser]")', block_start)]
         guard = block.index("if (lastPromotedTicket === promotedBefore) {")
         self.assertLess(guard, block.index("loadFrame(true)"))
-        self.assertLess(block.index("const promotedBefore = lastPromotedTicket;"), block.index("renderWorkspace(data.workspace)"))
+        self.assertLess(block.index("const promotedBefore = lastPromotedTicket;"), block.index("renderWorkspace(data.workspace"))
 
     def test_qr_proxy_waits_upstream_and_open_does_not_block(self):
         source = Path(app_module.__file__).read_text(encoding="utf-8")
@@ -658,7 +659,7 @@ class WebUiSafetyTests(unittest.TestCase):
         promote_block = script[script.index("if (promoted) {"):script.index("if (displayMode === \"native\") {")]
         self.assertIn("qrPollStartedAt = Date.now()", promote_block)
         apply_fn = script[script.index("const applyWorkspace"):script.index("const acquireWorkspace")]
-        self.assertIn("renderWorkspace(trackWorkspace(data.workspace))", apply_fn)
+        self.assertRegex(apply_fn, r"renderWorkspace\(trackWorkspace\(data\.workspace\)(?:,\s*data\.desktop \|\| null)?\)")
         # Every deliberate user action renews the budget.
         self.assertGreaterEqual(script.count("resetRecoveryBudget()"), 4)
         self.assertNotIn("requestQrRefresh({", script)

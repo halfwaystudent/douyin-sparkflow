@@ -1,0 +1,45 @@
+{
+  "x-optional-engine-note": "Example only; JSON-compatible YAML. Default OFF. Rebuild the matching login image and complete offline profile migration before enabling. Does not change the base compose file.",
+  "services": {
+    "web": {
+      "environment": {
+        "SPARKFLOW_FINGERPRINT_BROWSER_ENABLED": "${SPARKFLOW_FINGERPRINT_BROWSER_ENABLED:-0}",
+        "SPARKFLOW_BROWSER_ENGINE_POLICY_FILE": "/run/browser-engine/policy.json"
+      },
+      "volumes": [
+        "./state/browser-engine:/run/browser-engine:ro",
+        "./state/browser-binaries:/opt/sparkflow-browser-binaries:ro"
+      ]
+    },
+    "login-desktop": {
+      "environment": {
+        "SPARKFLOW_FINGERPRINT_BROWSER_ENABLED": "${SPARKFLOW_FINGERPRINT_BROWSER_ENABLED:-0}",
+        "SPARKFLOW_BROWSER_ENGINE_POLICY_FILE": "/run/browser-engine/policy.json"
+      },
+      "volumes": [
+        "./state/browser-engine:/run/browser-engine:ro",
+        "./state/browser-binaries:/opt/sparkflow-browser-binaries:ro"
+      ]
+    },
+    "scheduler": {
+      "environment": {
+        "SPARKFLOW_FINGERPRINT_BROWSER_ENABLED": "${SPARKFLOW_FINGERPRINT_BROWSER_ENABLED:-0}",
+        "SPARKFLOW_BROWSER_ENGINE_POLICY_FILE": "/run/browser-engine/policy.json"
+      },
+      "volumes": [
+        "./state/browser-engine:/run/browser-engine:ro",
+        "./state/browser-binaries:/opt/sparkflow-browser-binaries:ro"
+      ]
+    },
+    "task": {
+      "environment": {
+        "SPARKFLOW_FINGERPRINT_BROWSER_ENABLED": "${SPARKFLOW_FINGERPRINT_BROWSER_ENABLED:-0}",
+        "SPARKFLOW_BROWSER_ENGINE_POLICY_FILE": "/run/browser-engine/policy.json"
+      },
+      "volumes": [
+        "./state/browser-engine:/run/browser-engine:ro",
+        "./state/browser-binaries:/opt/sparkflow-browser-binaries:ro"
+      ]
+    }
+  }
+}

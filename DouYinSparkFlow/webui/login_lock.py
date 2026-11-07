@@ -162,6 +162,26 @@ def find_request(state: dict, *, username: str, session_id: str) -> tuple[str, d
     return "none", None, -1
 
 
+def _same_request_context(item: dict, *, account_ref: str, login_generation: str, mode: str) -> bool:
+    """Keep one owner from silently reusing a workspace for another login."""
+    requested_mode = mode if mode in {"relogin", "add"} else "relogin"
+    return (
+        str(item.get("mode") or "relogin") == requested_mode
+        and str(item.get("account_ref") or "") == str(account_ref or "")
+        and str(item.get("login_generation") or "") == str(login_generation or "")
+    )
+
+
+def _context_conflict(kind: str, position: int, existing: dict, state: dict) -> dict:
+    return {
+        "state": "conflict",
+        "current_state": kind,
+        "position": position,
+        "request": deepcopy(existing),
+        "workspace": state,
+    }
+
+
 def request_workspace(*, username: str, session_id: str, account_ref: str = "", login_generation: str = "", mode: str = "relogin") -> dict:
     with _MUTEX:
         state = _normalize_state(_read_raw())
@@ -170,6 +190,8 @@ def request_workspace(*, username: str, session_id: str, account_ref: str = "", 
             queue = state.setdefault("queue", [])
             kind, existing, position = find_request(state, username=username, session_id=session_id)
             if kind == "queued":
+                if not _same_request_context(existing, account_ref=account_ref, login_generation=login_generation, mode=mode):
+                    return _context_conflict(kind, position, existing, state)
                 return {"state": "queued", "position": position, "request": deepcopy(existing), "workspace": state}
             if len(queue) >= QUEUE_MAX_SIZE:
                 return {"state": "full", "position": -1, "request": None, "workspace": state}
@@ -182,10 +204,14 @@ def request_workspace(*, username: str, session_id: str, account_ref: str = "", 
         elif state.get("active") and not _expired(state["active"], now):
             kind, existing, position = find_request(state, username=username, session_id=session_id)
             if kind == "active":
+                if not _same_request_context(existing, account_ref=account_ref, login_generation=login_generation, mode=mode):
+                    return _context_conflict(kind, position, existing, state)
                 existing["last_heartbeat_at"] = now
                 _write_state(state)
                 return {"state": "active", "position": 0, "request": deepcopy(existing), "workspace": state}
             if kind == "queued":
+                if not _same_request_context(existing, account_ref=account_ref, login_generation=login_generation, mode=mode):
+                    return _context_conflict(kind, position, existing, state)
                 return {"state": "queued", "position": position, "request": deepcopy(existing), "workspace": state}
             queue = state.setdefault("queue", [])
             if len(queue) >= QUEUE_MAX_SIZE:

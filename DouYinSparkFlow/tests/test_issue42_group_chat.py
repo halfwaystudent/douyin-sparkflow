@@ -100,8 +100,20 @@ class GroupChatTargetTests(unittest.TestCase):
             cookies=AsyncMock(return_value=[COOKIE]),
             close=AsyncMock(),
         )
-        browser = Mock(new_context=AsyncMock(return_value=context))
-        chat_input = Mock(type=AsyncMock(), press=AsyncMock(side_effect=press_side_effect))
+        browser = Mock(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        runtime = Mock(stop=AsyncMock())
+        editor = {'text': ''}
+
+        async def typed(text, **_kwargs):
+            editor['text'] += text
+
+        async def cleared(text):
+            editor['text'] = text
+
+        chat_input = Mock(type=AsyncMock(side_effect=typed),
+                          press=AsyncMock(side_effect=press_side_effect),
+                          fill=AsyncMock(side_effect=cleared),
+                          evaluate=AsyncMock(side_effect=lambda *_args: editor['text']))
         collector = Mock(aclose=AsyncMock(return_value=True), pending_tasks=Mock(return_value=()))
         collector.attach.return_value = collector
 
@@ -115,10 +127,15 @@ class GroupChatTargetTests(unittest.TestCase):
                 return update_handler(mutate, user, **_kwargs)
             return mutate([user])[0]
 
+        from core import profile_cookies
         with (
-            patch.object(tasks, "_sleep_with_log", new=AsyncMock()),
-            patch.object(tasks, "retry_operation", new=AsyncMock()),
-            patch.object(tasks, "ensure_not_login_required", new=AsyncMock()),
+            # Synthetic sender fixtures must not start a real browser.
+            patch.object(tasks, 'get_browser', new=AsyncMock(return_value=(runtime, browser))),
+            patch.object(profile_cookies, 'get_userData', side_effect=lambda **_kw: [user]),
+            patch.object(profile_cookies, 'update_user_data', side_effect=persist),
+            patch.multiple(tasks, _sleep_with_log=AsyncMock(),
+                           retry_operation=AsyncMock(), ensure_not_login_required=AsyncMock(),
+                           _verify_open_group_conversation=self.verify),
             patch.object(tasks, "scroll_and_select_user", new=selected),
             patch.object(tasks, "locate_chat_input", new=AsyncMock(return_value=(chat_input, "input"))),
             patch.object(tasks, "build_message", return_value="hello"),
@@ -136,7 +153,6 @@ class GroupChatTargetTests(unittest.TestCase):
                 side_effect=readback_handler or (lambda **_kwargs: [user]),
             ),
             patch.object(tasks.friend_identity, "UserDetailCollector", return_value=collector),
-            patch.object(tasks, "_verify_open_group_conversation", new=self.verify),
             patch.object(tasks.personal_streak, "within_send_window", return_value=within_send_window),
         ):
             try:
@@ -229,14 +245,6 @@ class GroupChatTargetTests(unittest.TestCase):
 
         self.assertEqual(0, self.verify.await_count)
         self.assertEqual(1, chat_input.press.await_count)
-
-    def test_end_time_gate_stops_queued_browser_send_before_enter(self):
-        _user, chat_input = self._run_group_send_until_press(
-            None,
-            within_send_window=False,
-        )
-
-        chat_input.press.assert_not_awaited()
 
     def test_storage_failure_prevents_enter_dispatch(self):
         _user, chat_input = self._run_group_send_until_press(
@@ -908,6 +916,15 @@ class GroupChatTargetTests(unittest.TestCase):
 
         self.assertEqual(["群聊：目标群"], selected)
         self.assertEqual(1, row.clicks)
+
+    def test_end_time_gate_stops_queued_browser_send_before_enter(self):
+        _user, chat_input = self._run_group_send_until_press(
+            None,
+            within_send_window=False,
+        )
+
+        chat_input.press.assert_not_awaited()
+
 
 
 if __name__ == "__main__":

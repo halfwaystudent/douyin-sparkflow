@@ -25,6 +25,7 @@ from filelock import Timeout as StorageLockTimeout
 
 from core import identity as account_identity
 from core import streak_state
+from core.browser_engine import fingerprint_browser_enabled, resolve_browser_engine
 from core.cookies import (
     CookieParseError,
     cookie_summary,
@@ -1424,6 +1425,15 @@ def create_app():
             path = urlunsplit(("", "", parts.path, urlencode(query), ""))
         return RedirectResponse(url=path, status_code=status_code)
 
+    @app.get("/login#account-{unique_id}", include_in_schema=False)
+    async def legacy_login_account_fragment(request: Request, unique_id: str):
+        """Translate only the mobile client's encoded numeric login anchor."""
+        if request.query_params or not (
+            unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32
+        ):
+            return Response(status_code=404)
+        return redirect(f"/ops/send-console?_anchor=account-{unique_id}")
+
     @app.get("/settings#notify", include_in_schema=False)
     async def legacy_notify_fragment(request: Request):
         if not principal(request):
@@ -2402,22 +2412,48 @@ def create_app():
         current = account_by_ref(get_userData(force_reload=True), snapshot.get("account_ref", ""))
         return account_identity.same_login_snapshot(current, snapshot)
 
-    def _finish_friend_job(account_ref, normalized_id, **fields):
-        job = friend_refresh_jobs.get(account_ref)
-        if job is not None:
-            job.update(fields)
-            job["finishedAt"] = datetime.now().isoformat(timespec="seconds")
+    def _finish_friend_job(account_ref, normalized_id, snapshot, *, job=None, remove=False, **fields):
+        """Finish only the exact refresh job that installed this marker."""
+        current_job = friend_refresh_jobs.get(account_ref)
+        if (
+            current_job is None
+            or current_job is not job
+            or not account_identity.same_login_snapshot(current_job, snapshot)
+        ):
+            return False
+        if remove:
+            friend_refresh_jobs.pop(account_ref, None)
+        else:
+            current_job.update(fields)
+            current_job["finishedAt"] = datetime.now().isoformat(timespec="seconds")
         _friend_refresh_active.discard(normalized_id)
+        return True
 
-    async def _run_friend_refresh_job(normalized_id, account, username, *, account_ref=None):
+    async def _run_friend_refresh_job(normalized_id, account, username, *, account_ref=None, job=None):
         account = dict(account, _refresh_snapshot=account_identity.login_snapshot(account))
         account_ref = str(account_ref or account["_refresh_snapshot"].get("account_ref") or "")
         if not account_ref:
             _friend_refresh_active.discard(normalized_id)
             return
-        def on_progress(collected):
+        if job is None:
             job = friend_refresh_jobs.get(account_ref)
-            if job is not None:
+
+        def cleanup_cancelled_job(done):
+            if done.cancelled():
+                _finish_friend_job(
+                    account_ref,
+                    normalized_id,
+                    account["_refresh_snapshot"],
+                    job=job,
+                    remove=True,
+                )
+
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.add_done_callback(cleanup_cancelled_job)
+
+        def on_progress(collected):
+            if job is not None and friend_refresh_jobs.get(account_ref) is job:
                 job["stage"] = "collecting"
                 job["collected"] = int(collected)
 
@@ -2426,6 +2462,15 @@ def create_app():
                 fetch_account_friends(account, on_progress=on_progress),
                 timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            _finish_friend_job(
+                account_ref,
+                normalized_id,
+                account["_refresh_snapshot"],
+                job=job,
+                remove=True,
+            )
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "Async friend refresh timed out for %s after %ss",
@@ -2435,7 +2480,8 @@ def create_app():
             # Exceeding the read budget is an incomplete read, not a transport
             # failure, so the console reports it the same way as a stalled scan.
             _finish_friend_job(
-                account_ref, normalized_id,
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
                 state="failed",
                 stage="incomplete",
                 **_incomplete_scan_fields(
@@ -2453,7 +2499,8 @@ def create_app():
                 exc,
             )
             _finish_friend_job(
-                account_ref, normalized_id,
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
                 state="failed",
                 stage="failed",
                 error=str(exc),
@@ -2472,7 +2519,8 @@ def create_app():
                 exc_info=True,
             )
             _finish_friend_job(
-                account_ref, normalized_id,
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
                 state="failed",
                 stage="failed",
                 error=str(exc),
@@ -2495,7 +2543,8 @@ def create_app():
                 scan_reason or "-",
             )
             _finish_friend_job(
-                account_ref, normalized_id,
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
                 state="failed",
                 stage="incomplete",
                 **_incomplete_scan_fields(scan_reason),
@@ -2510,7 +2559,8 @@ def create_app():
                 len(previous_cache),
             )
             _finish_friend_job(
-                account_ref, normalized_id,
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
                 state="failed",
                 stage="empty",
                 error="本次没有读到任何好友，已保留上一次的好友数据；请稍后重试，或先确认该账号登录态。",
@@ -2522,7 +2572,7 @@ def create_app():
 
         updated_at = datetime.now().isoformat(timespec="seconds")
         if not await asyncio.to_thread(_write_friend_cache, account_ref, friends, updated_at, account["_refresh_snapshot"]):
-            _finish_friend_job(account_ref, normalized_id, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
+            _finish_friend_job(account_ref, normalized_id, account["_refresh_snapshot"], job=job, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
             return
 
         index_updated = False
@@ -2544,11 +2594,12 @@ def create_app():
         identity = await asyncio.to_thread(_record_friend_identity, account, friends) if index_updated else {}
 
         if not await asyncio.to_thread(_refresh_snapshot_is_current, account["_refresh_snapshot"]):
-            _finish_friend_job(account_ref, normalized_id, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
+            _finish_friend_job(account_ref, normalized_id, account["_refresh_snapshot"], job=job, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
             return
 
         _finish_friend_job(
-            account_ref, normalized_id,
+            account_ref, normalized_id, account["_refresh_snapshot"],
+            job=job,
             state="done",
             stage="done",
             friends=list(friends),
@@ -2559,6 +2610,16 @@ def create_app():
             message=f"已刷新 {len(friends)} 个好友"
             + ("，并已重建发送索引" if index_updated else ""),
         )
+
+    def _launch_friend_refresh_task(runner, normalized_id, account, username, *, account_ref, job):
+        """Install cancellation ownership before the coroutine can first run."""
+        snapshot = account_identity.login_snapshot(account)
+        task = asyncio.create_task(runner(normalized_id, account, username, account_ref=account_ref, job=job))
+        def cleanup_prestart_cancel(done):
+            if done.cancelled():
+                _finish_friend_job(account_ref, normalized_id, snapshot, job=job, remove=True)
+        task.add_done_callback(cleanup_prestart_cancel)
+        return task
 
     def _start_friend_refresh_if_free(normalized_id, account, username):
         """Start the background friend refresh when nothing blocks it.
@@ -2577,7 +2638,7 @@ def create_app():
         if not account_ref:
             return "skipped"
         _friend_refresh_active.add(normalized_id)
-        friend_refresh_jobs[account_ref] = {
+        job = {
             **account_identity.login_snapshot(account),
             "state": "running",
             "stage": "starting",
@@ -2585,8 +2646,10 @@ def create_app():
             "startedAt": datetime.now().isoformat(timespec="seconds"),
             "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
         }
-        asyncio.create_task(
-            _run_friend_refresh_job(normalized_id, dict(account), str(username or ""), account_ref=account_ref)
+        friend_refresh_jobs[account_ref] = job
+        _launch_friend_refresh_task(
+            _run_friend_refresh_job, normalized_id, dict(account), str(username or ""),
+            account_ref=account_ref, job=job,
         )
         return "started"
 
@@ -2685,7 +2748,7 @@ def create_app():
                 if not saved_ref:
                     return
                 _friend_refresh_active.add(normalized_id)
-                friend_refresh_jobs[saved_ref] = {
+                job = {
                     **account_identity.login_snapshot(saved),
                     "state": "running",
                     "stage": "starting",
@@ -2693,7 +2756,8 @@ def create_app():
                     "startedAt": datetime.now().isoformat(timespec="seconds"),
                     "previousUpdatedAt": saved.get("friends_cache_updated_at", ""),
                 }
-                await _run_friend_refresh_job(normalized_id, saved, "", account_ref=saved_ref)
+                friend_refresh_jobs[saved_ref] = job
+                await _run_friend_refresh_job(normalized_id, saved, "", account_ref=saved_ref, job=job)
 
     def _queue_login_verification(account_ref, token, generation="", *, delay=0):
         task = asyncio.create_task(
@@ -2765,7 +2829,7 @@ def create_app():
             )
 
         _friend_refresh_active.add(normalized_id)
-        friend_refresh_jobs[account_ref] = {
+        job = {
             **account_identity.login_snapshot(account),
             "state": "running",
             "stage": "starting",
@@ -2773,8 +2837,10 @@ def create_app():
             "startedAt": datetime.now().isoformat(timespec="seconds"),
             "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
         }
-        asyncio.create_task(
-            _run_friend_refresh_job(normalized_id, dict(account), principal(request).get("username", ""), account_ref=account_ref)
+        friend_refresh_jobs[account_ref] = job
+        _launch_friend_refresh_task(
+            _run_friend_refresh_job, normalized_id, dict(account), principal(request).get("username", ""),
+            account_ref=account_ref, job=job,
         )
         return JSONResponse(
             {"ok": True, "state": "running", "job": dict(friend_refresh_jobs[account_ref])},
@@ -3695,6 +3761,18 @@ def create_app():
                 flash(request, "当前密码不正确或尝试次数过多，设置未保存。", "error")
                 return redirect("/settings#system")
 
+        ui_port = None
+        if "ui_port" in form:
+            port_text = str(form.get("ui_port", "")).strip()
+            try:
+                ui_port = int(port_text)
+            except (TypeError, ValueError):
+                flash(request, "管理面板端口必须是 1 到 65535 的整数，设置未保存。", "error")
+                return redirect("/settings#system")
+            if not 1 <= ui_port <= 65535:
+                flash(request, "管理面板端口必须在 1 到 65535 之间，设置未保存。", "error")
+                return redirect("/settings#system")
+
         def save_settings():
             from filelock import FileLock
             from utils.config import app_settings_path
@@ -3716,7 +3794,8 @@ def create_app():
                 network_mode = str(form.get("douyin_network_mode", settings.get("douyin_network_mode", "direct"))).strip().lower()
                 settings["douyin_network_mode"] = network_mode if network_mode in {"direct", "mihomo"} else "direct"
                 settings["douyin_proxy_url"] = str(form.get("douyin_proxy_url", settings.get("douyin_proxy_url", "http://proxy:7890"))).strip()
-                settings["ui_port"] = int(form.get("ui_port", settings.get("ui_port", 8787)))
+                if ui_port is not None:
+                    settings["ui_port"] = ui_port
                 new_password = str(form.get("new_password", ""))
                 confirm_new_password = str(form.get("confirm_password", ""))
                 if new_password:
@@ -3956,6 +4035,70 @@ def create_app():
     app.state.binding_operations = binding_operations
     cookie_verification_lock = asyncio.Lock()
 
+    def login_profile_continuity_enabled():
+        """Enable the account-profile rollout only where desktop supports it."""
+        return os.getenv("SPARKFLOW_LOGIN_PROFILE_CONTINUITY", "") == "1"
+
+    def account_profile_for_lease(lease, *, current=None):
+        """Build a desktop selector from the lease immutable account target."""
+        if not login_profile_continuity_enabled() or str(lease.get("mode") or "") != "relogin":
+            return None, ""
+        account_ref = str(lease.get("account_ref") or "")
+        generation = str(lease.get("login_generation") or "")
+        if not account_ref:
+            return None, "重新登录账号已失效，请重新打开页面。"
+        accounts, _ = ensure_account_refs(get_userData(force_reload=True))
+        account = account_by_ref(accounts, account_ref)
+        if not account or account_identity.account_login_generation(account) != generation:
+            return None, "账号已移除或登录已更新，请重新打开页面。"
+        if current is not None:
+            allowed = can_access_account(current, account)
+        else:
+            admin_name = str(get_app_settings().get("admin_username", "admin") or "admin")
+            owner = next((user for user in get_web_users() if user.get("username") == lease.get("username")), None)
+            allowed = str(lease.get("username") or "") == admin_name or bool(
+                owner and owner.get("enabled") and account_ref in set(owner.get("account_refs", []))
+            )
+        unique_id = normalize_unique_id(account.get("unique_id"))
+        if not allowed or not unique_id:
+            return None, "账号权限或身份已变化，请重新打开页面。"
+        return {"unique_id": unique_id, "account_ref": account_ref, "login_generation": generation}, ""
+
+    def engine_expectation_for_login(profile):
+        """Return the server-owned expectation without exposing launch details."""
+        if not fingerprint_browser_enabled():
+            return None
+        profile_name = f"uid-{profile['unique_id']}" if profile else None
+        return resolve_browser_engine(profile_name).expectation()
+
+    def desktop_login_view(payload):
+        """Return only the desktop state the workspace controller needs."""
+        if not isinstance(payload, dict):
+            return {}
+        return {key: payload[key] for key in ("profile_mode", "reusable_session", "state", "logged_in") if key in payload}
+
+    async def open_login_for_lease(lease, *, current=None):
+        profile, error = account_profile_for_lease(lease, current=current)
+        if error:
+            raise RuntimeError(error)
+        if (
+            fingerprint_browser_enabled()
+            and str(lease.get("mode") or "") == "relogin"
+            and not profile
+        ):
+            raise RuntimeError("指纹浏览器要求重新登录使用账号浏览器环境。")
+        payload = {"interaction_key": str(lease.get("ticket") or "")}
+        if profile:
+            payload["account_profile"] = profile
+        expectation = engine_expectation_for_login(profile)
+        if expectation is not None:
+            payload["engine_expectation"] = expectation
+        desktop = await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload=payload, timeout=90)
+        # A pre-rollout desktop can accept JSON while silently ignoring the selector.
+        if profile and desktop_login_view(desktop).get("profile_mode") != "account":
+            raise RuntimeError("登录桌面未启用账号浏览器环境，已安全取消本次重新登录。")
+        return desktop_login_view(desktop)
+
     def _workspace_payload(request):
         current = principal(request)
         state = get_workspace_state()
@@ -4003,8 +4146,23 @@ def create_app():
             promoted = finish_login_transition()
             if promoted:
                 try:
-                    await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={"interaction_key": promoted.get("ticket", "")}, timeout=90)
+                    await open_login_for_lease(promoted)
                 except RuntimeError as exc:
+                    # The account changed while queued, or an old desktop ignored
+                    # account_profile. The failed opener may already have created
+                    # the wrong browser, so close that exact lease before dropping
+                    # it. Stay fail-closed even when cleanup fails: do not acquire
+                    # the transition lock again or promote a stranger here.
+                    try:
+                        await asyncio.to_thread(call_login_desktop, "/close", method="POST", payload={}, timeout=60)
+                    except RuntimeError:
+                        logger.exception("Failed to close rejected queued login workspace")
+                    begin_login_release(
+                        username=promoted.get("username", ""),
+                        session_id=promoted.get("session_id", ""),
+                        ticket=promoted.get("ticket", ""),
+                        account_ref=promoted.get("account_ref", ""),
+                    )
                     logger.error("Failed to open login workspace for queued user: %s", exc)
                     return False, promoted
             return True, promoted
@@ -4503,6 +4661,15 @@ def create_app():
             mode = "relogin"
         elif mode != "add":
             return JSONResponse({"ok": False, "error": "重新登录已有账号时必须选择账号"}, status_code=400)
+        if (
+            fingerprint_browser_enabled()
+            and mode == "relogin"
+            and not login_profile_continuity_enabled()
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "指纹浏览器要求重新登录使用账号浏览器环境。"},
+                status_code=503,
+            )
 
         result = request_workspace(
             username=current["username"],
@@ -4515,13 +4682,29 @@ def create_app():
             return JSONResponse({"ok": False, "error": "登录排队人数已满，请稍后重试"}, status_code=429)
         if result["state"] == "queued":
             return JSONResponse({"ok": True, "state": "queued", "workspace": _workspace_payload(request)}, status_code=202)
+        if result["state"] == "conflict":
+            current_request = result.get("request") or {}
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "当前工作区正在用于另一登录上下文；请先恢复或关闭当前工作区后再切换账号。",
+                    "workspace": _workspace_payload(request),
+                    "current_workspace": {
+                        "state": result.get("current_state", ""),
+                        "mode": current_request.get("mode", ""),
+                        "account_ref": current_request.get("account_ref", ""),
+                        "login_generation": current_request.get("login_generation", ""),
+                    },
+                },
+                status_code=409,
+            )
         try:
             # Off the event loop: opening takes seconds and must not stall other requests.
             async with login_transition_lock:
-                await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload={"interaction_key": result["request"].get("ticket", "")}, timeout=90)
+                desktop = await open_login_for_lease(result["request"], current=current)
                 if not login_lock_owner(request)[2]:
                     return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请"}, status_code=423)
-            return JSONResponse({"ok": True, "state": "active", "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request)})
+            return JSONResponse({"ok": True, "state": "active", "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request), "desktop": desktop})
         except RuntimeError as exc:
             begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=result["request"].get("ticket", ""), account_ref=account_ref)
             await _reset_and_promote()
@@ -4994,6 +5177,8 @@ def create_app():
             # Off the event loop: exporting reads the live login page and must not
             # freeze every other request (noVNC, heartbeats) while it runs.
             principal_for_save()
+            if receipt is not None:
+                receipt.set_stage("exporting")
             payload = await asyncio.to_thread(call_login_desktop, "/export", method="POST", payload={"interaction_key": ticket}, timeout=30)
             principal_for_save()
             if not payload.get("ok"):
@@ -5004,6 +5189,8 @@ def create_app():
             )
             # The page-read ID may be the public handle or the platform UID;
             # only the authenticated self-identity response decides who this is.
+            if receipt is not None:
+                receipt.set_stage("checking_identity")
             try:
                 trusted = await asyncio.to_thread(
                     account_identity.fetch_trusted_identity,

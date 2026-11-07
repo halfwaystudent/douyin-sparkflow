@@ -247,11 +247,13 @@ class SenderRouteReuseTests(unittest.TestCase):
                  patch.object(tasks, "get_browser", AsyncMock(return_value=(playwright, browser))) as launch, \
                  patch.object(tasks, "do_user_task", AsyncMock()) as run_user:
                 await tasks._run_browser_tasks(config, [dict(USER)])
-            preflight.assert_awaited_once_with(tasks.CREATOR_HOME_URL)
-            launch.assert_awaited_once_with(network_mode="direct")
+            preflight.assert_awaited_once_with(
+                tasks.CREATOR_HOME_URL, profile_name="uid-offline-route"
+            )
+            launch.assert_not_awaited()
             self.assertEqual("direct", run_user.await_args.args[6])
-            browser.close.assert_awaited_once()
-            playwright.stop.assert_awaited_once()
+            browser.close.assert_not_awaited()
+            playwright.stop.assert_not_awaited()
         asyncio.run(exercise())
 
 

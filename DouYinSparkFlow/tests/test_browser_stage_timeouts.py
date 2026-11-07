@@ -16,8 +16,19 @@ def flow(*, identity_guard=False):
     page = Mock(goto=AsyncMock(), close=AsyncMock())
     context = Mock(new_page=AsyncMock(return_value=page), add_cookies=AsyncMock(),
                    cookies=AsyncMock(return_value=[]), close=AsyncMock())
-    browser = Mock(new_context=AsyncMock(return_value=context))
-    chat = Mock(type=AsyncMock(), press=AsyncMock())
+    browser = Mock(new_context=AsyncMock(return_value=context), close=AsyncMock())
+    playwright = Mock(stop=AsyncMock())
+    editor = {'text': ''}
+
+    async def typed(text, **_kwargs):
+        editor['text'] += text
+
+    async def pressed(key):
+        if key == 'Shift+Enter':
+            editor['text'] += '\n'
+
+    chat = Mock(type=AsyncMock(side_effect=typed), press=AsyncMock(side_effect=pressed),
+                evaluate=AsyncMock(side_effect=lambda *_args: editor['text']))
     collector = Mock(aclose=AsyncMock(return_value=True), pending_tasks=Mock(return_value=()))
     collector.attach.return_value = collector
     release = Mock()
@@ -27,6 +38,7 @@ def flow(*, identity_guard=False):
 
     async def selected(*args, **kwargs):
         for target in args[3]:
+            editor['text'] = ''
             yield target
 
     async def no_sleep(*args, **kwargs):
@@ -44,6 +56,9 @@ def flow(*, identity_guard=False):
         stack.enter_context(patch.object(profile_cookies, 'get_userData', lambda **kw: [user]))
         stack.enter_context(patch.object(profile_cookies, 'update_user_data', lambda mutate, **kw: mutate([user])[0]))
         patches = {
+            # The sender now owns a browser per account, rather than using the
+            # legacy browser argument. Never let this offline fixture launch one.
+            "get_browser": AsyncMock(return_value=(playwright, browser)),
             "_acquire_browser_account_lock": AsyncMock(return_value=(Mock(), Mock(), "token")),
             "_release_browser_account_lock": release,
             "update_user_data": lambda mutate, **kw: mutate([user])[0],
@@ -104,7 +119,8 @@ def test_login_probe_count_is_enclosed_despite_inner_exception_handlers():
     page = Mock()
     page.locator.return_value.first.count = AsyncMock(side_effect=hangs)
     async def exercise():
-        with patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01):
+        with patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01), \
+                patch.object(tasks, "BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS", .01, create=True):
             with unittest.TestCase().assertRaises(tasks.BrowserStageTimeout):
                 await tasks._page_has_login_required_prompt(page)
     asyncio.run(exercise())
@@ -113,6 +129,7 @@ def test_login_probe_count_is_enclosed_despite_inner_exception_handlers():
 def test_before_send_timeout_is_one_account_fault_then_cooldown(flow):
     user, page, context, browser, chat, release, run = flow
     with patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01, create=True), \
+         patch.object(tasks, "BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS", .01, create=True), \
          patch.object(tasks, "ensure_not_login_required", AsyncMock(side_effect=hangs)), \
          patch.object(tasks, "_persist_browser_send_failure") as failed:
         asyncio.run(run())
@@ -143,15 +160,14 @@ def test_whole_account_timeout_preserves_dispatched_and_confirmed_targets(flow):
         if key == "Enter" and chat.press.await_count == 2:
             await hangs()
 
-    # Allow the fixture to reach the intentional second-Enter hang even
-    # under CPU throttling; the production deadline is not changed.
-    with patch.object(tasks, "_browser_account_timeout_seconds", return_value=1.0), \
+    # Allow setup to reach the second Enter; 40ms raced local logging/setup.
+    with patch.object(tasks, "_browser_account_timeout_seconds", return_value=.5), \
          patch.object(tasks, "_persist_browser_send_success", side_effect=success), \
          patch.object(tasks, "_persist_browser_send_failure") as failed:
         chat.press.side_effect = press
         asyncio.run(run())
-    assert chat.press.await_count == 2, "the deliberate second-Enter hang must be reached"
     failed.assert_not_called()
+    assert chat.press.await_count == 2, "fixture must time out during second Enter"
     now = datetime.now(tasks._schedule_timezone())
     assert tasks._target_sent_today(user, "first", now)
     assert streak_state.attempt_in_progress(user, "second", now) or streak_state.is_sent_unverified(user, "second", now)
@@ -306,7 +322,7 @@ def test_prelaunch_terminal_and_used_quota_guards(flow):
     user, page, context, browser, chat, release, run = flow
     now = datetime.now(tasks._schedule_timezone())
     streak_state.mark_failed(user, "first", category="group_identity_unavailable", reason="offline", retryable=False, now=now)
-    with patch.object(refusal_retry, "used_today", side_effect=lambda account, target, at, schedule_timezone=None: target == "second"), \
+    with patch.object(refusal_retry, "used_today", side_effect=lambda account, target, at, **_kwargs: target == "second"), \
          patch.object(refusal_retry, "eligible", return_value=False):
         assert tasks._browser_prelaunch_targets(user, user["targets"], False) == ["third"]
         assert tasks._browser_prelaunch_targets(user, user["targets"], True) == user["targets"]
@@ -418,13 +434,18 @@ def test_group_clear_timeout_does_not_enter_recovery_or_next_target(flow):
 
 def test_enter_timeout_uses_local_budget_and_keeps_unknown(flow):
     user, page, context, browser, chat, release, run = flow
+    entered = []
     async def press(key):
         if key == 'Enter':
+            entered.append(True)
             await hangs()
     chat.press.side_effect = press
+    # The local Enter deadline is the subject. Leave enough outer budget for
+    # unrelated setup/diagnostic scheduling, while keeping the 10ms local guard.
     with patch.object(tasks, 'BROWSER_STAGE_TIMEOUT_SECONDS', .01), \
-         patch.object(tasks, '_browser_account_timeout_seconds', return_value=.3):
+         patch.object(tasks, '_browser_account_timeout_seconds', return_value=5):
         asyncio.run(run())
+    assert entered == [True]
     assert 'stage=dispatch_enter' in user['account_failure']['reason']
     now = datetime.now(timezone.utc)
     assert streak_state.is_sent_unverified(user, 'first', now)
@@ -511,6 +532,6 @@ def _case(function):
 for _name, _function in list(globals().items()):
     if _name.startswith("test_"):
         setattr(BrowserStageTimeoutTests, _name, _case(_function))
-        # The unittest adapter owns collection; do not expose fixture-taking
-        # helper functions as a second, incompatible set of pytest tests.
-        del globals()[_name]
+        # Only the unittest wrapper owns the context-manager fixture. Collecting
+        # the helper too asks pytest for a nonexistent fixture and doubles tests.
+        _function.__test__ = False

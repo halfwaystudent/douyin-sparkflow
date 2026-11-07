@@ -117,10 +117,15 @@ class LegacyScheduleSelectionTests(unittest.TestCase):
   from unittest.mock import AsyncMock
   class LaunchReached(Exception):pass
   browser=SimpleNamespace(new_context=AsyncMock(side_effect=LaunchReached))
-  with patch.object(tasks,'_sleep_with_log',new_callable=AsyncMock),patch.object(tasks,'_cleanup_browser_session',new_callable=AsyncMock),patch.object(tasks,'datetime',wraps=datetime) as clock:
+  playwright=SimpleNamespace(stop=AsyncMock())
+  launcher=AsyncMock(return_value=(playwright,browser))
+  with patch.object(tasks,'_sleep_with_log',new_callable=AsyncMock),patch.object(tasks,'_cleanup_browser_session',new_callable=AsyncMock),patch.object(tasks,'get_browser',launcher),patch.object(tasks,'datetime',wraps=datetime) as clock:
    clock.now.side_effect=lambda tz:NOW.astimezone(tz)
    try:asyncio.run(tasks._do_user_task_locked(browser,account,tasks._normalize_send_strategy({}), {'enabled':False},{},'synthetic','direct'))
    except LaunchReached:pass
+  if browser.new_context.await_count:
+   launcher.assert_awaited_once_with(network_mode='direct',profile_name=tasks._account_profile_name(account))
+  else:launcher.assert_not_awaited()
   return browser.new_context.await_count>0
 
  def test_actual_locked_path_keeps_authorized_legacy_launch(self):

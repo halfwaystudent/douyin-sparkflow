@@ -71,6 +71,9 @@ class WorkspaceLifecycleBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.browser = await self.runtime.chromium.launch()
         self.page = await self.browser.new_page(viewport={"width": 390, "height": 844})
         await self.page.clock.install()
+        # Installed clocks otherwise advance during real driver/setup awaits,
+        # making exact heartbeat boundaries dependent on host load.
+        await self.page.clock.pause_at(await self.page.evaluate("Date.now() + 100"))
         await self.page.set_content(SHELL)
         await self.page.evaluate(MOCK)
         self.errors = []
@@ -107,10 +110,6 @@ class WorkspaceLifecycleBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.page.evaluate("changeVisibility('hidden')")
 
     async def test_idle_and_active_status_checks_are_bounded_and_queue_is_faster(self):
-        # Freeze wall-clock drift while advancing the synthetic scheduler.
-        # Otherwise host/renderer load can push the third 4s poll a few ms
-        # beyond run_for(12050), even though the production interval is right.
-        await self.page.clock.pause_at(await self.page.evaluate("Date.now() + 100"))
         await self.app()
         await self.page.clock.run_for(60050)
         self.assertEqual(3, len(await self.calls("/workspace-status")))
@@ -242,6 +241,8 @@ class WorkspaceLifecycleBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_manual_qr_timeout_restores_button_without_automatic_regeneration(self):
         await self.app()
         await self.open()
+        await self.page.clock.run_for(150)
+        await self.page.wait_for_function("!document.querySelector('[data-refresh-login-qr]').disabled")
         await self.page.evaluate("pending['/qr/refresh']=[]")
         await self.page.locator("[data-refresh-login-qr]").click()
         await self.page.clock.run_for(25001)
