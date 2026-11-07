@@ -32,6 +32,7 @@ jobs:
       # The suite must not depend on real account data; an empty array keeps it
       # hermetic and doubles as a check that nothing requires accounts to boot.
       USER_DATA: "[]"
+      PYTHONPATH: ".:tests"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python

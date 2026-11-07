@@ -21,6 +21,7 @@ class DeploymentContractTests(unittest.TestCase):
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("working-directory: DouYinSparkFlow", text)
         self.assertIn('USER_DATA: "[]"', text)
+        self.assertIn('PYTHONPATH: ".:tests"', text)
         self.assertIn("pip install -r requirements-test.txt", text)
         self.assertIn("python -m pytest -q --timeout=90 tests", text)
         tooling = (SOURCE_ROOT / "requirements-test.txt").read_text(encoding="utf-8")
