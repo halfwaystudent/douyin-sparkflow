@@ -104,8 +104,13 @@ class RecoveryReviewContracts(unittest.TestCase):
                     tasks.update_user_data(lambda accounts: (accounts.__setitem__(0, disk[0]), True), force_reload=True)
                     self.assertFalse(recovery.dispatch_allowed(scoped, now))
 
-    def test_default_window_ends_at_17_but_explicit_18_is_preserved(self):
+    def test_upstream_default_window_ends_at_18_and_explicit_live_17_is_preserved(self):
         from utils.config import DEFAULT_CONFIG
-        self.assertEqual(DEFAULT_CONFIG['dailySendWindow']['endHour'], 17)
-        self.assertEqual(tasks._normalize_send_window({})['endHour'], 17)
-        self.assertEqual(tasks._normalize_send_window({'dailySendWindow': {'endHour': 18}})['endHour'], 18)
+        self.assertEqual(DEFAULT_CONFIG['dailySendWindow']['endHour'], 18)
+        self.assertEqual(tasks._normalize_send_window({})['endHour'], 18)
+        for end_hour in (17, 18):
+            with self.subTest(end_hour=end_hour):
+                self.assertEqual(
+                    tasks._normalize_send_window({'dailySendWindow': {'endHour': end_hour}})['endHour'],
+                    end_hour,
+                )

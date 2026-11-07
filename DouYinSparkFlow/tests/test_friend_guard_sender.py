@@ -105,7 +105,14 @@ class FriendGuardSenderTests(unittest.TestCase):
     def test_final_identity_failure_keeps_unknown_and_does_not_continue(self):
         from datetime import datetime, timedelta, timezone
         from core import streak_state
-        with flow(identity_guard=True) as (user, page, context, browser, chat, release, run):
+        fixed_now = datetime(2026, 11, 7, 4, 0, tzinfo=timezone.utc)
+        with flow(identity_guard=True) as (user, page, context, browser, chat, release, run), \
+                patch.object(tasks, 'datetime', wraps=datetime) as clock:
+            # This tests same-day unknown protection, not midnight rollover.
+            # Freeze the writer and the assertion to the same business instant.
+            clock.now.side_effect = lambda tz=None: (
+                fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+            )
             async def verify(*args, **kw):
                 return (False, 'changed at final check') if kw.get('arm') else (True, '')
             with patch.object(friend_chat_guard, 'verify_friend', side_effect=verify), \
@@ -113,7 +120,7 @@ class FriendGuardSenderTests(unittest.TestCase):
                 asyncio.run(run())
             chat.press.assert_not_awaited()
             recovery.assert_not_awaited()
-            now=datetime.now(timezone.utc)+timedelta(minutes=45)
+            now = fixed_now + timedelta(minutes=45)
             self.assertTrue(streak_state.is_sent_unverified(user, 'first', now))
             due, *_=tasks._select_due_targets(user, {'enabled':True,'startHour':0,'endHour':24}, now)
             self.assertNotIn('first', due)

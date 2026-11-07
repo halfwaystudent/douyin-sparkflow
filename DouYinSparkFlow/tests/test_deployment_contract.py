@@ -21,7 +21,13 @@ class DeploymentContractTests(unittest.TestCase):
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("working-directory: DouYinSparkFlow", text)
         self.assertIn('USER_DATA: "[]"', text)
-        self.assertIn("python -m unittest discover -s tests", text)
+        self.assertIn("pip install -r requirements-test.txt", text)
+        self.assertIn("python -m pytest -q --timeout=90 tests", text)
+        tooling = (SOURCE_ROOT / "requirements-test.txt").read_text(encoding="utf-8")
+        self.assertIn("-r requirements.txt", tooling)
+        for package in ("pytest==", "pytest-asyncio==", "pytest-subtests==", "pytest-timeout=="):
+            with self.subTest(package=package):
+                self.assertIn(package, tooling)
         self.assertIn("node --test DouYinSparkFlow/tests/test_protocol_sender_helpers.mjs", text)
 
     def test_github_actions_are_pinned_to_commit_shas(self):

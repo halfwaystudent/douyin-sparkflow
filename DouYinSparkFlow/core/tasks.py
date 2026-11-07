@@ -2870,7 +2870,7 @@ def _normalize_send_window(config):
             end_minutes = -1
     else:
         try:
-            end_minutes = int(raw.get("endHour", 17)) * 60
+            end_minutes = int(raw.get("endHour", 18)) * 60
         except (TypeError, ValueError):
             end_minutes = -1
     normalized = {
