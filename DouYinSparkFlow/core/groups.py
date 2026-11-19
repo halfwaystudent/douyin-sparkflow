@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 from core.browser import (account_profile_name, acquire_browser_account_lock, douyin_network_modes,
     first_scrollable_element, get_browser, get_persistent_browser_context, normalize_persistent_profile_config, release_browser_account_lock)
+from core import im_ui
 from core.friends import (CATEGORY_BROWSER_CLEANUP_BLOCKED, CHAT_PAGE_URL,
     FriendRefreshError, _wait_for_chat_or_login, browser_account_cleanup_blocked,
     retain_browser_account_lock_for_cleanup)
@@ -62,6 +63,77 @@ async def _activate_group_tab(page, timeout_ms=20000):
 
 GROUP_ROW_SELECTOR = '#sub-app li.semi-list-item'
 GROUP_SCROLL_SELECTOR = '#sub-app [role="grid"], #sub-app .ReactVirtualized__Grid, #sub-app [class*="semi-list"] ul, #scroll'
+
+# New IM SaaS group rows: same data-e2e marker as friend rows, but the group
+# filter tag is 群聊 under the 消息 group.
+SAAS_GROUP_SCROLL_SELECTORS = im_ui.SAAS_SCROLL_SELECTORS
+
+
+async def _read_saas_group_row(row):
+    """Return (conversation_id, name) for one SaaS conversation row.
+
+    The SaaS bundle exposes the conversation object on the row's React fiber
+    (``memoizedProps.conversation`` with ``id``/``shortId``), and the display
+    name in ``.conversationConversationItemtitle``. Both are read passively;
+    the row is never clicked (clicking opens the conversation).
+    """
+    conversation_id = await row.evaluate(
+        """(element) => {
+            const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
+            let fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
+            let fiber = fiberKey && element[fiberKey];
+            for (let level = 0; fiber && level <= 4; level += 1, fiber = fiber.return) {
+                const conversation = fiber.memoizedProps?.conversation
+                    ?? fiber.memoizedProps?.header?.props?.conversation;
+                const value = conversation?.id ?? conversation?.shortId;
+                if (valid(value)) return value;
+            }
+            return null;
+        }"""
+    )
+    if not (isinstance(conversation_id, str) and conversation_id.isdigit()
+            and 10 <= len(conversation_id) <= 25):
+        return None, ""
+    try:
+        name = (await row.locator(im_ui.SAAS_NAME_SELECTOR).first
+                .inner_text(timeout=1000)).strip()
+    except Exception:
+        name = ""
+    return conversation_id, name
+
+
+async def collect_saas_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=.1):
+    """Passively exhaust the SaaS group-filtered virtual list; never click a row."""
+    _, scroll = await first_scrollable_element(page, list(SAAS_GROUP_SCROLL_SELECTORS))
+    if not scroll:
+        raise RuntimeError('未找到群列表滚动容器')
+    reset_top = await page.evaluate('(element) => { element.scrollTop = 0; return element.scrollTop; }', scroll)
+    if reset_top != 0:
+        raise RuntimeError('群列表滚动位置无法复位')
+    deadline = asyncio.get_running_loop().time() + max_scan_seconds
+    result, seen = [], set()
+    while True:
+        if asyncio.get_running_loop().time() > deadline:
+            raise RuntimeError('群列表读取超时')
+        added = 0
+        for row in await page.locator(im_ui.SAAS_ROW_SELECTOR).all():
+            if not await row.is_visible():
+                continue
+            conversation_id, name = await _read_saas_group_row(row)
+            if not conversation_id:
+                raise RuntimeError('visible group row has no conversation id')
+            if conversation_id not in seen:
+                if not name:
+                    raise RuntimeError('visible group row has no name')
+                seen.add(conversation_id)
+                result.append({'name': name, 'conversationId': conversation_id})
+                added += 1
+        state = await page.evaluate('''async e => { e.scrollTop += Math.max(1,e.clientHeight); await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))); return {top:e.scrollTop, client:e.clientHeight, height:e.scrollHeight} }''', scroll)
+        await asyncio.sleep(scroll_delay_seconds)
+        if state['top'] + state['client'] >= state['height'] - 1 and not added:
+            if not result:
+                raise RuntimeError('未读到群列表')
+            return result
 
 async def collect_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=.1):
     """Passively exhaust virtualized visible rows; never click a conversation."""
@@ -122,13 +194,32 @@ async def fetch_account_groups(account):
         else:
             playwright, browser = await get_browser(GUI=False, network_mode=mode, profile_name=account_profile_name(account)); context = await browser.new_context(); await context.add_cookies(cookies)
         async def guard_write_routes(route):
-            if refresh_request_allowed(route.request.method, route.request.url):
+            method = route.request.method
+            url = route.request.url
+            if (refresh_request_allowed(method, url)
+                    or im_ui.saas_request_allowed(method, url)):
                 await route.continue_()
             else:
                 await route.abort()
 
         await context.route('**/*', guard_write_routes)
         page = await context.new_page(); await page.goto(CHAT_PAGE_URL, wait_until='commit', timeout=60000); await _wait_for_chat_or_login(page)
+        if await im_ui.is_saas_ui(page):
+            # SaaS page: no role tabs; route through the verified 群聊 filter.
+            activated = await im_ui.activate_saas_filter(page, 'group')
+            if not activated:
+                raise RuntimeError('新版 IM 群聊筛选状态无法确认')
+            deadline = asyncio.get_running_loop().time() + 20
+            while asyncio.get_running_loop().time() < deadline:
+                rows = page.locator(im_ui.SAAS_ROW_SELECTOR)
+                if any([await row.is_visible() for row in await rows.all()]):
+                    break
+                await asyncio.sleep(.1)
+            else:
+                raise RuntimeError('未读到群列表')
+            rows = await collect_saas_group_rows(page)
+            # Reading group rows is not an account-identity proof.
+            return rows
         old = await _activate_group_tab(page)
         deadline = asyncio.get_running_loop().time() + 20
         while asyncio.get_running_loop().time() < deadline:

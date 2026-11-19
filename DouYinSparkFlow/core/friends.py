@@ -12,6 +12,7 @@ from core.browser import (
     normalize_persistent_profile_config,
     release_browser_account_lock,
 )
+from core import im_ui
 from core.friend_identity import UserDetailCollector
 from core.identity import (
     CATEGORY_IDENTITY_CONFLICT,
@@ -127,6 +128,15 @@ FRIEND_NAME_SELECTORS = (
     'xpath=.//*[contains(@class, "item-header-name-")]',
     '[class*="item-header-name-"]',
 )
+# New IM SaaS chat page: verified in the public bundle
+# (__federation_expose_default_export.aab99327.js). Rows are divs marked
+# data-e2e="conversation-item"; the title node is
+# .conversationConversationItemtitle; the virtual list scrolls inside
+# .conversationConversationListwrapper.
+SAAS_FRIEND_ROW_SELECTOR = im_ui.SAAS_ROW_SELECTOR
+SAAS_FRIEND_NAME_SELECTOR = im_ui.SAAS_NAME_SELECTOR
+SAAS_FRIEND_SCROLL_SELECTORS = im_ui.SAAS_SCROLL_SELECTORS
+
 # Backward-compatible aliases for callers/tests that imported the old constants.
 TARGET_SELECTOR = FRIEND_ROW_SELECTORS[-1]
 SCROLLABLE_FRIENDS_SELECTOR = SCROLLABLE_FRIENDS_SELECTORS[-1]
@@ -409,6 +419,10 @@ async def _read_friend_name(element):
 
 
 async def collect_friend_names(page, on_progress=None):
+    if await im_ui.is_saas_ui(page):
+        result = await _collect_saas_friend_names(page, on_progress=on_progress)
+        if result is not None:
+            return result
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
@@ -503,6 +517,145 @@ async def collect_friend_names(page, on_progress=None):
             return FriendScanResult(found_names, reason=reason)
 
 
+async def _collect_saas_friend_names(page, on_progress=None):
+    """Read the new IM SaaS conversation list without clicking any row.
+
+    The SaaS page has no 朋友私信/群消息 role tabs; it filters through the
+    分组 tag bar instead. ``friend`` maps to the 消息/全部 tag, which is the
+    default view and already excludes the stranger box.
+    """
+    if not await im_ui.is_saas_ui(page):
+        return None
+    activated = await im_ui.activate_saas_filter(page, "friend")
+    if not activated:
+        # SaaS shell present but the filter could not be confirmed: fail
+        # loudly rather than risk reading stranger/group rows as friends.
+        raise FriendRefreshError(
+            "新版 IM 页面已出现但好友筛选状态无法确认",
+            category=CATEGORY_STRUCTURE_CHANGED,
+        )
+    await _wait_for_saas_rows_or_empty(page)
+
+    found_names = []
+    seen_names = set()
+    idle_rounds = 0
+    stuck_rounds = 0
+
+    while True:
+        rows = await _first_visible_saas_rows(page)
+        if rows is None:
+            if found_names:
+                return FriendScanResult(found_names, reason="读取过程中好友行消失")
+            raise RuntimeError("好友列表已加载但未找到可读取的好友行")
+
+        new_names_count = 0
+        for element in rows:
+            name = await _read_saas_friend_name(element)
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            found_names.append(name)
+            new_names_count += 1
+
+        if on_progress is not None:
+            on_progress(len(found_names))
+
+        scrollable_selector, scrollable_element = await first_scrollable_element(
+            page, SAAS_FRIEND_SCROLL_SELECTORS
+        )
+        if not scrollable_element:
+            if found_names:
+                return FriendScanResult(found_names, reason="未找到好友列表滚动容器")
+            raise RuntimeError("未找到好友列表滚动容器")
+
+        metrics = await page.evaluate(
+            """(element) => ({
+                clientHeight: element.clientHeight,
+                scrollHeight: element.scrollHeight,
+            })""",
+            scrollable_element,
+        )
+        if int(metrics.get("scrollHeight") or 0) <= int(metrics.get("clientHeight") or 0):
+            return FriendScanResult(found_names, complete=True)
+
+        before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
+        await page.evaluate(
+            "(element) => element.scrollTop += %d" % SCROLL_STEP_PX,
+            scrollable_element,
+        )
+        await asyncio.sleep(SCROLL_SETTLE_SECONDS)
+        after_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
+        logger.debug(
+            "SaaS friend list refresh scroll selector=%s before=%s after=%s names=%s",
+            scrollable_selector, before_top, after_top, len(found_names),
+        )
+
+        should_stop, idle_rounds, stuck_rounds = update_collection_progress(
+            new_names_count=new_names_count,
+            no_more_visible=False,
+            scroll_moved=after_top > before_top,
+            idle_rounds=idle_rounds,
+            stuck_rounds=stuck_rounds,
+            idle_limit=FRIEND_LIST_IDLE_ROUNDS,
+            stuck_limit=FRIEND_LIST_STUCK_ROUNDS,
+        )
+        if should_stop:
+            reason = (
+                "列表滚动没有继续推进"
+                if stuck_rounds >= FRIEND_LIST_STUCK_ROUNDS
+                else "连续多轮没有读到新的好友"
+            )
+            return FriendScanResult(found_names, reason=reason)
+
+
+async def _first_visible_saas_rows(page, limit=5):
+    """Return visible SaaS row elements, or None when the list is empty."""
+    locator = page.locator(SAAS_FRIEND_ROW_SELECTOR).filter(visible=True)
+    count = await locator.count()
+    rows = []
+    for index in range(min(count, limit * 4)):
+        item = locator.nth(index)
+        try:
+            if await item.is_visible(timeout=500):
+                rows.append(item)
+        except Exception:
+            continue
+        if len(rows) >= limit * 4:
+            break
+    return rows or None
+
+
+async def _read_saas_friend_name(element):
+    try:
+        locator = element.locator(SAAS_FRIEND_NAME_SELECTOR).first
+        if await locator.count() == 0:
+            return ""
+        return (await locator.inner_text(timeout=1000)).strip()
+    except Exception:
+        return ""
+
+
+async def _wait_for_saas_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY_TIMEOUT_SECONDS):
+    started_at = asyncio.get_running_loop().time()
+    while asyncio.get_running_loop().time() - started_at < timeout_seconds:
+        rows = await _first_visible_saas_rows(page)
+        if rows:
+            return
+        # Empty-state markers verified in the bundle: LeftPanelEmptywrapper
+        # renders 暂无会话 / 暂无相关陌生人消息.
+        try:
+            empty = page.locator(".LeftPanelEmptywrapper")
+            if await empty.count() > 0 and await empty.first.is_visible():
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    raise FriendRefreshError(
+        "saas friend list did not become ready within timeout",
+        category=CATEGORY_STRUCTURE_CHANGED,
+    )
+
+
 async def _fetch_account_friends_once(
     account,
     network_mode,
@@ -576,6 +729,25 @@ async def _fetch_account_friends_once(
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)
         page = await context.new_page()
+
+        if not auth_only:
+            # The friend-list read must stay read-only on both page variants.
+            # The SaaS page issues its own init/config POSTs; allow exactly
+            # those plus the legacy chat reads, refuse every write.
+            from core.im_ui import saas_request_allowed
+            from core.groups import refresh_request_allowed
+
+            async def guard_friend_refresh_routes(route):
+                method = route.request.method
+                url = route.request.url
+                if refresh_request_allowed(method, url) or saas_request_allowed(method, url):
+                    await route.continue_()
+                else:
+                    await route.abort()
+
+            route = getattr(context, 'route', None)
+            if callable(route):
+                await route('**/*', guard_friend_refresh_routes)
 
         if auth_only:
             # Only the creator home page exposes the logged-in identity, and a
