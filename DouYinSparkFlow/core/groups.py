@@ -102,7 +102,12 @@ async def collect_saas_group_rows(page, *, max_scan_seconds=60, scroll_delay_sec
         for row in await page.locator(im_ui.SAAS_ROW_SELECTOR).all():
             if not await row.is_visible():
                 continue
-            conversation_id, name = await _read_saas_group_row(row)
+            from core import saas_group_guard
+            metadata = await saas_group_guard.read_row_metadata(row)
+            if metadata and metadata["type"] in {1, 3, 4, 17}:
+                continue
+            conversation_id = metadata.get("conversationId") if metadata and metadata["type"] == 2 else None
+            name = metadata.get("name", "") if metadata else ""
             if not conversation_id:
                 raise RuntimeError('visible group row has no conversation id')
             if conversation_id not in seen:

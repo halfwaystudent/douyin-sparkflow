@@ -129,6 +129,7 @@ class GroupChatTargetTests(unittest.TestCase):
             user["group_target_bindings"] = {"群聊：目标群": bound_id}
         self.verify = AsyncMock(side_effect=verify_side_effect or (lambda *_a, **_k: (True, "")))
         page = Mock(goto=AsyncMock(), close=AsyncMock())
+        _install_legacy_page_locators(page)
         context = Mock(
             new_page=AsyncMock(return_value=page),
             add_cookies=AsyncMock(),

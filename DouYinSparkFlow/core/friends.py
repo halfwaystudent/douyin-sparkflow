@@ -552,25 +552,11 @@ async def _read_saas_friend_row(element):
     means the row's type could not be proven — the caller must treat the scan
     as incomplete rather than risk caching a group as a friend.
     """
-    name = await _read_saas_friend_name(element)
-    try:
-        conversation_type = await element.evaluate(
-            """(node) => {
-                let fiberKey = Object.keys(node || {}).find((key) => key.startsWith('__reactFiber'));
-                let fiber = fiberKey && node[fiberKey];
-                for (let level = 0; fiber && level <= 4; level += 1, fiber = fiber.return) {
-                    const conversation = fiber.memoizedProps?.conversation
-                        ?? fiber.memoizedProps?.header?.props?.conversation;
-                    if (conversation && typeof conversation.type === 'number') {
-                        return conversation.type;
-                    }
-                }
-                return null;
-            }"""
-        )
-    except Exception:
-        conversation_type = None
-    return name, conversation_type
+    from core import saas_group_guard
+    snapshot = await saas_group_guard.read_row_metadata(element)
+    if not snapshot:
+        return "", None
+    return snapshot["name"], snapshot["type"]
 
 
 async def _collect_saas_friend_names(page, on_progress=None):

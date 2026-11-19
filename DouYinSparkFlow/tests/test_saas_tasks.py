@@ -40,6 +40,32 @@ class SaasTasksTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tasks,'_dismiss_non_login_dialogs',AsyncMock()),patch.object(tasks,'_click_first_visible_locator',AsyncMock(side_effect=AssertionError('legacy click before variant proof'))):
             self.assertEqual(await tasks._open_friends_tab(self.page,'synthetic','wrong-old-xpath',()),'saas_verified')
 
+    async def test_confirmed_saas_false_activation_is_not_success(self):
+        with patch.object(tasks,'_dismiss_non_login_dialogs',AsyncMock()), patch.object(tasks,'_sender_chat_variant_is_saas',AsyncMock(return_value=True)), patch.object(tasks.im_ui,'activate_saas_filter',AsyncMock(return_value=False)):
+            with self.assertRaises(tasks.FriendListUnavailableError):
+                await tasks._open_friends_tab(self.page,'synthetic','unused',())
+            with self.assertRaises(tasks.FriendListUnavailableError):
+                await tasks._open_groups_tab(self.page,'synthetic')
+
+    async def test_detached_saas_fiber_is_not_a_friend_record(self):
+        await self.content('<div data-e2e="conversation-item"><div class="conversationConversationItemtitle">detached</div></div>')
+        await self.page.evaluate("document.querySelector('[data-e2e=conversation-item]').__reactFiber$test={memoizedProps:{conversation:{type:1}}}")
+        self.assertIsNone(await tasks._extract_friend_record(self.page.locator('[data-e2e=conversation-item]')))
+
+    async def test_saas_friend_record_name_and_type_share_a_committed_snapshot(self):
+        from tests import test_saas_chat_guard as fixture
+        await self.page.set_content(fixture.saas_html(fixture.conv_row('demo-A',fixture.CONV_A,active=True)))
+        await self.page.evaluate(fixture.SETUP,{'rowConvs':[fixture.CONV_A],'headerConv':fixture.CONV_A,'inputConv':fixture.CONV_A})
+        real=self.page.locator('[data-e2e="conversation-item"]');page=self.page
+        class RecycledRow:
+            async def evaluate(self,script,*args):
+                result=await real.evaluate(script,*args)
+                await page.evaluate("""() => {const r=document.querySelector('[data-e2e="conversation-item"]');r.querySelector('.conversationConversationItemtitle').textContent='群乙';let f=r[Object.keys(r).find(k=>k.startsWith('__reactFiber'))];for(let i=0;f&&i<=3;i++,f=f.return)if(f.memoizedProps?.conversation){f.memoizedProps.conversation.type=2;break;}}""")
+                return result
+            def __getattr__(self,key):return getattr(real,key)
+        record=await tasks._extract_friend_record(RecycledRow())
+        self.assertEqual(record['visibleName'],'demo-A')
+
     async def test_saas_friend_tab_never_calls_old_xpath_click(self):
         await self.content(FILTER)
         with patch.object(tasks,'_dismiss_non_login_dialogs',AsyncMock()),patch.object(tasks,'_click_first_visible_locator',AsyncMock(return_value=False)) as legacy:

@@ -256,11 +256,11 @@ class SaasFriendRowTypeTests(unittest.IsolatedAsyncioTestCase):
         await page.evaluate(
             """(convs) => {
                 const rows = document.querySelectorAll('[data-e2e="conversation-item"]');
+                const root={stateNode:{},return:null,child:null};root.stateNode.current=root;let previous=null;
                 rows.forEach((row, i) => {
-                    row.__reactFiber$test = {
-                        memoizedProps: { conversation: convs[i] || null },
-                        return: null,
-                    };
+                    const host={stateNode:row,memoizedProps:{conversation:convs[i]||null},return:root};
+                    row.__reactFiber$test=host;
+                    if(previous)previous.sibling=host;else root.child=host;previous=host;
                 });
             }""",
             conversations,

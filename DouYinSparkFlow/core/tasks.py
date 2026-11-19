@@ -640,10 +640,13 @@ async def save_debug_artifacts(page, account_name, target_name, stage):
     logger.info("Saved debug artifacts at stage=%s for %s/%s", stage, account_name, target_name)
 
 
+_SAAS_CHAT_INPUT_SELECTOR = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]:visible'
+
+
 @_bounded_browser_stage("locate_chat_input")
 async def locate_chat_input(page):
     if await im_ui.is_saas_ui(page):
-        selector = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]:visible'
+        selector = _SAAS_CHAT_INPUT_SELECTOR
         inputs = page.locator(selector)
         await inputs.first.wait_for(state="visible", timeout=10000)
         if await inputs.count() != 1:
@@ -1513,6 +1516,7 @@ class GroupTargetSelectionError(FriendListUnavailableError):
 
 
 ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
+    "group_identity_unavailable",
     "browser_resource_unavailable",
     "browser_dialog_blocked",
     "browser_stage_timeout",
@@ -1685,7 +1689,8 @@ async def _sender_chat_variant_is_saas(page):
 async def _open_friends_tab(page, account_name, fallback_selector, target_selectors):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_friends_tab")
     if await _sender_chat_variant_is_saas(page):
-        await im_ui.activate_saas_filter(page, "friend")
+        if not await im_ui.activate_saas_filter(page, "friend"):
+            raise FriendListUnavailableError("friend_list_unavailable: SaaS 页面在筛选激活前发生变化")
         return "saas_verified"
     # Group and friend rows use the same DOM shape.  A visible row therefore
     # proves neither that the friends tab is active nor that it is safe to
@@ -1776,7 +1781,8 @@ def _dedupe_group_target_aliases(targets):
 async def _open_groups_tab(page, account_name):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_groups_tab")
     if await _sender_chat_variant_is_saas(page):
-        await im_ui.activate_saas_filter(page, "group")
+        if not await im_ui.activate_saas_filter(page, "group"):
+            raise FriendListUnavailableError("group_list_unavailable: SaaS 页面在筛选激活前发生变化")
         return
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     candidates = [
@@ -2007,14 +2013,22 @@ async def _scan_bound_group_rows(page, scrollable, selector, account_name, confi
             try:
                 if not await row.is_visible(timeout=800):
                     continue
-                conversation_id = await _read_group_row_conversation_id(row)
+                if await row.get_attribute("data-e2e") == "conversation-item":
+                    metadata = await saas_group_guard.read_row_metadata(row)
+                    if metadata and metadata["type"] in {1, 3, 4, 17}:
+                        continue
+                    conversation_id = metadata.get("conversationId") if metadata and metadata["type"] == 2 else None
+                    display_name = metadata.get("name", "") if metadata else ""
+                else:
+                    conversation_id = await _read_group_row_conversation_id(row)
+                    display_name = await _extract_friend_display_name(row)
                 if not conversation_id:
                     raise FriendListIncompleteError(
                         f"group_identity_unavailable for {account_name}: visible group row has no conversation id"
                     )
                 if conversation_id not in seen_ids:
                     seen_ids.add(conversation_id)
-                    found.append((conversation_id, await _extract_friend_display_name(row)))
+                    found.append((conversation_id, display_name))
                     added += 1
             except FriendListIncompleteError:
                 raise
@@ -2406,16 +2420,12 @@ async def _extract_friend_record(element):
     if await element.get_attribute('data-e2e') == 'conversation-item':
         # The SaaS 全部 filter includes groups. Never mix their names into the
         # friend index; unknown row types are unreadable, not guessed friends.
-        row_type = await element.evaluate('''node => {
-          const key=Object.keys(node).find(k=>k.startsWith('__reactFiber'));
-          let f=key&&node[key];
-          for(let i=0;f&&i<=3;i++,f=f.return){
-            if(f.memoizedProps?.conversation)return f.memoizedProps.conversation.type;
-          }return null;
-        }''')
-        if row_type != 1:
+        snapshot = await saas_group_guard.read_row_metadata(element)
+        if not snapshot or snapshot.get("type") != 1:
             return None
-    display_name = await _extract_friend_display_name(element)
+        display_name = snapshot["name"]
+    else:
+        display_name = await _extract_friend_display_name(element)
     normalized_name = _normalize_target_name(display_name)
     if not normalized_name:
         return None
@@ -5164,6 +5174,7 @@ async def _do_user_task_locked(
                 chat_input = None
                 last_own_message_before = None
                 send_receipt = {}
+                group_guard_required = False
                 try:
                     await _run_browser_stage("debug_selected", save_debug_artifacts(page, account_name, target_name, "selected-friend"))
                     chat_input, selector_used = await _run_browser_stage("locate_chat_input", locate_chat_input(page))
@@ -5276,6 +5287,19 @@ async def _do_user_task_locked(
                             logger.error("Aborting before Enter: durable resend barrier unavailable")
                             return
                         await _require_friend_chat(page, user, target_name, arm=True)
+                    if parse_chat_target(target_name)[0] == "group" and (
+                            selector_used == _SAAS_CHAT_INPUT_SELECTOR or await im_ui.is_saas_ui(page)):
+                        # A proven SaaS editor must not lose its guard merely
+                        # because navigation removed the shell after locating it.
+                        # Arm before all remaining awaits. The capture listener
+                        # rechecks current identity synchronously at keydown.
+                        group_guard_required = True
+                        armed, reason = await _run_browser_stage(
+                            "group_arm", saas_group_guard.arm_enter(page, chat_input, bound_id))
+                        if not armed:
+                            raise friend_chat_guard.FriendIdentityError(
+                                "group_identity_unavailable: " + reason,
+                                category="group_identity_unavailable")
                     if action_gate is not None:
                         gate_result = await _run_browser_stage("action_report_gate", action_gate.ensure_before_enter())
                         logger.info(
@@ -5297,6 +5321,13 @@ async def _do_user_task_locked(
                         if not allowed:
                             raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: Enter blocked at dispatch')
 
+                    if group_guard_required:
+                        allowed = await _run_browser_stage(
+                            "group_dispatch_guard", saas_group_guard.dispatch_was_allowed(page))
+                        if not allowed:
+                            raise friend_chat_guard.FriendIdentityError(
+                                "group_identity_unavailable: Enter blocked at dispatch",
+                                category="group_identity_unavailable")
                     sent_ok, detail = await _run_browser_stage("confirm_message", confirm_message_sent(
                         page,
                         chat_input,
@@ -5458,6 +5489,11 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message after failure", account_name)
+                finally:
+                    if group_guard_required:
+                        await _run_browser_stage(
+                            "group_disarm", saas_group_guard.disarm(page),
+                            timeout_seconds=BROWSER_CLEANUP_TIMEOUT_SECONDS)
         except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
             raise
         except Exception as exc:
