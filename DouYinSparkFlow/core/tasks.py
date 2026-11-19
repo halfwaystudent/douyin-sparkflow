@@ -40,7 +40,7 @@ from core import personal_streak, send_pause
 from core.identity import same_login_snapshot
 from core.protocol_dispatch import run_protocol_tasks
 from core.profile_cookies import prepare_profile_cookies, publish_profile_cookies
-from core import friend_identity, friend_chat_guard, notifications, streak_state
+from core import friend_identity, friend_chat_guard, notifications, streak_state, im_ui
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -641,6 +641,14 @@ async def save_debug_artifacts(page, account_name, target_name, stage):
 
 @_bounded_browser_stage("locate_chat_input")
 async def locate_chat_input(page):
+    if await im_ui.is_saas_ui(page):
+        selector = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]:visible'
+        inputs = page.locator(selector)
+        await inputs.first.wait_for(state="visible", timeout=10000)
+        if await inputs.count() != 1:
+            raise RuntimeError('friend_identity_unavailable: ambiguous SaaS editor')
+        await inputs.first.click(timeout=5000)
+        return inputs.first, selector
     selectors = [
         # The recorded creator editor has chat-input-nSWBco on the editable
         # itself; do not wait on an obsolete hashed class or global last editor.
@@ -1115,9 +1123,42 @@ async def start_im_send_observer(page, account_name, target_name):
 
     return summary
 
+async def _saas_own_messages_today(page):
+    # Public component: MessageBoxContentisFromMe + msg-item-content; only
+    # the message's own text renderer and explicit Date metadata count.
+    now = datetime.now(_schedule_timezone())
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return await page.evaluate(r"""({start,end}) => {
+      const panels=[...document.querySelectorAll('#sub-app .componentsRightPanelwrapper')].filter(e=>e.getClientRects().length);
+      if(panels.length!==1)return [];
+      const result=[];
+      for(const node of panels[0].querySelectorAll('[data-e2e="msg-item-content"]')){
+        if(!node.getClientRects().length)continue;
+        const row=node.closest('.MessageBoxContentcolumnBox');
+        if(!row?.classList.contains('MessageBoxContentisFromMe'))continue;
+        const texts=[...node.querySelectorAll('.MessageItemTextbubbleTextContent')].filter(e=>e.getClientRects().length);
+        if(texts.length!==1)continue;
+        const key=Object.keys(node).find(k=>k.startsWith('__reactFiber'));
+        let fiber=key&&node[key],message=null;
+        for(let i=0;fiber&&i<=6;i++,fiber=fiber.return){
+          if(fiber.memoizedProps?.message){message=fiber.memoizedProps.message;break;}
+        }
+        if(message?.isFromMe!==true || !(message.createdAt instanceof Date))continue;
+        const at=message.createdAt.getTime();if(!(at>=start&&at<end))continue;
+        const text=texts[0].innerText.trim();if(!text)continue;
+        const r=node.getBoundingClientRect();
+        result.push({text,centerX:r.left+r.width/2,centerY:r.top+r.height/2,top:r.top,bottom:r.bottom,right:r.right,className:row.className.slice(0,240)});
+      }
+      return result;
+    }""", {"start":start.timestamp()*1000,"end":(start+timedelta(days=1)).timestamp()*1000})
+
+
 @_bounded_browser_stage("last_message_read")
 async def snapshot_last_own_message(page, chat_input=None):
     try:
+        if await im_ui.is_saas_ui(page):
+            messages = await _saas_own_messages_today(page)
+            return messages[-1] if messages else None
         return await page.evaluate(
             r"""() => {
                 // ---- DOM structure (douyin creator private message) ----
@@ -1180,6 +1221,10 @@ async def snapshot_last_own_message(page, chat_input=None):
 async def count_today_own_message_matches(page, target_text):
     """Count how many of *target_text* appear in today's own-message bubbles."""
     try:
+        if await im_ui.is_saas_ui(page):
+            messages = await _saas_own_messages_today(page)
+            expected = _normalize_message_text(target_text)
+            return sum(_normalize_message_text(item['text']) == expected for item in messages)
         return await page.evaluate(
             r"""(targetText) => {
                 const allRows = Array.from(
@@ -1402,6 +1447,8 @@ async def detect_message_already_sent(page, chat_input, message, before_snapshot
 
 
 def classify_browser_failure(stage, exc):
+    if getattr(exc, 'category', None) == 'browser_resource_unavailable':
+        return 'browser_resource_unavailable'
     if isinstance(exc, BrowserDialogBlocked):
         return exc.category
     if isinstance(exc, BrowserStageTimeout):
@@ -1465,6 +1512,7 @@ class GroupTargetSelectionError(FriendListUnavailableError):
 
 
 ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
+    "browser_resource_unavailable",
     "browser_dialog_blocked",
     "browser_stage_timeout",
     "browser_cleanup_blocked",
@@ -1617,6 +1665,8 @@ async def _click_first_visible_locator(candidates, account_name, stage):
 
 async def _open_friends_tab(page, account_name, fallback_selector, target_selectors):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_friends_tab")
+    if await im_ui.activate_saas_filter(page, "friend"):
+        return "saas_verified"
     # Group and friend rows use the same DOM shape.  A visible row therefore
     # proves neither that the friends tab is active nor that it is safe to
     # select from it; always explicitly open the friends tab first.
@@ -1705,6 +1755,8 @@ def _dedupe_group_target_aliases(targets):
 
 async def _open_groups_tab(page, account_name):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_groups_tab")
+    if await im_ui.activate_saas_filter(page, "group"):
+        return
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     candidates = [
         ("page role tab 群消息", page.get_by_role("tab", name="群消息", exact=True)),
@@ -1722,7 +1774,9 @@ async def _open_groups_tab(page, account_name):
 
 
 async def _group_tab_is_active(page, account_name):
-    """Trust group rows only while the visible 群消息 role tab is selected."""
+    """Trust group rows only while the exact group filter is selected."""
+    if await im_ui.is_saas_ui(page):
+        return await im_ui.saas_filter_is_active(page, "group")
     locator = page.get_by_role("tab", name="群消息", exact=True)
     count = await _locator_count_with_timeout(
         locator, account_name, "verify_groups_tab", "role=tab[name=群消息]"
@@ -1749,8 +1803,10 @@ async def _read_group_row_conversation_id(row_locator):
         let fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
         let fiber = fiberKey && element[fiberKey];
         for (let level = 0; fiber && level <= 3; level += 1, fiber = fiber.return) {
-            const conversation = fiber.memoizedProps?.header?.props?.conversation;
-            const value = conversation?.id ?? conversation?.shortId;
+            const saas = element.matches('[data-e2e="conversation-item"]');
+            const conversation = saas ? fiber.memoizedProps?.conversation : fiber.memoizedProps?.header?.props?.conversation;
+            if (saas && conversation && conversation.type !== 2) return null;
+            const value = saas ? (conversation?.shortId ?? conversation?.id) : (conversation?.id ?? conversation?.shortId);
             if (valid(value)) return value;
         }
         return null;
@@ -2251,6 +2307,7 @@ async def _wait_for_friend_list_ready(
 
 async def _extract_friend_display_name(element):
     name_selectors = (
+        '.conversationConversationItemtitle',
         """xpath=.//span[contains(@class, "item-header-name-")]""",
         """xpath=.//*[contains(@class, "item-header-name-")]""",
     )
@@ -2306,6 +2363,18 @@ async def _extract_friend_stable_keys(element):
 
 
 async def _extract_friend_record(element):
+    if await element.get_attribute('data-e2e') == 'conversation-item':
+        # The SaaS 全部 filter includes groups. Never mix their names into the
+        # friend index; unknown row types are unreadable, not guessed friends.
+        row_type = await element.evaluate('''node => {
+          const key=Object.keys(node).find(k=>k.startsWith('__reactFiber'));
+          let f=key&&node[key];
+          for(let i=0;f&&i<=3;i++,f=f.return){
+            if(f.memoizedProps?.conversation)return f.memoizedProps.conversation.type;
+          }return null;
+        }''')
+        if row_type != 1:
+            return None
     display_name = await _extract_friend_display_name(element)
     normalized_name = _normalize_target_name(display_name)
     if not normalized_name:
@@ -2411,6 +2480,7 @@ async def scroll_and_select_user(
         return
     friends_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
     target_selectors = (
+        im_ui.SAAS_ROW_SELECTOR,
         '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
         '#sub-app li.semi-list-item:has([class*="item-header-name-"])',
         'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]'
@@ -2418,7 +2488,7 @@ async def scroll_and_select_user(
         'xpath=//*[@id="sub-app"]//div[contains(@class, "semi-list-item-body") and .//span[contains(@class, "item-header-name-")]]',
         'xpath=//*[@id="sub-app"]//li[.//span[contains(@class, "item-header-name-")]]',
     )
-    scrollable_friends_selectors = (
+    scrollable_friends_selectors = im_ui.SAAS_SCROLL_SELECTORS + (
         '#sub-app [role="grid"]',
         '#sub-app .ReactVirtualized__Grid',
         'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]/div/div/div[3]/div/div/div/ul/div',
@@ -4837,6 +4907,14 @@ async def do_user_task(
                 except BrowserStageTimeout as exc:
                     # Never replace in-flight/unknown or confirmed target outcomes.
                     _record_browser_stage_failure(user, exc, user.get("targets") or [])
+                    break
+                except Exception as exc:
+                    if classify_browser_failure("browser_launch", exc) != "browser_resource_unavailable":
+                        raise
+                    _persist_account_send_failure(
+                        user, "browser_resource_unavailable", str(exc),
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        _browser_not_started_targets(user, user.get("targets") or []))
                     break
         finally:
             _BROWSER_OPERATION_OWNER.reset(owner_token)
