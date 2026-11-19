@@ -19,6 +19,9 @@ Public API (async, Playwright):
 * ``read_row_metadata(row)`` -> ``{'type', 'name', ...}`` or ``None``.
 * ``select_row(row, bound_id)`` -> ``'clicked'`` or a reason string.
 * ``verify_open(page, chat_input, bound_id)`` -> ``(bool, reason)``.
+* ``arm_enter(page, chat_input, bound_id)`` -> ``(bool, reason)``.
+* ``dispatch_was_allowed(page)`` -> ``bool`` (consumes the single shot).
+* ``disarm(page)`` -> ``None``.
 
 ``chat_input`` may be ``None`` (header-only proof, allowed only before a send
 input exists) or a Locator/ElementHandle that must resolve to the single
@@ -174,6 +177,61 @@ const result = groupOpenCheck(cfg);
 return {ok:result.ok === true, reason:result.reason || ''};
 }"""
 
+# Single-shot Enter guard for bound SaaS group sends. Arming re-runs the full
+# open-pane proof synchronously and pins the authorized editor; the capture
+# keydown handler then re-runs the same proof inside the event dispatch, so a
+# conversation switch, filter change, duplicate claimant, replaced input, or
+# wrong event target between arm and Enter is blocked instead of sent.
+_ARM_ENTER = "cfg=>{" + _COMMON + _ROW_CONVERSATION + _GROUP_OPEN_CHECK + r"""
+currentRootIndexes = new WeakMap();
+const bound = String(cfg.boundId || '');
+const previous = window.__sparkflowGroupGuard;
+if (previous && previous.handler) window.removeEventListener('keydown', previous.handler, true);
+const armed = groupOpenCheck({boundId: bound, input: cfg.input || null, requireInput: true});
+if (!armed.ok) return {ok:false, reason: armed.reason || 'group_arm_failed'};
+const pinned = armed.input;
+if (!pinned) return {ok:false, reason:'group_input_node_unavailable'};
+const state = {fired:false, allowed:false, reason:'', armed:true, handler:null};
+window.__sparkflowGroupGuard = state;
+state.handler = event => {
+  if (event.key !== 'Enter' || event.shiftKey) return;
+  if (state.fired) {
+    // Single shot already spent: every later Enter stays blocked until the
+    // record is consumed or the guard is explicitly disarmed.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    return;
+  }
+  let allowed = false;
+  let reason = 'group_identity_unavailable';
+  try {
+    const target = event.target;
+    const inputs = Array.from(document.querySelectorAll(SAAS_INPUT_SEL)).filter(visible);
+    const onEditor = !!(target && pinned
+      && (target === pinned || (typeof pinned.contains === 'function' && pinned.contains(target))));
+    if (!onEditor || inputs.length !== 1 || inputs[0] !== pinned || !visible(pinned)) {
+      reason = 'group_event_input_mismatch';
+    } else {
+      const current = groupOpenCheck({boundId: bound, input: pinned, requireInput: true});
+      allowed = current.ok === true && event.isComposing !== true;
+      reason = current.reason || (event.isComposing === true ? 'group_input_composing' : '');
+    }
+  } catch (err) {
+    allowed = false;
+    reason = 'group_identity_unavailable';
+  }
+  state.fired = true;
+  state.allowed = allowed;
+  state.reason = reason;
+  if (!allowed) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+};
+window.addEventListener('keydown', state.handler, true);
+return {ok:true, reason:''};
+}"""
+
 # Atomic committed-fiber metadata read: conversation type, display name, and —
 # only for a provable group — the bound-format shortId. Known conversation
 # types verified in the public bundle (150.b12e3b59.js ConversationType):
@@ -320,3 +378,60 @@ async def verify_open(page, chat_input, bound_id):
     if not isinstance(result, dict):
         return False, 'group_identity_unavailable'
     return result.get('ok') is True, str(result.get('reason') or '')
+
+
+async def arm_enter(page, chat_input, bound_id):
+    """Arm the single-shot Enter guard for a bound SaaS group send.
+
+    Runs the full open-pane proof synchronously (active row, unique bound
+    claimant, header/input same committed conversation, 群聊 filter) and, only
+    when it passes, installs a capture-phase ``keydown`` listener pinned to the
+    authorized editor. The listener re-runs the same proof inside the event
+    dispatch: a conversation switch, filter change, duplicate claimant,
+    replaced input, or wrong event target blocks the Enter instead of sending.
+
+    Returns ``(True, '')`` when armed; ``(False, reason)`` otherwise. At most
+    one Enter is authorized — see ``dispatch_was_allowed``/``disarm``.
+    """
+    try:
+        anchor = await _anchor_handle(chat_input)
+        if chat_input is not None and anchor is None:
+            return False, 'group_input_node_unavailable'
+        result = await page.evaluate(
+            _ARM_ENTER,
+            {'boundId': str(bound_id or ''), 'input': anchor, 'requireInput': True},
+        )
+    except Exception as exc:
+        return False, f'group_arm_unavailable: {type(exc).__name__}'
+    if not isinstance(result, dict):
+        return False, 'group_arm_unavailable'
+    return result.get('ok') is True, str(result.get('reason') or '')
+
+
+async def dispatch_was_allowed(page):
+    """Consume the armed Enter record; True only for the one allowed shot.
+
+    Removes the capture listener and deletes the guard state, so a stale
+    "allowed" can never authorize a later Enter. An Enter that never fired —
+    or one already consumed — reports False.
+    """
+    state = await page.evaluate(
+        "() => { const s = window.__sparkflowGroupGuard;"
+        " if (s && s.handler) window.removeEventListener('keydown', s.handler, true);"
+        " const out = {present: !!s, fired: s ? s.fired === true : false,"
+        "   allowed: s ? s.allowed === true : false,"
+        "   armed: s ? s.armed === true : false, reason: s ? s.reason || '' : ''};"
+        " delete window.__sparkflowGroupGuard; return out; }"
+    )
+    return (isinstance(state, dict) and state.get('present') is True
+            and state.get('fired') is True and state.get('allowed') is True
+            and state.get('armed') is True)
+
+
+async def disarm(page):
+    """Remove the armed Enter guard without authorizing anything."""
+    await page.evaluate(
+        "() => { const s = window.__sparkflowGroupGuard;"
+        " if (s && s.handler) window.removeEventListener('keydown', s.handler, true);"
+        " delete window.__sparkflowGroupGuard; }"
+    )

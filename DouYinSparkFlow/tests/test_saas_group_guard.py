@@ -445,6 +445,147 @@ class SaasGroupGuardTests(unittest.IsolatedAsyncioTestCase):
         await self._rebuild([weird], weird, weird, rows_html=rows)
         self.assertIsNone(await guard.read_row_metadata(row))
 
+    # ---------- arm_enter / dispatch_was_allowed / disarm ----------
+
+    async def _arm(self, bound_id=BOUND_A):
+        return await guard.arm_enter(self.page, await self._input(), bound_id)
+
+    async def _guard_state(self):
+        return await self.page.evaluate(
+            "() => { const s = window.__sparkflowGroupGuard; return s ? {"
+            "fired: s.fired === true, allowed: s.allowed === true,"
+            " armed: s.armed === true, reason: s.reason || ''} : null; }")
+
+    async def _enter_probe(self):
+        # Bubble-phase target listener: a blocked Enter never reaches it
+        # (stopImmediatePropagation in the window capture phase), an allowed
+        # one does.
+        await self.page.evaluate("""() => {
+          window.__enterProbe = {seen: 0};
+          const ed = document.querySelector('[data-e2e="msg-input"] [contenteditable="true"]');
+          ed.addEventListener('keydown', () => { window.__enterProbe.seen += 1; });
+        }""")
+
+    async def _probe_seen(self):
+        return await self.page.evaluate('() => window.__enterProbe.seen')
+
+    async def _press_enter(self):
+        await (await self._input()).press('Enter')
+
+    async def test_arm_enter_allows_bound_enter_and_consumes(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self._press_enter()
+        state = await self._guard_state()
+        self.assertIsNotNone(state)
+        self.assertTrue(state['fired'])
+        self.assertTrue(state['allowed'])
+        self.assertTrue(await guard.dispatch_was_allowed(self.page))
+        self.assertIsNone(await self._guard_state())
+
+    async def test_arm_enter_blocks_second_enter_until_consumed(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self._enter_probe()
+        await self._press_enter()  # allowed single shot
+        self.assertEqual(await self._probe_seen(), 1)
+        await self._press_enter()  # spent guard must keep blocking
+        self.assertEqual(await self._probe_seen(), 1)
+        state = await self._guard_state()
+        self.assertTrue(state['fired'] and state['allowed'])
+        self.assertTrue(await guard.dispatch_was_allowed(self.page))
+
+    async def test_arm_enter_blocks_enter_on_wrong_target(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self.page.evaluate("""() => {
+          document.querySelector('.RightPanelHeadertitle').dispatchEvent(
+            new KeyboardEvent('keydown', {key:'Enter', bubbles:true, cancelable:true}));
+        }""")
+        state = await self._guard_state()
+        self.assertTrue(state['fired'])
+        self.assertFalse(state['allowed'])
+        self.assertIn('input', state['reason'])
+        # The spent shot also blocks a later Enter aimed at the real editor.
+        await self._enter_probe()
+        await self._press_enter()
+        self.assertEqual(await self._probe_seen(), 0)
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+        self.assertIsNone(await self._guard_state())
+
+    async def test_arm_enter_blocks_after_header_input_switch(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        # Header and input panes rebind to a different conversation object.
+        await self._rebuild([GROUP_A, GROUP_B], GROUP_B, GROUP_B)
+        await self._press_enter()
+        state = await self._guard_state()
+        self.assertTrue(state['fired'])
+        self.assertFalse(state['allowed'])
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+        await guard.disarm(self.page)
+
+    async def test_arm_enter_blocks_after_row_type_change(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self.page.evaluate("""() => {
+          const conv = window.saasFiber.scope.child.memoizedProps.conversation;
+          window.saasFiber.scope.child.memoizedProps.conversation =
+            Object.assign({}, conv, {type: 1});
+        }""")
+        await self._press_enter()
+        state = await self._guard_state()
+        self.assertTrue(state['fired'])
+        self.assertFalse(state['allowed'])
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+        await guard.disarm(self.page)
+
+    async def test_arm_enter_rejects_duplicate_bound_claimants(self):
+        dup = dict(GROUP_B, shortId=BOUND_A, id='0:2:10000:20009')
+        rows = conv_row('群甲', GROUP_A, active=True) + conv_row('群乙', dup)
+        await self._rebuild([GROUP_A, dup], GROUP_A, GROUP_A, rows_html=rows)
+        ok, reason = await self._arm()
+        self.assertFalse(ok)
+        self.assertIn('ambiguous', reason)
+        self.assertIsNone(await self._guard_state())
+
+    async def test_arm_enter_blocks_when_group_filter_unbound(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self.page.evaluate("""() => {
+          const tags = document.querySelectorAll('.conversationFilterTagBartagItem');
+          tags.forEach(t => t.classList.remove('conversationFilterTagBartagItemActive'));
+          tags[0].classList.add('conversationFilterTagBartagItemActive');
+        }""")
+        await self._press_enter()
+        state = await self._guard_state()
+        self.assertTrue(state['fired'])
+        self.assertFalse(state['allowed'])
+        self.assertEqual(state['reason'], 'group_filter_inactive')
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+        await guard.disarm(self.page)
+
+    async def test_arm_enter_refuses_when_open_identity_unproven(self):
+        ok, reason = await self._arm(BOUND_B)
+        self.assertFalse(ok)
+        self.assertTrue(reason)
+        self.assertIsNone(await self._guard_state())
+
+    async def test_dispatch_was_allowed_false_when_never_fired(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+        self.assertIsNone(await self._guard_state())
+
+    async def test_disarm_removes_armed_guard(self):
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await guard.disarm(self.page)
+        self.assertIsNone(await self._guard_state())
+        await self._enter_probe()
+        await self._press_enter()
+        self.assertEqual(await self._probe_seen(), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
