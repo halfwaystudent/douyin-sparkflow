@@ -10,4 +10,17 @@ class ResourceRoutingTests(unittest.TestCase):
                 self.assertEqual(tasks.classify_browser_failure(stage,ResourcePressure('insufficient memory')),'browser_resource_unavailable')
         self.assertIn('browser_resource_unavailable',tasks.ACCOUNT_LEVEL_FAILURE_CATEGORIES)
 
+    def test_low_session_memory_stops_before_checkpoint_without_recovery_probe(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from core.browser_resources import BrowserResourceUnavailable
+        from tests.test_browser_stage_timeouts import flow
+        with flow(identity_guard=False) as (user,page,context,browser,chat,release,run):
+            with patch.object(tasks,'ensure_browser_resources',create=True,side_effect=BrowserResourceUnavailable({'check':'session'})), \
+                 patch.object(tasks,'_mark_browser_target_in_flight') as mark, \
+                 patch.object(tasks,'detect_message_already_sent',AsyncMock()) as recovery:
+                asyncio.run(run())
+            mark.assert_not_called();chat.press.assert_not_awaited();recovery.assert_not_awaited()
+            self.assertEqual(user['account_failure']['category'],'browser_resource_unavailable')
+
 if __name__=='__main__':unittest.main()

@@ -135,13 +135,13 @@ def test_ensure_raises_browser_resource_unavailable_on_low_host_memory():
 
 
 def test_unmeasurable_host_is_fail_safe_not_infinite_resource():
-    """Missing meminfo -> measured=False, ok=True (do not brick non-Linux)."""
+    """A missing Linux sample refuses; non-Linux support is tested separately."""
     report = br.browser_resource_report(
         "launch",
         sampler=lambda: {"host": {"read_error": "meminfo_unreadable"},
                          "cgroups": [], "platform": "linux"},
     )
-    assert report["ok"] is True
+    assert report["ok"] is False
     assert report["measured"] is False
 
 
@@ -164,7 +164,7 @@ def test_io_error_is_reported_not_swallowed_as_unlimited():
 
 def test_fixture_host_normal_passes_launch(monkeypatch, tmp_path):
     _patch_fs(monkeypatch, tmp_path, meminfo=MEMINFO_OK,
-              self_cgroup="0::/\n",
+              self_cgroup="0::/docker/abc\n",
               cgroup_files={"docker/abc/memory.max": "max\n",
                             "docker/abc/memory.current": "1048576\n"})
     report = br.browser_resource_report("launch")

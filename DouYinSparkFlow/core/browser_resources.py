@@ -1,44 +1,13 @@
-"""Pre-launch memory safety for browser sessions.
+"""Read-only memory gate for browser startup and pre-dispatch checks.
 
-The helpers here only *measure*; they never touch the browser itself.  Two
-layers are reported separately because the deployment differs:
-
-* ``host``    - /proc/meminfo MemAvailable.  This is the whole machine, not a
-  container view.  Swap is deliberately ignored: it is disk, not RAM, and a
-  page-in storm is exactly the stall we are trying to avoid.
-* ``cgroup``  - the tightest finite limit among cgroup v2 ``memory.max`` and
-  v1 ``memory.limit_in_bytes`` discovered under the process's own
-  ``/proc/self/cgroup`` membership, paired with ``memory.current`` /
-  ``memory.usage_in_bytes``.  ``max``/``max``-like values mean unlimited and
-  are skipped.  On cgroup v1 the kernel also reports a near-2**63 value for
-  unlimited; values >= 1 EiB are treated as unlimited.
-
-Read failures are never treated as "infinite resources".  A sampling or I/O
-problem returns ``memory=None`` entries with a ``read_error`` note instead of
-raising, so a non-Linux or fixture-broken host cannot silently disable the
-check forever, while a real permission/disk fault is visible in the returned
-dict rather than being swallowed as success.
-
-Thresholds (see ``browser_resource_report``):
-
-* ``launch``: refuse to start a *new* browser when the tightest bounded
-  layer (cgroup limit when finite, else host MemAvailable) would drop below
-  ``max(fixed_min_bytes, ratio * bound)``.  Defaults are 256 MiB fixed and
-  10% of the bound.  The fixed floor keeps a 2 GiB host able to launch a
-  session after its current browsers have already consumed RAM.
-* ``session``: while a browser is already running, only the *fraction* floor
-  (default 10% of MemTotal) is enforced by callers that re-check mid-session;
-  the fixed floor is intentionally not applied there so a small host is not
-  permanently locked out once it is already in use.
-
-Everything is injectable for tests: ``_read_text`` can be monkeypatched, or
-``_MEMINFO_PATH`` / ``_CGROUP_ROOT`` / ``_SELF_CGROUP_PATH`` point at fixture
-files.
+Check host MemAvailable and every finite process-memory cgroup independently;
+swap is never counted as RAM. Launch requires max(256 MiB, 10% of each bound),
+session checks require 10%. Linux sampling errors fail closed. Platforms without
+Linux memory telemetry remain supported; no browser or sysctl is modified here.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -81,7 +50,7 @@ class BrowserResourceUnavailable(RuntimeError):
 
 def _format_details(details):
     parts = []
-    for key in ("layer", "available_bytes", "required_bytes", "bound_bytes"):
+    for key in ("layer", "available_bytes", "required_bytes", "bound_bytes", "errors"):
         if key in details:
             parts.append(f"{key}={details[key]}")
     return " ".join(parts)
@@ -162,7 +131,9 @@ def _cgroup_memberships():
         fields = line.split(":")
         if len(fields) != 3:
             continue
-        hierarchy, _controllers, path = fields
+        hierarchy, controllers, path = fields
+        if hierarchy != "0" and "memory" not in controllers.split(","):
+            continue
         path = path.strip()
         if not path:
             path = "/"
@@ -173,12 +144,27 @@ def _cgroup_memberships():
         yield hierarchy.strip(), rel
 
 
+def _resolve_cgroup_dir(base, rel):
+    # Container mounts may expose /docker/<id> as the controller root.
+    # Subtract the kernel mount root, not the host membership twice.
+    for line in (_read_text('/proc/self/mountinfo') or '').splitlines():
+        fields = line.split()
+        if len(fields) < 7 or fields[4] != str(base):
+            continue
+        try:
+            suffix = Path('/'+rel).relative_to(Path(fields[3]))
+        except ValueError:
+            continue
+        return base / suffix
+    return base / rel if rel else base
+
+
 def _cgroup_v2_dir():
     """Absolute dir holding this process's v2 memory files (None if absent)."""
     for hierarchy, rel in _cgroup_memberships() or ():
         if hierarchy == "0":
             base = _CGROUP_ROOT
-            return base / rel if rel else base
+            return _resolve_cgroup_dir(base, rel)
     return None
 
 
@@ -188,13 +174,10 @@ def _cgroup_v1_dirs():
     for hierarchy, rel in _cgroup_memberships() or ():
         if hierarchy == "0":
             continue
-        base = _CGROUP_ROOT / f"memory"  # unified layout on modern kernels
-        if not base.exists():
-            # Older layout: /sys/fs/cgroup/memory is itself the controller root.
+        base = _CGROUP_ROOT / "memory"
+        if _read_text(_CGROUP_ROOT / "memory.limit_in_bytes") is not None:
             base = _CGROUP_ROOT
-        if not base.exists():
-            continue
-        directory = base / rel if rel else base
+        directory = _resolve_cgroup_dir(base, rel)
         key = str(directory)
         if key in seen:
             continue
@@ -203,21 +186,22 @@ def _cgroup_v1_dirs():
 
 
 def _finite_cgroup_limit(directory, *, version):
-    """Return (limit_bytes, current_bytes, source) for one cgroup dir."""
-    if version == 2:
-        limit_text = _read_text(directory / "memory.max")
-        current_text = _read_text(directory / "memory.current")
-        limit = _parse_cgroup_v2_limit(limit_text)
-        current = _parse_cgroup_v2_current(current_text)
-        return limit, current, "cgroup_v2"
-    limit_text = _read_text(directory / "memory.limit_in_bytes")
-    current_text = _read_text(directory / "memory.usage_in_bytes")
-    limit = _parse_cgroup_v1_limit(limit_text)
-    try:
-        current = int((current_text or "").strip())
-    except (TypeError, ValueError):
-        current = None
-    return limit, current, "cgroup_v1"
+    """Read limit and usage; distinguish unlimited from missing/malformed."""
+    limit_name, usage_name = (("memory.max", "memory.current") if version == 2
+                              else ("memory.limit_in_bytes", "memory.usage_in_bytes"))
+    raw_limit = _read_text(directory / limit_name)
+    raw_current = _read_text(directory / usage_name)
+    source = "cgroup_v%d" % version
+    raw = (raw_limit or "").strip()
+    unlimited = raw == "max" if version == 2 else raw.isdigit() and int(raw) >= _UNLIMITED_FLOOR
+    if unlimited:
+        return None, _parse_cgroup_v2_current(raw_current), source, "no_finite_limit"
+    if not raw.isdigit() or int(raw) <= 0:
+        return None, None, source, "limit_unreadable"
+    limit = int(raw)
+    current = _parse_cgroup_v2_current(raw_current)
+    error = None if isinstance(current, int) and current >= 0 else "usage_unreadable"
+    return limit, current, source, error
 
 
 def _sample_memory():
@@ -237,7 +221,7 @@ def _sample_memory():
         fields = _parse_meminfo_kb(meminfo_text)
         sample["host"].update({
             "mem_total_bytes": fields.get("MemTotal", 0) * 1024 or None,
-            "mem_available_bytes": fields.get("MemAvailable", 0) * 1024 or None,
+            "mem_available_bytes": fields["MemAvailable"] * 1024 if "MemAvailable" in fields else None,
             "mem_free_bytes": fields.get("MemFree", 0) * 1024 or None,
             "swap_total_bytes": fields.get("SwapTotal", 0) * 1024 or None,
             "swap_free_bytes": fields.get("SwapFree", 0) * 1024 or None,
@@ -246,19 +230,19 @@ def _sample_memory():
     # cgroup v2 (unified) first; it is the tightest view when present.
     v2_dir = _cgroup_v2_dir()
     if v2_dir is not None:
-        limit, current, source = _finite_cgroup_limit(v2_dir, version=2)
+        limit, current, source, error = _finite_cgroup_limit(v2_dir, version=2)
         sample["cgroups"].append({
             "version": 2, "source": source, "path": str(v2_dir),
             "limit_bytes": limit, "current_bytes": current,
-            "read_error": None if limit is not None else "no_finite_limit",
+            "read_error": error,
         })
 
     for directory in _cgroup_v1_dirs():
-        limit, current, source = _finite_cgroup_limit(directory, version=1)
+        limit, current, source, error = _finite_cgroup_limit(directory, version=1)
         sample["cgroups"].append({
             "version": 1, "source": source, "path": str(directory),
             "limit_bytes": limit, "current_bytes": current,
-            "read_error": None if limit is not None else "no_finite_limit",
+            "read_error": error,
         })
 
     return sample
@@ -275,141 +259,54 @@ LAUNCH_MIN_AVAILABLE_BYTES = 256 * 1024 * 1024       # 256 MiB fixed floor
 LAUNCH_MIN_AVAILABLE_RATIO = 0.10                    # 10% of the bound
 SESSION_MIN_AVAILABLE_RATIO = 0.10                   # in-session: fraction only
 
-# Env overrides exist for operators but are NOT the test hook: tests patch the
-# constants/sampler directly so production cannot be silently disabled by an
-# environment variable left in a container spec.
-
-
-def _env_int(name, default):
-    try:
-        return int(str(os.getenv(name) or "").strip())
-    except (TypeError, ValueError):
-        return default
-
-
 def _launch_thresholds():
-    return {
-        "min_available_bytes": _env_int(
-            "SPARKFLOW_BROWSER_LAUNCH_MIN_AVAILABLE_MB",
-            LAUNCH_MIN_AVAILABLE_BYTES // (1024 * 1024),
-        ) * 1024 * 1024,
-        "min_available_ratio": float(
-            os.getenv("SPARKFLOW_BROWSER_LAUNCH_MIN_AVAILABLE_RATIO")
-            or LAUNCH_MIN_AVAILABLE_RATIO
-        ),
-    }
+    return {"min_available_bytes": LAUNCH_MIN_AVAILABLE_BYTES,
+            "min_available_ratio": LAUNCH_MIN_AVAILABLE_RATIO}
 
 
 def _session_thresholds():
-    return {
-        "min_available_ratio": float(
-            os.getenv("SPARKFLOW_BROWSER_SESSION_MIN_AVAILABLE_RATIO")
-            or SESSION_MIN_AVAILABLE_RATIO
-        ),
-    }
-
-
-def _tightest_bounded_layer(sample):
-    """Pick the layer whose limit actually constrains this process.
-
-    Preference order: finite cgroup limit (tightest wins) > host MemAvailable.
-    Returns (layer_name, bound_bytes, available_bytes, detail_dict).
-    """
-    best = None
-    for cg in sample.get("cgroups") or []:
-        limit = cg.get("limit_bytes")
-        current = cg.get("current_bytes")
-        if not isinstance(limit, int) or limit <= 0:
-            continue
-        if not isinstance(current, int) or current < 0:
-            current = 0
-        available = max(0, limit - current)
-        candidate = (available, limit, "cgroup", cg, current)
-        if best is None or available < best[0]:
-            best = candidate
-    if best is not None:
-        available, bound, layer, cg, current = best
-        return layer, bound, available, {
-            "cgroup_version": cg.get("version"),
-            "cgroup_path": cg.get("path"),
-            "cgroup_limit_bytes": bound,
-            "cgroup_current_bytes": current,
-        }
-
-    host = sample.get("host") or {}
-    available = host.get("mem_available_bytes")
-    total = host.get("mem_total_bytes")
-    if isinstance(available, int) and isinstance(total, int) and total > 0:
-        return "host", total, available, {
-            "mem_total_bytes": total,
-            "mem_free_bytes": host.get("mem_free_bytes"),
-            "swap_total_bytes": host.get("swap_total_bytes"),
-            "swap_free_bytes": host.get("swap_free_bytes"),
-            "host_read_error": host.get("read_error"),
-        }
-    return "unknown", None, None, {"sample": sample}
+    return {"min_available_ratio": SESSION_MIN_AVAILABLE_RATIO}
 
 
 def browser_resource_report(check="launch", *, sampler=None):
-    """Measure memory and decide whether a browser may start/continue.
-
-    Returns a dict; raises nothing.  ``ok`` is False only when a *finite*
-    bound was measured AND available memory is below the required threshold.
-    Unmeasurable hosts/cgroups report ``ok=True`` with ``measured=False`` so
-    exotic platforms keep working, while ``read_error`` fields keep the cause
-    visible.
-    """
+    """Check every measured layer. Linux telemetry errors refuse a new visit."""
+    if check not in {"launch", "session"}:
+        raise ValueError("unknown browser resource check")
     sample = (sampler or _sample_memory)()
-    layer, bound, available, extra = _tightest_bounded_layer(sample)
-
-    if check == "session":
-        thresholds = _session_thresholds()
-        required = (
-            int(bound * thresholds["min_available_ratio"])
-            if isinstance(bound, int) and bound > 0 else None
-        )
-    else:
-        thresholds = _launch_thresholds()
-        fixed = thresholds["min_available_bytes"]
-        ratio = thresholds["min_available_ratio"]
-        if isinstance(bound, int) and bound > 0:
-            required = max(fixed, int(bound * ratio))
-        else:
-            required = fixed
-
-    report = {
-        "ok": True,
-        "measured": available is not None and bound is not None,
-        "check": check,
-        "layer": layer,
-        "bound_bytes": bound,
-        "available_bytes": available,
-        "required_bytes": required,
-        "thresholds": thresholds,
-        "sample": sample,
-    }
-    report.update(extra)
-
-    if not report["measured"] or required is None or available is None:
-        return report
-    if available < required:
-        report["ok"] = False
-    return report
+    thresholds = _session_thresholds() if check == "session" else _launch_thresholds()
+    ratio = thresholds["min_available_ratio"]
+    fixed = 0 if check == "session" else thresholds["min_available_bytes"]
+    layers = []
+    errors = []
+    host = sample.get("host") or {}
+    total, available = host.get("mem_total_bytes"), host.get("mem_available_bytes")
+    linux = sample.get("platform", sys.platform).startswith("linux")
+    if isinstance(total, int) and total > 0 and isinstance(available, int) and available >= 0:
+        layers.append(("host", total, available))
+    elif linux:
+        errors.append("host_memory_unreadable")
+    for cg in sample.get("cgroups") or []:
+        limit, current = cg.get("limit_bytes"), cg.get("current_bytes")
+        if limit is None:
+            if cg.get("read_error") not in {None, "no_finite_limit"}:
+                errors.append("cgroup_limit_unreadable")
+            continue
+        if not isinstance(limit, int) or limit <= 0 or not isinstance(current, int) or current < 0:
+            errors.append("cgroup_usage_unreadable")
+            continue
+        layers.append(("cgroup", limit, max(0, limit-current)))
+    measurements = [{"layer": name, "bound_bytes": bound, "available_bytes": free,
+                     "required_bytes": max(fixed, int(bound*ratio))}
+                    for name, bound, free in layers]
+    tightest = min(measurements, key=lambda x:x["available_bytes"]-x["required_bytes"]) if measurements else {
+        "layer":"unknown", "bound_bytes":None, "available_bytes":None, "required_bytes":None}
+    return {**tightest, "check": check, "thresholds":thresholds, "sample":sample,
+            "layers":measurements, "errors":errors, "measured":bool(measurements),
+            "ok":not errors and all(x["available_bytes"]>=x["required_bytes"] for x in measurements)}
 
 
 def ensure_browser_resources(check="launch", *, sampler=None):
-    """Raise :class:`BrowserResourceUnavailable` when memory is too tight.
-
-    Contract for callers (``get_browser`` / ``get_persistent_browser_context``
-    use ``check="launch"``; a mid-session re-check may pass ``check="session"``):
-
-    * returns the measurement dict on success (``ok=True``);
-    * raises ``BrowserResourceUnavailable(category='browser_resource_unavailable')``
-      only when a finite bound was measured and available < required;
-    * never raises for missing /proc or non-Linux platforms — those report
-      ``measured=False`` and pass, because refusing forever on a platform we
-      cannot measure would be worse than the risk it guards.
-    """
+    """Return a report or refuse low/unreadable Linux resources before launch."""
     report = browser_resource_report(check=check, sampler=sampler)
     if report["ok"]:
         return report

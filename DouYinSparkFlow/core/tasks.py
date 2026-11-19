@@ -34,6 +34,7 @@ from core.browser import (
     release_browser_account_lock,
     select_douyin_network_mode,
 )
+from core.browser_resources import BrowserResourceUnavailable, ensure_browser_resources
 from core.im_receipt import parse_send_response
 from core.msg_builder import build_message, build_message_candidates, using_message_config, current_message_config
 from core import personal_streak, send_pause
@@ -392,7 +393,7 @@ async def _require_friend_chat(page, user, target_name, *, arm=False, wait=False
     try:
         ok, reason = await _run_browser_stage("friend_identity", friend_chat_guard.verify_friend(
             page, latest, target_name, arm=arm, wait=wait))
-    except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+    except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
         raise
     except Exception as exc:
         raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: verification failed') from exc
@@ -5153,6 +5154,7 @@ async def _do_user_task_locked(
                         len((last_own_message_before or {}).get("text", "")),
                     )
 
+                    ensure_browser_resources("session")
                     started = _mark_browser_target_in_flight(
                         user,
                         target_name,
@@ -5318,7 +5320,7 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message", account_name)
-                except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+                except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
                     # No recovery browser probes after a wedged stage or an
                     # identity mismatch, and never continue to another target.
                     try:
@@ -5417,7 +5419,7 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message after failure", account_name)
-        except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+        except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
             raise
         except Exception as exc:
             for group_error in group_scan_errors:
