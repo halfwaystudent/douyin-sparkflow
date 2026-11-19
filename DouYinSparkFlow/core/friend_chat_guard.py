@@ -78,6 +78,15 @@ const visible = node => {
   return style.display!=='none' && style.visibility!=='hidden' && r.width>0 && r.height>0;
 };
 const nameOf = row => row.querySelector('span[class*="item-header-name-"]')?.textContent?.trim() || '';
+// New IM SaaS rows (verified in __federation_expose_default_export.aab99327.js):
+// div[data-e2e="conversation-item"] > .conversationConversationItemtitle rendered by
+// TextKeepSpaces, which stores spaces as \xa0 — normalize before comparing.
+const normalizeName = text => (text || '').replace(/ /g, ' ').trim();
+const saasNameOf = row => {
+  const node = row.querySelector('.conversationConversationItemtitle');
+  return normalizeName(node ? node.textContent : '');
+};
+const sameName = (observed, expected) => normalizeName(observed) === normalizeName(expected);
 const rawFiber = node => {const key=Object.keys(node || {}).find(k=>k.startsWith('__reactFiber'));return key && node[key];};
 // These caches exist only during this synchronous evaluate/keydown check.
 // A DOM expando and even a current host's return links may point at alternate
@@ -136,6 +145,20 @@ const addConversation = (bag,c) => {
   if(c.shortId)addIdentity(bag,'conversation',c.shortId);else addIdentity(bag,'conversation',c.id);
   addIdentity(bag,'peer',c.peerUserId);addIdentity(bag,'peer',c.peer_user_id);
   addIdentity(bag,'sec',c.secUid);addIdentity(bag,'sec',c.sec_uid);
+  // New IM SaaS conversation model (ux() wrapper in the public bundle):
+  // peer uid is toParticipantUserId; the peer sec_uid is either the explicit
+  // toParticipantSecUserId (module 2540 wrapper) or derived from
+  // firstPageParticipant.participants — the exact lookup that wrapper performs.
+  // No store/allList membership is consulted; only per-conversation fields.
+  const saasPeer = c.toParticipantUserId;
+  addIdentity(bag,'peer',saasPeer);
+  if(c.toParticipantSecUserId)addIdentity(bag,'sec',c.toParticipantSecUserId);
+  if(saasPeer && !c.toParticipantSecUserId){
+    const fpp = c.firstPageParticipant;
+    const list = Array.isArray(fpp) ? fpp : (fpp && Array.isArray(fpp.participants) ? fpp.participants : []);
+    const member = list.find(p => p && typeof p==='object' && String(p.user_id)===String(saasPeer));
+    if(member)addIdentity(bag,'sec',member.sec_uid !== undefined ? member.sec_uid : member.secUid);
+  }
 };
 const unpack = bag => Object.fromEntries(Object.entries(bag).map(([k,v])=>[k,Array.from(v)]));
 const conversationIdentity = c => {const bag=identityBag();addConversation(bag,c);return unpack(bag);};
@@ -180,6 +203,85 @@ const nearestChatProvider = state => {
 const sameConversation = (identity,cfg) => consistent(identity)
   && (!cfg.conversation || identity.conversation[0]===cfg.conversation)
   && (!cfg.thread || identity.thread[0]===cfg.thread);
+// ---- New IM SaaS UI (public bundle verified) ----
+// Rows: div[data-e2e="conversation-item"]; active row carries the exact
+// conversationConversationItemcurConversation class. Header name lives in
+// .RightPanelHeadertitle (normal panel) or .StackLayoutStackChatHeadertitle
+// (stack layout); input is the contenteditable inside [data-e2e="msg-input"].
+// The pane proof is the per-conversation `curConversation` prop that the
+// public bundle passes to the RightPanelHeader and MsgInput components —
+// header and input must resolve to the SAME conversation object.
+const SAAS_ROW_SEL = '#sub-app [data-e2e="conversation-item"]';
+const SAAS_INPUT_SEL = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]';
+const SAAS_HEADER_SEL = '#sub-app .RightPanelHeaderconvHeader, #sub-app [class*="StackLayoutStackChatHeaderinfoContainer"]';
+const SAAS_TITLE_SEL = '.RightPanelHeadertitle, .StackLayoutStackChatHeadertitle';
+const saasRows = () => Array.from(document.querySelectorAll(SAAS_ROW_SEL)).filter(visible);
+const legacyRows = () => Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
+const uiMode = () => {
+  const s = saasRows().length, l = legacyRows().length;
+  return s && l ? 'mixed' : s ? 'saas' : l ? 'legacy' : 'none';
+};
+const nearestSaasConversation = state => {
+  const path = state.path || [];
+  for (let depth = 0; depth < path.length && depth <= 14; depth++) {
+    const props = path[depth].memoizedProps;
+    if (props && props.curConversation && typeof props.curConversation === 'object') return path[depth];
+  }
+  return null;
+};
+const scopedPaneIdentitySaas = (input, header, cfg) => {
+  const i = committedFiber(input), h = committedFiber(header);
+  if ((i.rootKnown && !i.committed) || (h.rootKnown && !h.committed))
+    return {present:true, ok:false, reason:'friend_uncommitted_pane'};
+  const ip = nearestSaasConversation(i), hp = nearestSaasConversation(h);
+  if (!ip && !hp) return {present:false, ok:false};
+  // Both panes must resolve to the identical current-conversation object;
+  // a missing or divergent proof can never be replaced by DOM attributes.
+  if (!i.committed || !h.committed || !ip || !hp
+      || ip.memoizedProps.curConversation !== hp.memoizedProps.curConversation)
+    return {present:true, ok:false, reason:'friend_pane_scope_mismatch'};
+  const identity = conversationIdentity(ip.memoizedProps.curConversation);
+  if ((!cfg.conversation && !cfg.thread) || !sameConversation(identity,cfg)
+      || !matches(identity,cfg.expected))
+    return {present:true, ok:false, reason:'friend_current_conversation_mismatch'};
+  return {present:true, ok:true};
+};
+const saasCheck = cfg => {
+  currentRootIndexes = new WeakMap();
+  const mode = uiMode();
+  if (mode !== 'saas') return {ok:false, reason: mode === 'mixed' ? 'friend_ui_ambiguous' : 'friend_ui_unavailable'};
+  const rows = saasRows();
+  const named = rows.filter(row => sameName(saasNameOf(row), cfg.name));
+  if (named.length !== 1) return {ok:false, reason:'friend_identity_ambiguous'};
+  const active = rows.filter(row => row.classList.contains('conversationConversationItemcurConversation'));
+  if (active.length !== 1 || active[0] !== named[0]) return {ok:false, reason:'friend_chat_not_active'};
+  const rowState = committedFiber(active[0]);
+  if (rowState.rootKnown && !rowState.committed) return {ok:false, reason:'friend_row_uncommitted'};
+  const rowIdentity = read(active[0]);
+  if (!matches(rowIdentity,cfg.expected)) return {ok:false, reason:'friend_active_identity_mismatch'};
+  if (!sameConversation(rowIdentity,cfg)) return {ok:false, reason:'friend_conversation_changed'};
+  const headers = Array.from(document.querySelectorAll(SAAS_HEADER_SEL)).filter(visible);
+  if (headers.length !== 1) return {ok:false, reason:'friend_header_ambiguous'};
+  const titles = Array.from(headers[0].querySelectorAll(SAAS_TITLE_SEL)).filter(visible);
+  if (titles.length !== 1 || !sameName(titles[0].textContent, cfg.name))
+    return {ok:false, reason:'friend_header_name_mismatch'};
+  const inputs = Array.from(document.querySelectorAll(SAAS_INPUT_SEL)).filter(visible);
+  if (inputs.length !== 1) return {ok:false, reason:'friend_input_ambiguous'};
+  const inputIdentity = read(inputs[0],0), headerIdentity = read(headers[0],0);
+  for (const identity of [inputIdentity,headerIdentity]) {
+    if (!consistent(identity)) return {ok:false, reason:'friend_open_identity_conflict'};
+    for (const kind of ['peer','sec']) {
+      if (identity[kind].length && cfg.expected[kind] && identity[kind][0] !== cfg.expected[kind])
+        return {ok:false, reason:'friend_open_identity_mismatch'};
+    }
+    if ((identity.conversation.length && cfg.conversation && identity.conversation[0] !== cfg.conversation)
+        || (identity.thread.length && cfg.thread && identity.thread[0] !== cfg.thread))
+      return {ok:false, reason:'friend_open_conversation_mismatch'};
+  }
+  const pane = scopedPaneIdentitySaas(inputs[0], headers[0], cfg);
+  if (!pane.ok) return {ok:false, reason: pane.reason || 'friend_open_identity_unavailable'};
+  return {ok:true, reason:'', input:inputs[0]};
+};
 const scopedPaneIdentity = (input,header,cfg) => {
   const i=committedFiber(input),h=committedFiber(header);
   if((i.rootKnown && !i.committed)||(h.rootKnown && !h.committed))return {present:true,ok:false,reason:'friend_uncommitted_pane'};
@@ -210,6 +312,9 @@ const check = cfg => {
   // The armed keydown closure survives React commits. Never reuse the graph
   // indexed while arming, even if root.current cycles back to the same object.
   currentRootIndexes = new WeakMap();
+  const mode = uiMode();
+  if (mode === 'saas') return saasCheck(cfg);
+  if (mode === 'mixed') return {ok:false, reason:'friend_ui_ambiguous'};
   const rows=Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
   const named=rows.filter(row=>nameOf(row)===cfg.name);
   if(named.length!==1)return {ok:false,reason:'friend_identity_ambiguous'};
@@ -264,6 +369,23 @@ const check = cfg => {
 """
 
 _SELECT = "(row,cfg)=>{" + _COMMON + r"""
+const isSaasRow = !!(row.closest && row.closest('[data-e2e="conversation-item"]'));
+if(isSaasRow){
+  const mode=uiMode();
+  if(mode!=='saas')return {ok:false,reason:mode==='mixed'?'friend_ui_ambiguous':'friend_ui_unavailable'};
+  const srows=saasRows();
+  if(!visible(row) || !srows.includes(row))return {ok:false,reason:'friend_row_unavailable'};
+  if(srows.filter(r=>sameName(saasNameOf(r),cfg.name)).length!==1)return {ok:false,reason:'friend_identity_ambiguous'};
+  if(!sameName(saasNameOf(row),cfg.name))return {ok:false,reason:'friend_row_name_mismatch'};
+  const identity=read(row);
+  if(!matches(identity,cfg.expected))return {ok:false,reason:'friend_row_identity_mismatch'};
+  const title=row.querySelector('.conversationConversationItemtitle');
+  if(!title)return {ok:false,reason:'friend_name_node_unavailable'};
+  // The SaaS row activates on mousedown (verified onMouseDown in the bundle),
+  // not click — dispatch the same event a real press produces first.
+  row.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window}));
+  return {ok:true,reason:'',conversation:identity.conversation[0] || '',thread:identity.thread[0] || ''};
+}
 const rows=Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
 if(!visible(row) || !rows.includes(row))return {ok:false,reason:'friend_row_unavailable'};
 if(rows.filter(r=>nameOf(r)===cfg.name).length!==1)return {ok:false,reason:'friend_identity_ambiguous'};
@@ -289,7 +411,11 @@ if(cfg.arm){
     if(event.key!=='Enter' || event.shiftKey)return;
     let correctInput=false,current={ok:false,reason:'friend_identity_unavailable'};
     try{
-      const inputs=Array.from(document.querySelectorAll('#sub-app [contenteditable="true"]')).filter(visible);
+      const mode=uiMode();
+      const inputs = mode==='saas'
+        ? Array.from(document.querySelectorAll(SAAS_INPUT_SEL)).filter(visible)
+        : mode==='mixed' ? []
+        : Array.from(document.querySelectorAll('#sub-app [contenteditable="true"]')).filter(visible);
       correctInput=inputs.length===1 && inputs[0]===pinnedInput && visible(pinnedInput)
         && (event.target===pinnedInput || pinnedInput.contains(event.target));
       if(correctInput)current=check(cfg);
