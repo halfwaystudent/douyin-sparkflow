@@ -368,6 +368,12 @@ class SaasGroupGuardTests(unittest.IsolatedAsyncioTestCase):
         ok, reason = await guard.verify_open(self.page, await self._input(), BOUND_A)
         self.assertFalse(ok)
 
+    async def test_unreadable_supplied_editor_does_not_degrade_to_header_only(self):
+        from unittest.mock import AsyncMock, Mock
+        unreadable = Mock(element_handle=AsyncMock(side_effect=RuntimeError('detached')))
+        ok, _ = await guard.verify_open(self.page, unreadable, BOUND_A)
+        self.assertFalse(ok)
+
     async def test_verify_open_never_raises_on_garbage_page(self):
         await self.page.set_content('<div id="sub-app"></div>')
         ok, reason = await guard.verify_open(self.page, None, BOUND_A)

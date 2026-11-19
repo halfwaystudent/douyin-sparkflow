@@ -196,6 +196,8 @@ async def verify_open(page, chat_input, bound_id):
         if not await im_ui.saas_filter_is_active(page, 'group'):
             return False, 'group_filter_inactive'
         anchor = await _anchor_handle(chat_input)
+        if chat_input is not None and anchor is None:
+            return False, 'group_input_node_unavailable'
         result = await page.evaluate(_VERIFY_OPEN, {'boundId': str(bound_id or ''), 'input': anchor})
     except Exception as exc:
         return False, f'group_identity_unavailable: {type(exc).__name__}'

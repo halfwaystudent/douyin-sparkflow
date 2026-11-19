@@ -41,7 +41,7 @@ from core import personal_streak, send_pause
 from core.identity import same_login_snapshot
 from core.protocol_dispatch import run_protocol_tasks
 from core.profile_cookies import prepare_profile_cookies, publish_profile_cookies
-from core import friend_identity, friend_chat_guard, notifications, streak_state, im_ui
+from core import friend_identity, friend_chat_guard, notifications, streak_state, im_ui, saas_group_guard
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -1664,9 +1664,27 @@ async def _click_first_visible_locator(candidates, account_name, stage):
     return False
 
 
+async def _sender_chat_variant_is_saas(page):
+    legacy_confirmed = False
+    async def legacy_probe():
+        nonlocal legacy_confirmed
+        selector = await _selector_visible(page, (
+            '#sub-app li.semi-list-item',
+            '#sub-app [class*="item-header-name-"]',
+            '#sub-app [role="tab"]',
+        ))
+        legacy_confirmed = bool(selector)
+        return legacy_confirmed
+    saas = await im_ui.wait_for_saas_ui(page, timeout_ms=30000, legacy_probe=legacy_probe)
+    if not saas and not legacy_confirmed:
+        raise FriendListUnavailableError('friend_list_unavailable: 未识别到已就绪的新旧私信页面')
+    return saas
+
+
 async def _open_friends_tab(page, account_name, fallback_selector, target_selectors):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_friends_tab")
-    if await im_ui.activate_saas_filter(page, "friend"):
+    if await _sender_chat_variant_is_saas(page):
+        await im_ui.activate_saas_filter(page, "friend")
         return "saas_verified"
     # Group and friend rows use the same DOM shape.  A visible row therefore
     # proves neither that the friends tab is active nor that it is safe to
@@ -1756,7 +1774,8 @@ def _dedupe_group_target_aliases(targets):
 
 async def _open_groups_tab(page, account_name):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_groups_tab")
-    if await im_ui.activate_saas_filter(page, "group"):
+    if await _sender_chat_variant_is_saas(page):
+        await im_ui.activate_saas_filter(page, "group")
         return
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     candidates = [
@@ -1799,6 +1818,8 @@ _GROUP_HEADER_SELECTOR = '#sub-app div[class*="box-header-"]'
 
 async def _read_group_row_conversation_id(row_locator):
     """Read the numeric conversation identity exposed by a group row's React fiber."""
+    if await row_locator.get_attribute('data-e2e') == 'conversation-item':
+        return await saas_group_guard.read_row_id(row_locator)
     script = """(element) => {
         const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
         let fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
@@ -1878,6 +1899,9 @@ async def _stable_single_screen_group_list(page, scrollable):
 
 async def _confirm_group_chat_header(page, expected_name):
     """Require the selected chat header to name the exact configured group."""
+    if await im_ui.is_saas_ui(page):
+        headers = page.locator('#sub-app .RightPanelHeaderconvHeader:visible .RightPanelHeadertitle:visible')
+        return await headers.count() == 1 and (await headers.inner_text()).replace('\xa0', ' ').strip() == expected_name.replace('\xa0', ' ').strip()
     try:
         await page.wait_for_function(
             """({ selector, expectedName }) => Array.from(document.querySelectorAll(selector))
@@ -1900,6 +1924,8 @@ async def _verify_open_group_conversation(page, chat_input, bound_id):
     Context membership is corroborating evidence only: its list order does not
     identify the active conversation, but a present context must include the id.
     """
+    if await im_ui.is_saas_ui(page):
+        return await saas_group_guard.verify_open(page, chat_input, bound_id)
     try:
         anchor = await chat_input.element_handle() if chat_input is not None else None
         if anchor is None:
@@ -1939,6 +1965,10 @@ async def _read_group_header_conversation_id(page, bound_id=None):
     ``allList`` is never indexed: when a bound id is supplied, it only proves
     that exact id is represented in the header's React context.
     """
+    if await im_ui.is_saas_ui(page):
+        if bound_id and (await saas_group_guard.verify_open(page, None, bound_id))[0]:
+            return bound_id
+        return None
     script = """({ element, boundId }) => { const valid = value => typeof value === 'string' && /^\\d{10,25}$/.test(value);
         let key = Object.keys(element || {}).find(key => key.startsWith('__reactFiber'));
         let fiber = key && element[key];
@@ -2006,6 +2036,8 @@ async def _click_bound_group_row_atomically(row_locator, bound_id):
 
     Returns "clicked", or a short reason why nothing was clicked.
     """
+    if await row_locator.get_attribute('data-e2e') == 'conversation-item':
+        return await saas_group_guard.select_row(row_locator, bound_id)
     script = """(element, boundId) => {
         const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
         const fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
@@ -2045,7 +2077,7 @@ async def _locate_bound_group_row(page, scrollable, selector, bound_id, account_
         raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: could not reset group list")
     deadline = asyncio.get_running_loop().time() + float(config["maxScanSeconds"])
     while asyncio.get_running_loop().time() <= deadline:
-        for row in await page.locator('#sub-app li.semi-list-item').all():
+        for row in await page.locator(selector).all():
             if await row.is_visible(timeout=800) and await _read_group_row_conversation_id(row) == bound_id:
                 return row
         state = await page.evaluate("""async (element) => { element.scrollTop += Math.max(1, element.clientHeight);
@@ -2075,6 +2107,10 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
     scrollable_selectors = ('#sub-app [role="grid"]', '#sub-app .ReactVirtualized__Grid', 'xpath=//*[@id="sub-app"]//ul/div')
     config = friend_scan_config or _normalize_friend_list_scan_config({})
     await _open_groups_tab(page, account_name)
+    saas = await im_ui.is_saas_ui(page)
+    if saas:
+        target_selectors = (im_ui.SAAS_ROW_SELECTOR,)
+        scrollable_selectors = im_ui.SAAS_SCROLL_SELECTORS
     try:
         active_selector, _ = await _wait_for_friend_list_ready(
             page, account_name, target_selectors, (), (),
@@ -2164,6 +2200,8 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
             await page.evaluate("(element) => { element.scrollTop = 0; return element.scrollTop === 0; }", initial_scrollable)
         except Exception:
             pass
+    if saas:
+        raise FriendListIncompleteError('group_identity_unavailable: 新版群聊必须具有已保存的会话绑定')
     snapshot = await _stable_single_screen_group_list(page, initial_scrollable)
     if snapshot is None:
         raise FriendListIncompleteError(

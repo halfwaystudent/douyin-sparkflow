@@ -28,14 +28,23 @@ class SaasTasksTests(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_saas_editor_refuses(self):
         await self.content('<div data-e2e="msg-input"><div contenteditable="true">one</div><div contenteditable="true">two</div></div>')
         with self.assertRaises(RuntimeError):await tasks.locate_chat_input(self.page)
+    async def test_sender_waits_for_delayed_saas_shell_without_guessing_old_xpath(self):
+        import json
+        await self.page.set_content('<div id="sub-app"></div>')
+        payload='<div class="im-saas-viewport-test">'+FILTER+'</div>'
+        await self.page.evaluate('html=>setTimeout(()=>{document.querySelector("#sub-app").innerHTML=html},100)',payload)
+        with patch.object(tasks,'_dismiss_non_login_dialogs',AsyncMock()),patch.object(tasks,'_click_first_visible_locator',AsyncMock(side_effect=AssertionError('legacy click before variant proof'))):
+            self.assertEqual(await tasks._open_friends_tab(self.page,'synthetic','wrong-old-xpath',()),'saas_verified')
+
     async def test_saas_friend_tab_never_calls_old_xpath_click(self):
         await self.content(FILTER)
         with patch.object(tasks,'_dismiss_non_login_dialogs',AsyncMock()),patch.object(tasks,'_click_first_visible_locator',AsyncMock(return_value=False)) as legacy:
             result=await tasks._open_friends_tab(self.page,'synthetic','invalid-old-selector',())
         self.assertEqual(result,'saas_verified');legacy.assert_not_awaited()
     async def test_group_shortid_namespace_not_threadid(self):
-        await self.content('<div data-e2e="conversation-item"><span class="conversationConversationItemtitle">group</span></div>')
-        await self.page.evaluate('''() => {const r=document.querySelector('[data-e2e="conversation-item"]');r.__reactFiber$test={memoizedProps:{conversation:{type:2,id:'0:2:10000:10001',shortId:'7691234567890123401'}}}}''')
+        from tests import test_saas_group_guard as fixture
+        await self.page.set_content(fixture.group_html(fixture.conv_row('群甲',fixture.GROUP_A,active=True)))
+        await self.page.evaluate(fixture.SETUP,{'rowConvs':[fixture.GROUP_A],'headerConv':fixture.GROUP_A,'inputConv':fixture.GROUP_A})
         self.assertEqual(await tasks._read_group_row_conversation_id(self.page.locator('[data-e2e="conversation-item"]')),'7691234567890123401')
     async def test_group_filter_activated_and_verified(self):
         await self.content(FILTER)
@@ -51,6 +60,23 @@ class SaasTasksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await tasks.count_today_own_message_matches(self.page,'peer'),0)
         await self.page.evaluate('''() => {for(const e of document.querySelectorAll('[data-e2e="msg-item-content"]'))e.__reactFiber$test.memoizedProps.message.createdAt=new Date(Date.now()-86400000)}''')
         self.assertIsNone(await tasks.snapshot_last_own_message(self.page))
+
+    async def test_group_sender_reaches_verified_bound_saas_conversation(self):
+        from tests import test_saas_group_guard as fixture
+        rows=fixture.conv_row('群甲',fixture.GROUP_A,active=True)
+        await self.page.set_content(fixture.group_html(rows))
+        await self.page.evaluate(fixture.SETUP,{'rowConvs':[fixture.GROUP_A],'headerConv':fixture.GROUP_A,'inputConv':fixture.GROUP_A})
+        account={'group_target_bindings':{'群聊：群甲':fixture.BOUND_A}}
+        config=tasks._normalize_friend_list_scan_config({})
+        config.update(maxScanSeconds=3,scrollDelaySeconds=0)
+        scan=tasks.scroll_and_select_group_targets(self.page,'synthetic',['群聊：群甲'],config,account)
+        with patch.object(tasks,'_dismiss_non_login_dialogs',AsyncMock()),patch.object(tasks,'_persist_group_target_rename_notice'):
+            try:self.assertEqual(await scan.__anext__(),'群聊：群甲')
+            finally:await scan.aclose()
+        self.assertEqual(await self.page.evaluate('window.mousedowns'),1)
+        editor=self.page.locator('[data-e2e="msg-input"] [contenteditable="true"]')
+        self.assertTrue((await tasks._verify_open_group_conversation(self.page,editor,fixture.BOUND_A))[0])
+        self.assertFalse((await tasks._verify_open_group_conversation(self.page,editor,fixture.BOUND_B))[0])
 
     async def test_saas_group_row_is_not_a_friend_record(self):
         await self.content('<div data-e2e="conversation-item"><div class="conversationConversationItemtitle">same name</div></div>')
