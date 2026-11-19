@@ -217,12 +217,15 @@ class SaasGroupRowCollectionTests(unittest.IsolatedAsyncioTestCase):
                     ['群甲', {id: '0:2:10000:10001', shortId: '12345678901', type: 2}],
                     ['群乙', {id: '0:2:10000:10002', shortId: '12345678902', type: 2}],
                 ];
+                const root={stateNode:{},return:null,child:null};root.stateNode.current=root;let previous=null;
                 data.forEach(([name, conversation]) => {
                     const row = document.createElement('div');
                     row.setAttribute('data-e2e', 'conversation-item');
                     row.className = 'conversationConversationItemwrapper';
                     row.innerHTML = '<div class="conversationConversationItemtitle">' + name + '</div>';
-                    row.__reactFiber$test = { memoizedProps: { conversation } };
+                    const host={stateNode:row,memoizedProps:{conversation},return:root};
+                    row.__reactFiber$test=host;
+                    if(previous)previous.sibling=host;else root.child=host;previous=host;
                     list.appendChild(row);
                 });
             }"""
@@ -333,7 +336,9 @@ class SaasFriendLazyListTests(unittest.IsolatedAsyncioTestCase):
                     row.setAttribute('data-e2e', 'conversation-item');
                     row.className = 'conversationConversationItemwrapper';
                     row.innerHTML = '<div class="conversationConversationItemtitle">' + name + '</div>';
-                    row.__reactFiber$test = { memoizedProps: { conversation: conv }, return: null };
+                    const root={stateNode:{},return:null,child:null};root.stateNode.current=root;
+                const host={stateNode:row,memoizedProps:{conversation:conv},return:root};
+                root.child=host;row.__reactFiber$test=host;
                     return row;
                 };
                 list.innerHTML = '';
@@ -370,7 +375,9 @@ class SaasGroupRowIdentityTests(unittest.IsolatedAsyncioTestCase):
                 row.setAttribute('data-e2e', 'conversation-item');
                 row.className = 'conversationConversationItemwrapper';
                 row.innerHTML = '<div class="conversationConversationItemtitle">群甲</div>';
-                row.__reactFiber$test = { memoizedProps: { conversation: conv }, return: null };
+                const root={stateNode:{},return:null,child:null};root.stateNode.current=root;
+                const host={stateNode:row,memoizedProps:{conversation:conv},return:root};
+                root.child=host;row.__reactFiber$test=host;
                 list.appendChild(row);
             }""",
             conversation,

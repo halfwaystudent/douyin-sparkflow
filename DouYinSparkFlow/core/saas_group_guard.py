@@ -134,6 +134,23 @@ return {ok:true, reason:''};
 }"""
 
 
+async def read_row_snapshot(row):
+    """Read group id and its displayed name atomically from the current tree."""
+    script = "(row)=>{" + _COMMON + _ROW_CONVERSATION + r"""
+      currentRootIndexes = new WeakMap();
+      if(!row?.matches('[data-e2e="conversation-item"]') || !visible(row))return null;
+      const found=rowConversation(row);
+      if(!found.committed || !groupConversationOk(found.conversation))return null;
+      const title=rowTitle(row);if(!title)return null;
+      return {conversationId:found.conversation.shortId,name:title};
+    }"""
+    try:
+        result = await row.evaluate(script)
+    except Exception:
+        return None
+    return result if isinstance(result, dict) else None
+
+
 async def read_row_id(row):
     """Return the row's bound-format group id (numeric shortId) or ``None``.
 

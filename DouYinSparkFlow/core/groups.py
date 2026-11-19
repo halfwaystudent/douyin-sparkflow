@@ -70,37 +70,12 @@ SAAS_GROUP_SCROLL_SELECTORS = im_ui.SAAS_SCROLL_SELECTORS
 
 
 async def _read_saas_group_row(row):
-    """Return (conversation_id, name) for one SaaS conversation row.
-
-    The SaaS bundle exposes the conversation object on the row's React fiber
-    (``memoizedProps.conversation`` with ``id``/``shortId``), and the display
-    name in ``.conversationConversationItemtitle``. Both are read passively;
-    the row is never clicked (clicking opens the conversation).
-    """
-    conversation_id = await row.evaluate(
-        """(element) => {
-            const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
-            let fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
-            let fiber = fiberKey && element[fiberKey];
-            for (let level = 0; fiber && level <= 4; level += 1, fiber = fiber.return) {
-                const conversation = fiber.memoizedProps?.conversation
-                    ?? fiber.memoizedProps?.header?.props?.conversation;
-                if (conversation && conversation.type !== 2) return null;
-                const value = conversation?.shortId ?? conversation?.id;
-                if (valid(value)) return value;
-            }
-            return null;
-        }"""
-    )
-    if not (isinstance(conversation_id, str) and conversation_id.isdigit()
-            and 10 <= len(conversation_id) <= 25):
+    """Never pair a stale virtual row id with a newly recycled display name."""
+    from core import saas_group_guard
+    snapshot = await saas_group_guard.read_row_snapshot(row)
+    if not snapshot:
         return None, ""
-    try:
-        name = (await row.locator(im_ui.SAAS_NAME_SELECTOR).first
-                .inner_text(timeout=1000)).strip()
-    except Exception:
-        name = ""
-    return conversation_id, name
+    return snapshot["conversationId"], snapshot["name"]
 
 
 async def collect_saas_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=.1):
