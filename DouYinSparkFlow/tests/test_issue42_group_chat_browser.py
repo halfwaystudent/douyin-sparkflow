@@ -350,16 +350,9 @@ class OfflineGroupChatBrowserTests(unittest.TestCase):
         self.assertEqual(0, result["nameClicks"])
 
     def test_hidden_group_row_is_not_a_target(self):
-        # The shared fixture leads with a hidden decoy tab; the sender's legacy
-        # variant probe only inspects each selector's first match, so this test
-        # keeps the decoy hidden but out of the tab role to let the visible
-        # 群消息 tab prove the legacy page.
         result = self._run(
             FIXTURE.replace("HEIGHT", "300").replace("CONTENT_HEIGHT", "210").replace(
                 "ROWS", _row("目标群", hidden=True)
-            ).replace(
-                '<button role="tab" aria-selected="false" class="hidden-copy">',
-                '<button aria-selected="false" class="hidden-copy">',
             )
         )
 
@@ -384,6 +377,8 @@ class BoundGroupRelocationIsolationTests(unittest.TestCase):
             patch.object(tasks, "_locate_bound_group_row", new=AsyncMock(side_effect=tasks.FriendListUnavailableError("group_not_found for offline: gone"))),
         ):
             page = AsyncMock()
+            from unittest.mock import Mock
+            page.locator = Mock(return_value=Mock(count=AsyncMock(return_value=0)))
             page.evaluate = AsyncMock(return_value=True)
             async def run():
                 return [t async for t in tasks.scroll_and_select_group_targets(

@@ -28,6 +28,10 @@ class SaasTasksTests(unittest.IsolatedAsyncioTestCase):
     async def test_ambiguous_saas_editor_refuses(self):
         await self.content('<div data-e2e="msg-input"><div contenteditable="true">one</div><div contenteditable="true">two</div></div>')
         with self.assertRaises(RuntimeError):await tasks.locate_chat_input(self.page)
+    async def test_visible_probe_skips_hidden_first_legacy_marker(self):
+        await self.page.set_content('<div id="sub-app"><button role="tab" style="display:none">hidden</button><button role="tab">群消息</button></div>')
+        self.assertEqual(await tasks._selector_visible(self.page,('#sub-app [role="tab"]',)),'#sub-app [role="tab"]')
+
     async def test_sender_waits_for_delayed_saas_shell_without_guessing_old_xpath(self):
         import json
         await self.page.set_content('<div id="sub-app"></div>')

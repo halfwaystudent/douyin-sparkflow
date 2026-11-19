@@ -168,6 +168,9 @@ FRIEND_LIST_READY_TIMEOUT_SECONDS = 60
 # these bounds only end the read; they never prove the list was fully read.
 FRIEND_LIST_IDLE_ROUNDS = 5
 FRIEND_LIST_STUCK_ROUNDS = 2
+# Budget for the SaaS micro-frontend to mount after #sub-app appears. The
+# legacy probe short-circuits this on pages that are already legacy.
+SAAS_UI_DETECT_TIMEOUT_MS = 20000
 SCROLL_STEP_PX = 800
 SCROLL_SETTLE_SECONDS = 1.5
 # How long to wait for in-flight user_detail response bodies after the read.
@@ -418,12 +421,34 @@ async def _read_friend_name(element):
     return ""
 
 
+async def _legacy_friend_ui_present(page):
+    """True once the legacy friend list UI is confirmed on the page."""
+    try:
+        _, rows = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
+        if rows is not None:
+            return True
+        for name in ("朋友私信", "群消息"):
+            if await page.get_by_role("tab", name=name, exact=True).count() > 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 async def collect_friend_names(page, on_progress=None):
-    if await im_ui.is_saas_ui(page):
+    await _wait_for_chat_or_login(page)
+    # The SaaS micro-frontend mounts asynchronously after #sub-app exists; a
+    # single instant probe can miss it and strand the refresh on legacy
+    # selectors that can never match. Wait for either variant, whichever the
+    # page proves first.
+    if await im_ui.wait_for_saas_ui(
+        page,
+        timeout_ms=SAAS_UI_DETECT_TIMEOUT_MS,
+        legacy_probe=lambda: _legacy_friend_ui_present(page),
+    ):
         result = await _collect_saas_friend_names(page, on_progress=on_progress)
         if result is not None:
             return result
-    await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
     if not target_locator:
@@ -517,12 +542,44 @@ async def collect_friend_names(page, on_progress=None):
             return FriendScanResult(found_names, reason=reason)
 
 
+async def _read_saas_friend_row(element):
+    """Return ``(name, conversation_type)`` for one SaaS conversation row.
+
+    ``conversation_type`` comes from the row's React fiber
+    (``memoizedProps.conversation.type``): the 消息/全部 filter lists every
+    conversation kind, so only ``1`` (ONE_TO_ONE_CHAT, verified in the public
+    bundle's ``ConversationType`` enum) may be cached as a friend. ``None``
+    means the row's type could not be proven — the caller must treat the scan
+    as incomplete rather than risk caching a group as a friend.
+    """
+    name = await _read_saas_friend_name(element)
+    try:
+        conversation_type = await element.evaluate(
+            """(node) => {
+                let fiberKey = Object.keys(node || {}).find((key) => key.startsWith('__reactFiber'));
+                let fiber = fiberKey && node[fiberKey];
+                for (let level = 0; fiber && level <= 4; level += 1, fiber = fiber.return) {
+                    const conversation = fiber.memoizedProps?.conversation
+                        ?? fiber.memoizedProps?.header?.props?.conversation;
+                    if (conversation && typeof conversation.type === 'number') {
+                        return conversation.type;
+                    }
+                }
+                return null;
+            }"""
+        )
+    except Exception:
+        conversation_type = None
+    return name, conversation_type
+
+
 async def _collect_saas_friend_names(page, on_progress=None):
     """Read the new IM SaaS conversation list without clicking any row.
 
     The SaaS page has no 朋友私信/群消息 role tabs; it filters through the
-    分组 tag bar instead. ``friend`` maps to the 消息/全部 tag, which is the
-    default view and already excludes the stranger box.
+    分组 tag bar instead. ``friend`` maps to the 消息/全部 tag, which also
+    lists group conversations, so every row is classified by its fiber
+    conversation type before its title may enter the friend cache.
     """
     if not await im_ui.is_saas_ui(page):
         return None
@@ -540,6 +597,11 @@ async def _collect_saas_friend_names(page, on_progress=None):
     seen_names = set()
     idle_rounds = 0
     stuck_rounds = 0
+    # Passes that produced no new friend AND could not scroll further. A
+    # viewport that fits its content is not proof of completeness — the SaaS
+    # virtual list lazy-renders pages — so completion needs two stable reads.
+    settled_passes = 0
+    unproven_rows = False
 
     while True:
         rows = await _first_visible_saas_rows(page)
@@ -550,7 +612,14 @@ async def _collect_saas_friend_names(page, on_progress=None):
 
         new_names_count = 0
         for element in rows:
-            name = await _read_saas_friend_name(element)
+            name, conversation_type = await _read_saas_friend_row(element)
+            if conversation_type != 1:
+                # Type 2+ rows are groups/broadcasts — never friends. An
+                # unreadable type means the row might be a friend we cannot
+                # prove, so the scan can no longer claim completeness.
+                if conversation_type is None:
+                    unproven_rows = True
+                continue
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
@@ -565,7 +634,8 @@ async def _collect_saas_friend_names(page, on_progress=None):
         )
         if not scrollable_element:
             if found_names:
-                return FriendScanResult(found_names, reason="未找到好友列表滚动容器")
+                return FriendScanResult(found_names, complete=False,
+                                        reason="未找到好友列表滚动容器")
             raise RuntimeError("未找到好友列表滚动容器")
 
         metrics = await page.evaluate(
@@ -575,8 +645,21 @@ async def _collect_saas_friend_names(page, on_progress=None):
             })""",
             scrollable_element,
         )
-        if int(metrics.get("scrollHeight") or 0) <= int(metrics.get("clientHeight") or 0):
-            return FriendScanResult(found_names, complete=True)
+        fits_viewport = (
+            int(metrics.get("scrollHeight") or 0)
+            <= int(metrics.get("clientHeight") or 0)
+        )
+        if fits_viewport:
+            if new_names_count == 0 and settled_passes >= 1:
+                return FriendScanResult(
+                    found_names,
+                    complete=not unproven_rows,
+                    reason="" if not unproven_rows else "新版列表存在无法确认类型的会话行",
+                )
+            settled_passes += 1 if new_names_count == 0 else 0
+            await asyncio.sleep(SCROLL_SETTLE_SECONDS)
+            continue
+        settled_passes = 0
 
         before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
         await page.evaluate(
@@ -745,9 +828,8 @@ async def _fetch_account_friends_once(
                 else:
                     await route.abort()
 
-            route = getattr(context, 'route', None)
-            if callable(route):
-                await route('**/*', guard_friend_refresh_routes)
+            await context.route('**/*', guard_friend_refresh_routes)
+            await context.route_web_socket('**/*', im_ui.deny_refresh_socket)
 
         if auth_only:
             # Only the creator home page exposes the logged-in identity, and a

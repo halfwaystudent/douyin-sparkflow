@@ -85,7 +85,8 @@ async def _read_saas_group_row(row):
             for (let level = 0; fiber && level <= 4; level += 1, fiber = fiber.return) {
                 const conversation = fiber.memoizedProps?.conversation
                     ?? fiber.memoizedProps?.header?.props?.conversation;
-                const value = conversation?.id ?? conversation?.shortId;
+                if (conversation && conversation.type !== 2) return null;
+                const value = conversation?.shortId ?? conversation?.id;
                 if (valid(value)) return value;
             }
             return null;
@@ -110,8 +111,15 @@ async def collect_saas_group_rows(page, *, max_scan_seconds=60, scroll_delay_sec
     reset_top = await page.evaluate('(element) => { element.scrollTop = 0; return element.scrollTop; }', scroll)
     if reset_top != 0:
         raise RuntimeError('群列表滚动位置无法复位')
+    # Let the virtual list mount its first page before the first read; rows
+    # that materialise later are picked up by the stability passes below.
+    await asyncio.sleep(scroll_delay_seconds)
     deadline = asyncio.get_running_loop().time() + max_scan_seconds
     result, seen = [], set()
+    # Bottom-reaching passes that added nothing. One quiet pass is not proof:
+    # the virtual list lazy-renders pages and may still have unfetched rows,
+    # so completion needs two consecutive stable reads at the bottom.
+    quiet_bottom_passes = 0
     while True:
         if asyncio.get_running_loop().time() > deadline:
             raise RuntimeError('群列表读取超时')
@@ -130,10 +138,15 @@ async def collect_saas_group_rows(page, *, max_scan_seconds=60, scroll_delay_sec
                 added += 1
         state = await page.evaluate('''async e => { e.scrollTop += Math.max(1,e.clientHeight); await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))); return {top:e.scrollTop, client:e.clientHeight, height:e.scrollHeight} }''', scroll)
         await asyncio.sleep(scroll_delay_seconds)
-        if state['top'] + state['client'] >= state['height'] - 1 and not added:
-            if not result:
-                raise RuntimeError('未读到群列表')
-            return result
+        at_bottom = state['top'] + state['client'] >= state['height'] - 1
+        if at_bottom and not added:
+            quiet_bottom_passes += 1
+            if quiet_bottom_passes >= 2:
+                if not result:
+                    raise RuntimeError('未读到群列表')
+                return result
+        else:
+            quiet_bottom_passes = 0
 
 async def collect_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=.1):
     """Passively exhaust virtualized visible rows; never click a conversation."""
@@ -203,8 +216,23 @@ async def fetch_account_groups(account):
                 await route.abort()
 
         await context.route('**/*', guard_write_routes)
+        await context.route_web_socket('**/*', im_ui.deny_refresh_socket)
         page = await context.new_page(); await page.goto(CHAT_PAGE_URL, wait_until='commit', timeout=60000); await _wait_for_chat_or_login(page)
-        if await im_ui.is_saas_ui(page):
+
+        async def _legacy_group_ui_present():
+            try:
+                if await page.get_by_role('tab', name='群消息', exact=True).count() > 0:
+                    return True
+                for row in await page.locator(GROUP_ROW_SELECTOR).all():
+                    if await row.is_visible():
+                        return True
+            except Exception:
+                pass
+            return False
+
+        if await im_ui.wait_for_saas_ui(
+            page, timeout_ms=20000, legacy_probe=_legacy_group_ui_present
+        ):
             # SaaS page: no role tabs; route through the verified 群聊 filter.
             activated = await im_ui.activate_saas_filter(page, 'group')
             if not activated:

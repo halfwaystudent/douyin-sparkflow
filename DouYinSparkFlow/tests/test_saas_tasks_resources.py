@@ -10,6 +10,17 @@ class ResourceRoutingTests(unittest.TestCase):
                 self.assertEqual(tasks.classify_browser_failure(stage,ResourcePressure('insufficient memory')),'browser_resource_unavailable')
         self.assertIn('browser_resource_unavailable',tasks.ACCOUNT_LEVEL_FAILURE_CATEGORIES)
 
+    def test_resource_pause_uses_existing_temporary_cooldown_not_whole_day(self):
+        from datetime import datetime,timedelta,timezone
+        from unittest.mock import patch
+        from core import recovery_queue
+        now=datetime(2026,11,19,4,tzinfo=timezone.utc)
+        user={'account_failure':{'category':'browser_resource_unavailable','attemptCount':2,'lastAttemptAt':(now-timedelta(minutes=90)).isoformat()}}
+        with patch.object(recovery_queue,'enabled',return_value=False):
+            self.assertFalse(tasks._account_paused_by_failure_today(user,now))
+            user['account_failure']['lastAttemptAt']=(now-timedelta(minutes=10)).isoformat()
+            self.assertTrue(tasks._account_paused_by_failure_today(user,now))
+
     def test_low_session_memory_stops_before_checkpoint_without_recovery_probe(self):
         import asyncio
         from unittest.mock import AsyncMock, patch

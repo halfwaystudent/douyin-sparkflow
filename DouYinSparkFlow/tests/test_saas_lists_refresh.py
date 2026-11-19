@@ -211,13 +211,18 @@ class SaasGroupRowCollectionTests(unittest.IsolatedAsyncioTestCase):
             """() => {
                 const list = document.getElementById('list');
                 list.innerHTML = '';
-                const data = [['群甲','12345678901'], ['群乙','12345678902']];
-                data.forEach(([name, id]) => {
+                // Real group conversations expose a thread id ("0:2:...") plus
+                // the numeric shortId the bindings store; type 2 = GROUP_CHAT.
+                const data = [
+                    ['群甲', {id: '0:2:10000:10001', shortId: '12345678901', type: 2}],
+                    ['群乙', {id: '0:2:10000:10002', shortId: '12345678902', type: 2}],
+                ];
+                data.forEach(([name, conversation]) => {
                     const row = document.createElement('div');
                     row.setAttribute('data-e2e', 'conversation-item');
                     row.className = 'conversationConversationItemwrapper';
                     row.innerHTML = '<div class="conversationConversationItemtitle">' + name + '</div>';
-                    row.__reactFiber$test = { memoizedProps: { conversation: { id } } };
+                    row.__reactFiber$test = { memoizedProps: { conversation } };
                     list.appendChild(row);
                 });
             }"""
@@ -228,6 +233,182 @@ class SaasGroupRowCollectionTests(unittest.IsolatedAsyncioTestCase):
              {'name': '群乙', 'conversationId': '12345678902'}],
             rows,
         )
+
+
+class SaasFriendRowTypeTests(unittest.IsolatedAsyncioTestCase):
+    """The 消息/全部 tag lists every conversation type — groups included.
+    Friend collection must only accept ONE_TO_ONE_CHAT (type 1) rows proven
+    through the row's React fiber; anything else is not a friend."""
+
+    async def _page(self, html):
+        pw = await async_playwright().start()
+        self.addAsyncCleanup(pw.stop)
+        browser = await pw.chromium.launch(headless=True)
+        self.addAsyncCleanup(browser.close)
+        page = await browser.new_page()
+        await page.set_content(html)
+        return page
+
+    async def _attach_conversations(self, page, conversations):
+        await page.evaluate(
+            """(convs) => {
+                const rows = document.querySelectorAll('[data-e2e="conversation-item"]');
+                rows.forEach((row, i) => {
+                    row.__reactFiber$test = {
+                        memoizedProps: { conversation: convs[i] || null },
+                        return: null,
+                    };
+                });
+            }""",
+            conversations,
+        )
+
+    async def test_friend_scan_skips_group_rows_and_keeps_one_to_one(self):
+        from core import friends as friends_module
+        html = saas_page(rows=["好友甲", "群聊乙", "好友丙"], scroll_height=200)
+        page = await self._page(html)
+        await self._attach_conversations(page, [
+            {"id": "0:1:1:2", "shortId": "1111111111111111111", "type": 1},
+            {"id": "0:2:3:4", "shortId": "2222222222222222222", "type": 2},
+            {"id": "0:1:5:6", "shortId": "3333333333333333333", "type": 1},
+        ])
+        result = await friends_module._collect_saas_friend_names(page)
+        self.assertEqual(["好友甲", "好友丙"], list(result))
+        self.assertTrue(result.complete)
+
+    async def test_friend_scan_unreadable_row_type_is_incomplete_not_friend(self):
+        from core import friends as friends_module
+        html = saas_page(rows=["好友甲", "未知乙"], scroll_height=200)
+        page = await self._page(html)
+        # Only the first row carries a provable conversation; the second has
+        # no fiber at all, so it can be a group — it must not be cached.
+        await self._attach_conversations(page, [
+            {"id": "0:1:1:2", "shortId": "1111111111111111111", "type": 1},
+            None,
+        ])
+        result = await friends_module._collect_saas_friend_names(page)
+        self.assertEqual(["好友甲"], list(result))
+        self.assertFalse(result.complete)
+        self.assertTrue(result.reason)
+
+    async def test_friend_scan_non_numeric_type_row_is_not_a_friend(self):
+        from core import friends as friends_module
+        html = saas_page(rows=["直播间"], scroll_height=200)
+        page = await self._page(html)
+        await self._attach_conversations(page, [
+            {"id": "0:3:1:2", "shortId": "4444444444444444444", "type": 3},
+        ])
+        result = await friends_module._collect_saas_friend_names(page)
+        self.assertEqual([], list(result))
+        # A provably non-friend row is correctly excluded; the scan itself
+        # still completed because every visible row was classified.
+        self.assertTrue(result.complete)
+
+
+class SaasFriendLazyListTests(unittest.IsolatedAsyncioTestCase):
+    """A list that fits one viewport is NOT proof of completeness: the SaaS
+    virtual list can lazy-render only the first page. The scan must re-read
+    after settling and only report complete once a pass adds nothing."""
+
+    async def _page(self, html):
+        pw = await async_playwright().start()
+        self.addAsyncCleanup(pw.stop)
+        browser = await pw.chromium.launch(headless=True)
+        self.addAsyncCleanup(browser.close)
+        page = await browser.new_page()
+        await page.set_content(html)
+        return page
+
+    async def test_friend_scan_waits_for_lazy_rows_before_completing(self):
+        from core import friends as friends_module
+        html = saas_page(rows=["好友甲"], scroll_height=200)
+        # scrollHeight stays == clientHeight (200) forever: the container can
+        # never scroll, yet a second row materialises late.
+        page = await self._page(html)
+        await page.evaluate(
+            """(convs) => {
+                const list = document.getElementById('list');
+                const mk = (name, conv) => {
+                    const row = document.createElement('div');
+                    row.setAttribute('data-e2e', 'conversation-item');
+                    row.className = 'conversationConversationItemwrapper';
+                    row.innerHTML = '<div class="conversationConversationItemtitle">' + name + '</div>';
+                    row.__reactFiber$test = { memoizedProps: { conversation: conv }, return: null };
+                    return row;
+                };
+                list.innerHTML = '';
+                list.appendChild(mk('好友甲', convs[0]));
+                setTimeout(() => { list.appendChild(mk('好友乙', convs[1])); }, 400);
+            }""",
+            [{"id": "0:1:1:2", "shortId": "1111111111111111111", "type": 1},
+             {"id": "0:1:3:4", "shortId": "5555555555555555555", "type": 1}],
+        )
+        result = await friends_module._collect_saas_friend_names(page)
+        self.assertEqual(["好友甲", "好友乙"], list(result))
+        self.assertTrue(result.complete)
+
+
+class SaasGroupRowIdentityTests(unittest.IsolatedAsyncioTestCase):
+    """Group rows must yield the numeric shortId (the bound-id format) and
+    only for provable GROUP_CHAT (type 2) conversations."""
+
+    async def _page(self, html):
+        pw = await async_playwright().start()
+        self.addAsyncCleanup(pw.stop)
+        browser = await pw.chromium.launch(headless=True)
+        self.addAsyncCleanup(browser.close)
+        page = await browser.new_page()
+        await page.set_content(html)
+        return page
+
+    async def _row_with_conversation(self, page, conversation):
+        await page.evaluate(
+            """(conv) => {
+                const list = document.getElementById('list');
+                list.innerHTML = '';
+                const row = document.createElement('div');
+                row.setAttribute('data-e2e', 'conversation-item');
+                row.className = 'conversationConversationItemwrapper';
+                row.innerHTML = '<div class="conversationConversationItemtitle">群甲</div>';
+                row.__reactFiber$test = { memoizedProps: { conversation: conv }, return: null };
+                list.appendChild(row);
+            }""",
+            conversation,
+        )
+        return page.locator(im_ui.SAAS_ROW_SELECTOR).first
+
+    async def test_group_row_prefers_shortId_over_thread_id(self):
+        from core.groups import _read_saas_group_row
+        page = await self._page(saas_page(rows=[], scroll_height=200))
+        row = await self._row_with_conversation(page, {
+            "id": "0:2:10000:10001",
+            "shortId": "7691234567890123401",
+            "type": 2,
+        })
+        conversation_id, name = await _read_saas_group_row(row)
+        self.assertEqual("7691234567890123401", conversation_id)
+        self.assertEqual("群甲", name)
+
+    async def test_group_row_rejects_non_group_conversation(self):
+        from core.groups import _read_saas_group_row
+        page = await self._page(saas_page(rows=[], scroll_height=200))
+        row = await self._row_with_conversation(page, {
+            "id": "0:1:10000:10001",
+            "shortId": "7691234567890123401",
+            "type": 1,
+        })
+        conversation_id, _name = await _read_saas_group_row(row)
+        self.assertIsNone(conversation_id)
+
+    async def test_group_row_without_type_fails_closed(self):
+        from core.groups import _read_saas_group_row
+        page = await self._page(saas_page(rows=[], scroll_height=200))
+        row = await self._row_with_conversation(page, {
+            "id": "0:2:10000:10001",
+            "shortId": "7691234567890123401",
+        })
+        conversation_id, _name = await _read_saas_group_row(row)
+        self.assertIsNone(conversation_id)
 
 
 class SaasPolicyIntegrationTests(unittest.TestCase):

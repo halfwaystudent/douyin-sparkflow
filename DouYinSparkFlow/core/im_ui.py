@@ -61,18 +61,47 @@ SAAS_FILTER_TAG_LABELS = {
 SAAS_FILTER_KINDS = frozenset({"friend", "group"})
 
 
+async def deny_refresh_socket(socket):
+    """A read-only list scan must not reconnect queued outbound socket writes."""
+    await socket.close()
+
+
 async def is_saas_ui(page) -> bool:
     """True when the new IM SaaS shell is present on the page.
 
-    Only reads the DOM; never clicks or navigates.
+    Only reads the DOM; never clicks or navigates. A broken read propagates:
+    reporting ``False`` on a page we could not inspect would silently route a
+    SaaS page into the legacy XPath collectors.
     """
-    try:
-        viewport = page.locator(SAAS_VIEWPORT_MARKER)
-        if await viewport.count() == 0:
-            return False
-        return await viewport.first.is_visible()
-    except Exception:
+    viewport = page.locator(SAAS_VIEWPORT_MARKER)
+    if await viewport.count() == 0:
         return False
+    return await viewport.first.is_visible()
+
+
+async def wait_for_saas_ui(page, *, timeout_ms=30000, legacy_probe=None, poll_seconds=0.5):
+    """Poll for the SaaS shell until it appears, the legacy UI proves itself,
+    or the budget runs out.
+
+    The SaaS micro-frontend mounts asynchronously after ``#sub-app`` exists,
+    so a single instant probe right after navigation can miss it and strand
+    the refresh on the legacy path. ``legacy_probe`` is an optional async
+    callable returning True once the legacy list UI is confirmed; when it
+    fires first we return ``False`` immediately instead of burning the whole
+    SaaS budget. Read errors propagate rather than classifying an unreadable
+    page as legacy. A timeout without either positive marker must be rejected
+    by the caller, never used as permission to click a guessed old XPath.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    while True:
+        if await is_saas_ui(page):
+            return True
+        if legacy_probe is not None and await legacy_probe():
+            return False
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(poll_seconds)
 
 
 async def _filter_tag_for_kind(page, kind):
@@ -136,7 +165,8 @@ async def activate_saas_filter(page, kind, *, timeout_ms=10000) -> bool:
 
     Returns ``False`` only when the page is not the SaaS UI at all (caller
     falls back to the legacy path). When the SaaS UI is present but the
-    filter cannot be found or confirmed, raises — never silently degrade.
+    filter cannot be found, clicked, or confirmed active, raises — never
+    silently degrade to the legacy XPath on a page that is definitely new.
     """
     if kind not in SAAS_FILTER_KINDS:
         raise ValueError(f"unknown saas filter kind: {kind!r}")
@@ -194,7 +224,9 @@ async def activate_saas_filter(page, kind, *, timeout_ms=10000) -> bool:
         if await saas_filter_is_active(page, kind):
             return True
         await asyncio.sleep(0.1)
-    return False
+    raise RuntimeError(
+        f"新版 IM 筛选标签点击后未生效: group={group_label!r} tag={tag_label!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

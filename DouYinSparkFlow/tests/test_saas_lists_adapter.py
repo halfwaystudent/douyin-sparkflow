@@ -206,6 +206,65 @@ class SaasFilterStateRealBrowserTests(unittest.IsolatedAsyncioTestCase):
         name = await row.locator(im_ui.SAAS_NAME_SELECTOR).first.inner_text()
         self.assertEqual("测试好友", name)
 
+    async def test_activate_saas_filter_raises_when_click_never_takes_effect(self):
+        # SaaS shell + filter bar present, but the tag click is a no-op (the
+        # store never marks it active). Returning False here would let the
+        # caller fall back to the legacy XPath on a page that is definitely
+        # the new UI — the adapter must raise instead.
+        html = saas_page_html(active_all=False).replace(
+            "<script>", "<script>window.__noop=1;//"
+        )
+        # Neutralise every click listener the fixture installs.
+        html = html.replace("tag.addEventListener('click'", "void 0 && tag.addEventListener('click'")
+        page = await self._page(html)
+        with self.assertRaises(RuntimeError):
+            await im_ui.activate_saas_filter(page, "friend", timeout_ms=800)
+
+    async def test_is_saas_ui_propagates_read_errors(self):
+        # A broken DOM read must not be reported as "legacy UI": that would
+        # silently route a SaaS page into the old XPath collectors.
+        page = await self._page(saas_page_html(rows=["甲"]))
+        await page.close()
+        with self.assertRaises(Exception):
+            await im_ui.is_saas_ui(page)
+
+    async def test_wait_for_saas_ui_detects_late_micro_frontend(self):
+        # The SaaS micro-frontend mounts after the legacy-looking shell; a
+        # single instant probe would miss it and send the refresh down the
+        # legacy path where it can never succeed.
+        html = (
+            '<div id="sub-app"><div class="semi-list-item">legacy</div>'
+            '<script>setTimeout(() => {'
+            'document.body.insertAdjacentHTML("beforeend", '
+            '\'<div class="im-saas-viewport-C7YJGz" style="width:100px;height:100px">x</div>\');'
+            '}, 300);</script></div>'
+        )
+        page = await self._page(html)
+        self.assertTrue(await im_ui.wait_for_saas_ui(page, timeout_ms=5000))
+
+    async def test_wait_for_saas_ui_returns_false_on_legacy_page(self):
+        page = await self._page('<div id="sub-app"><ul><li class="semi-list-item">甲</li></ul></div>')
+        self.assertFalse(await im_ui.wait_for_saas_ui(page, timeout_ms=600))
+
+    async def test_wait_for_saas_ui_stops_early_when_legacy_probe_fires(self):
+        # When the legacy list is already rendered, the wait must not burn the
+        # whole SaaS budget before letting the legacy collector run.
+        page = await self._page(
+            '<div id="sub-app"><ul><li class="semi-list-item">甲</li></ul></div>'
+        )
+
+        async def legacy_probe():
+            return await page.locator("#sub-app li.semi-list-item").count() > 0
+
+        import time
+        started = time.monotonic()
+        self.assertFalse(
+            await im_ui.wait_for_saas_ui(
+                page, timeout_ms=10000, legacy_probe=legacy_probe
+            )
+        )
+        self.assertLess(time.monotonic() - started, 5)
+
 
 class SaasReadPolicyTests(unittest.TestCase):
     def test_saas_read_policy_allows_observed_init_reads(self):

@@ -1531,6 +1531,7 @@ ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
 
 
 TEMPORARY_ACCOUNT_FAILURE_CATEGORIES = {
+    "browser_resource_unavailable",
     "browser_stage_timeout",
     "friend_list_unavailable",
     "friend_list_timeout",
@@ -1618,7 +1619,7 @@ async def _first_non_empty_locator(page, selectors):
 
 async def _selector_visible(page, selectors):
     for selector in selectors:
-        locator = page.locator(selector).first
+        locator = page.locator(selector).filter(visible=True)
         try:
             count = await _locator_count_with_timeout(
                 locator,
@@ -1626,7 +1627,7 @@ async def _selector_visible(page, selectors):
                 "selector_visible",
                 selector,
             )
-            if count and await locator.is_visible(timeout=500):
+            if count and await locator.first.is_visible(timeout=500):
                 return selector
         except Exception:
             continue
