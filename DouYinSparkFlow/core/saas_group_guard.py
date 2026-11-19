@@ -16,6 +16,7 @@ arbitrary conversation object.
 Public API (async, Playwright):
 
 * ``read_row_id(row)`` -> numeric shortId string or ``None``.
+* ``read_row_metadata(row)`` -> ``{'type', 'name', ...}`` or ``None``.
 * ``select_row(row, bound_id)`` -> ``'clicked'`` or a reason string.
 * ``verify_open(page, chat_input, bound_id)`` -> ``(bool, reason)``.
 
@@ -87,50 +88,112 @@ row.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, vi
 return {ok:true, reason:'', title};
 }"""
 
-_VERIFY_OPEN = "cfg=>{" + _COMMON + _ROW_CONVERSATION + r"""
+# Synchronous open-pane proof shared by ``verify_open`` and the armed Enter
+# guard. The keydown handler calls ``groupOpenCheck`` inside the capture
+# phase, so every check re-derives the committed current fiber graph and no
+# await ever separates proof from dispatch.
+_GROUP_OPEN_CHECK = r"""
+const saasGroupFilterActive = () => {
+  const viewport = document.querySelector('[class*="im-saas-viewport"]');
+  if (!viewport || !visible(viewport)) return false;
+  const bar = document.querySelector('.conversationFilterTagBarwrapper');
+  if (!bar) return false;
+  for (const group of bar.querySelectorAll('.conversationFilterTagBargroup')) {
+    const header = group.querySelector('.conversationFilterTagBargroupLabel');
+    if (!header || normalizeName(header.textContent) !== '消息') continue;
+    for (const tag of group.querySelectorAll('.conversationFilterTagBartagItem')) {
+      const label = tag.querySelector('.conversationFilterTagBartagItemLabel');
+      if (label && normalizeName(label.textContent) === '群聊')
+        return tag.classList.contains('conversationFilterTagBartagItemActive');
+    }
+  }
+  return false;
+};
+const groupOpenCheck = cfg => {
+  // The armed keydown closure survives React commits: never reuse a fiber
+  // graph indexed by an earlier check.
+  currentRootIndexes = new WeakMap();
+  const bound = String(cfg.boundId || '');
+  if (!/^\d{10,25}$/.test(bound)) return {ok:false, reason:'group_bound_id_invalid'};
+  const inputNode = cfg.input || null;
+  const requireInput = cfg.requireInput === true;
+  // The read-only 群聊 filter must still be the selected tag.
+  if (!saasGroupFilterActive()) return {ok:false, reason:'group_filter_inactive'};
+  const rows = saasRows();
+  const active = rows.filter(row => row.classList.contains('conversationConversationItemcurConversation'));
+  if (active.length !== 1) return {ok:false, reason: active.length ? 'group_active_row_ambiguous' : 'group_active_row_missing'};
+  const activeRow = active[0];
+  const rowFound = rowConversation(activeRow);
+  if (!rowFound.committed) return {ok:false, reason:'group_row_uncommitted'};
+  if (!groupConversationOk(rowFound.conversation, bound)) return {ok:false, reason:'group_active_identity_mismatch'};
+  const title = rowTitle(activeRow);
+  if (!title) return {ok:false, reason:'group_row_title_unavailable'};
+  // select_row refuses activation unless exactly one visible row claims the
+  // bound id; verify and the armed Enter check hold the same bar.
+  let claimants = 0;
+  for (const other of rows) {
+    const o = rowConversation(other);
+    if (o.committed && groupConversationOk(o.conversation, bound)) claimants++;
+  }
+  if (claimants !== 1) return {ok:false, reason:'group_row_ambiguous'};
+  // Header: unique visible convHeader whose single title equals the row title.
+  const headers = Array.from(document.querySelectorAll('#sub-app .RightPanelHeaderconvHeader')).filter(visible);
+  if (headers.length !== 1) return {ok:false, reason:'group_header_ambiguous'};
+  const titles = Array.from(headers[0].querySelectorAll('.RightPanelHeadertitle')).filter(visible);
+  if (titles.length !== 1 || normalizeName(titles[0].textContent) !== title)
+    return {ok:false, reason:'group_header_title_mismatch'};
+  // Header pane proof: nearest committed curConversation on the header's own
+  // current path must be the bound group conversation object.
+  const headerState = committedFiber(headers[0]);
+  if (headerState.rootKnown && !headerState.committed) return {ok:false, reason:'group_header_uncommitted'};
+  const headerProvider = headerState.committed ? nearestSaasConversation(headerState) : null;
+  if (!headerProvider) return {ok:false, reason:'group_header_conversation_unavailable'};
+  const headerConv = headerProvider.memoizedProps.curConversation;
+  if (!groupConversationOk(headerConv, bound)) return {ok:false, reason:'group_header_conversation_mismatch'};
+  if (!inputNode)
+    return requireInput ? {ok:false, reason:'group_input_node_unavailable'} : {ok:true, reason:'header_only'};
+  // Input pane proof: the supplied node must be the single visible SaaS editor.
+  const inputs = Array.from(document.querySelectorAll(SAAS_INPUT_SEL)).filter(visible);
+  if (inputs.length !== 1) return {ok:false, reason:'group_input_ambiguous'};
+  if (inputs[0] !== inputNode) return {ok:false, reason:'group_input_node_mismatch'};
+  const inputState = committedFiber(inputNode);
+  if (inputState.rootKnown && !inputState.committed) return {ok:false, reason:'group_input_uncommitted'};
+  const inputProvider = inputState.committed ? nearestSaasConversation(inputState) : null;
+  if (!inputProvider) return {ok:false, reason:'group_input_conversation_unavailable'};
+  const inputConv = inputProvider.memoizedProps.curConversation;
+  // Same object AND same committed current path: both providers must resolve
+  // to the identical conversation object under the same root.current.
+  if (inputConv !== headerConv || !groupConversationOk(inputConv, bound))
+    return {ok:false, reason:'group_input_conversation_mismatch'};
+  return {ok:true, reason:'', input: inputNode};
+};
+"""
+
+_VERIFY_OPEN = "cfg=>{" + _COMMON + _ROW_CONVERSATION + _GROUP_OPEN_CHECK + r"""
+const result = groupOpenCheck(cfg);
+return {ok:result.ok === true, reason:result.reason || ''};
+}"""
+
+# Atomic committed-fiber metadata read: conversation type, display name, and —
+# only for a provable group — the bound-format shortId. Known conversation
+# types verified in the public bundle (150.b12e3b59.js ConversationType):
+# 1 ONE_TO_ONE_CHAT, 2 GROUP_CHAT, 3 LIVE_CHAT, 4 BROADCAST_CHAT,
+# 17 AI_DOUBLE_CHAT. Only type 2 carries a group id; the thread-namespace
+# ``id`` is never reported as a conversation id. Unknown/missing types read
+# as null so callers fail closed instead of skipping a real row.
+_READ_ROW_METADATA = "(row)=>{" + _COMMON + _ROW_CONVERSATION + r"""
 currentRootIndexes = new WeakMap();
-const bound = String(cfg.boundId || '');
-if (!/^\d{10,25}$/.test(bound)) return {ok:false, reason:'group_bound_id_invalid'};
-const inputNode = cfg.input || null;
-// Exactly one visible row carries the active-conversation class.
-const rows = saasRows();
-const active = rows.filter(row => row.classList.contains('conversationConversationItemcurConversation'));
-if (active.length !== 1) return {ok:false, reason: active.length ? 'group_active_row_ambiguous' : 'group_active_row_missing'};
-const activeRow = active[0];
-const rowFound = rowConversation(activeRow);
-if (!rowFound.committed) return {ok:false, reason:'group_row_uncommitted'};
-if (!groupConversationOk(rowFound.conversation, bound)) return {ok:false, reason:'group_active_identity_mismatch'};
-const title = rowTitle(activeRow);
-if (!title) return {ok:false, reason:'group_row_title_unavailable'};
-// Header: unique visible convHeader whose single title equals the row title.
-const headers = Array.from(document.querySelectorAll('#sub-app .RightPanelHeaderconvHeader')).filter(visible);
-if (headers.length !== 1) return {ok:false, reason:'group_header_ambiguous'};
-const titles = Array.from(headers[0].querySelectorAll('.RightPanelHeadertitle')).filter(visible);
-if (titles.length !== 1 || normalizeName(titles[0].textContent) !== title)
-  return {ok:false, reason:'group_header_title_mismatch'};
-// Header pane proof: nearest committed curConversation on the header's own
-// current path must be the bound group conversation object.
-const headerState = committedFiber(headers[0]);
-if (headerState.rootKnown && !headerState.committed) return {ok:false, reason:'group_header_uncommitted'};
-const headerProvider = headerState.committed ? nearestSaasConversation(headerState) : null;
-if (!headerProvider) return {ok:false, reason:'group_header_conversation_unavailable'};
-const headerConv = headerProvider.memoizedProps.curConversation;
-if (!groupConversationOk(headerConv, bound)) return {ok:false, reason:'group_header_conversation_mismatch'};
-if (!inputNode) return {ok:true, reason:'header_only'};
-// Input pane proof: the supplied node must be the single visible SaaS editor.
-const inputs = Array.from(document.querySelectorAll(SAAS_INPUT_SEL)).filter(visible);
-if (inputs.length !== 1) return {ok:false, reason:'group_input_ambiguous'};
-if (inputs[0] !== inputNode) return {ok:false, reason:'group_input_node_mismatch'};
-const inputState = committedFiber(inputNode);
-if (inputState.rootKnown && !inputState.committed) return {ok:false, reason:'group_input_uncommitted'};
-const inputProvider = inputState.committed ? nearestSaasConversation(inputState) : null;
-if (!inputProvider) return {ok:false, reason:'group_input_conversation_unavailable'};
-const inputConv = inputProvider.memoizedProps.curConversation;
-// Same object AND same committed current path: both providers must resolve
-// to the identical conversation object under the same root.current.
-if (inputConv !== headerConv || !groupConversationOk(inputConv, bound))
-  return {ok:false, reason:'group_input_conversation_mismatch'};
-return {ok:true, reason:''};
+if(!row || !row.matches || !row.matches('[data-e2e="conversation-item"]') || !visible(row)) return null;
+const found = rowConversation(row);
+if(!found.committed || !found.conversation || typeof found.conversation !== 'object') return null;
+const c = found.conversation;
+const name = rowTitle(row);
+if (c.type === 1 || c.type === 3 || c.type === 4 || c.type === 17) return {type:c.type, name:name};
+if (c.type === 2) {
+  if (typeof c.shortId !== 'string' || !/^[0-9]{10,25}$/.test(c.shortId)) return null;
+  return {type:2, name:name, conversationId:c.shortId};
+}
+return null;
 }"""
 
 
@@ -164,6 +227,42 @@ async def read_row_id(row):
     except Exception:
         return None
     return value if isinstance(value, str) and value.isdigit() and 10 <= len(value) <= 25 else None
+
+
+async def read_row_metadata(row):
+    """Atomically read a row's committed conversation type, name and group id.
+
+    One synchronous evaluate walks the row's committed current fiber path
+    (<=3 hops) and reads ``memoizedProps.conversation`` plus the displayed
+    title, so type, name and id can never be paired across a recycle:
+
+    * committed known type (1 ONE_TO_ONE, 3 LIVE, 4 BROADCAST, 17
+      AI_DOUBLE — verified in the public bundle's ``ConversationType``
+      enum) -> ``{'type': <n>, 'name': name}`` with no conversation id;
+    * committed ``type === 2`` GROUP_CHAT with a valid numeric ``shortId`` ->
+      ``{'type': 2, 'name': name, 'conversationId': shortId}``;
+    * anything else — unknown/missing type (e.g. 999), uncommitted or
+      detached fiber, unreadable row, invalid group id — -> ``None``.
+
+    Known non-group types are reported so callers can *skip* them provably;
+    only type 1 may feed friend caches and only type 2 group lookups. The
+    thread-namespace ``id`` is never reported as ``conversationId``.
+    """
+    try:
+        result = await row.evaluate(_READ_ROW_METADATA)
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not isinstance(result.get('name'), str):
+        return None
+    name = result['name']
+    kind = result.get('type')
+    if kind in (1, 3, 4, 17):
+        return {'type': kind, 'name': name}
+    if kind == 2:
+        cid = result.get('conversationId')
+        if isinstance(cid, str) and cid.isdigit() and 10 <= len(cid) <= 25:
+            return {'type': 2, 'name': name, 'conversationId': cid}
+    return None
 
 
 async def select_row(row, bound_id):

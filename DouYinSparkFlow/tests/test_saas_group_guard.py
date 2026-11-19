@@ -380,6 +380,71 @@ class SaasGroupGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertTrue(reason)
 
+    async def test_verify_open_rejects_duplicate_bound_claimants(self):
+        # select_row refuses activation unless exactly one visible row claims
+        # the bound id; verify_open must hold the same bar (LOGIC-2).
+        dup = dict(GROUP_B, shortId=BOUND_A, id='0:2:10000:20009')
+        rows = conv_row('群甲', GROUP_A, active=True) + conv_row('群乙', dup)
+        await self._rebuild([GROUP_A, dup], GROUP_A, GROUP_A, rows_html=rows)
+        ok, reason = await guard.verify_open(self.page, await self._input(), BOUND_A)
+        self.assertFalse(ok)
+        self.assertIn('ambiguous', reason)
+
+    # ---------- read_row_metadata ----------
+
+    async def test_read_row_metadata_returns_group_type_name_and_id(self):
+        row = (await self._rows()).first
+        self.assertEqual(await guard.read_row_metadata(row),
+                         {'type': 2, 'name': '群甲', 'conversationId': BOUND_A})
+
+    async def test_read_row_metadata_returns_friend_type_without_conversation_id(self):
+        rows = conv_row('好友甲', FRIEND)
+        await self._rebuild([FRIEND], FRIEND, FRIEND, rows_html=rows,
+                            header_name='好友甲')
+        row = (await self._rows()).first
+        self.assertEqual(await guard.read_row_metadata(row),
+                         {'type': 1, 'name': '好友甲'})
+
+    async def test_read_row_metadata_rejects_row_without_fiber(self):
+        html = ('<div id="sub-app"><div class="im-saas-viewport-X">' + FILTER_GROUP +
+                '<div class="conversationConversationListwrapper">' +
+                conv_row('群甲', GROUP_A) + '</div></div></div>')
+        await self.page.set_content(html)
+        row = (await self._rows()).first
+        self.assertIsNone(await guard.read_row_metadata(row))
+
+    async def test_read_row_metadata_rejects_detached_fiber(self):
+        # An expando fiber outside the committed current tree is not proof.
+        row = (await self._rows()).first
+        await self.page.evaluate("""() => {
+          const row = document.querySelector('[data-e2e="conversation-item"]');
+          row['__reactFiber$saas'] = {tag:5, stateNode:row, return:null,
+            memoizedProps:{conversation:{type:2, shortId:'7691234567890123401'}}};
+        }""")
+        self.assertIsNone(await guard.read_row_metadata(row))
+
+    async def test_read_row_metadata_rejects_invalid_or_unknown_type(self):
+        bad = dict(GROUP_A, shortId='123')  # group id outside the bound format
+        rows = conv_row('群甲', bad, active=True)
+        await self._rebuild([bad], bad, bad, rows_html=rows)
+        row = (await self._rows()).first
+        self.assertIsNone(await guard.read_row_metadata(row))
+        # Known non-friend/non-group bundle types are reported so callers can
+        # skip them provably — never authorized as either target kind.
+        for kind in (3, 4, 17):
+            other = dict(GROUP_A, type=kind)
+            rows = conv_row('直播间' if kind == 3 else '其他', other, active=True)
+            await self._rebuild([other], other, other, rows_html=rows)
+            row = (await self._rows()).first
+            meta = await guard.read_row_metadata(row)
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta['type'], kind)
+            self.assertNotIn('conversationId', meta)
+        weird = dict(GROUP_A, type=999)  # not a known conversation type
+        rows = conv_row('群甲', weird, active=True)
+        await self._rebuild([weird], weird, weird, rows_html=rows)
+        self.assertIsNone(await guard.read_row_metadata(row))
+
 
 if __name__ == '__main__':
     unittest.main()
