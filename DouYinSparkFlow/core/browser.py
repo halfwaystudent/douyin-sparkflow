@@ -15,6 +15,7 @@ from playwright.async_api import async_playwright
 from rich.console import Console
 
 from core.browser_engine import prepare_profile_engine, resolve_browser_engine
+from core.browser_resources import ensure_browser_resources
 from utils.config import (
     DEBUG,
     Environment,
@@ -354,6 +355,10 @@ async def install_browser():
 
 async def get_browser(GUI=False, network_mode=None, profile_name=None):
     configure_playwright_environment()
+    # Refuse to launch when the host/cgroup cannot spare the reserve; the
+    # exception carries category='browser_resource_unavailable' so the task
+    # layer classifies it as a resource failure, not a login/network fault.
+    ensure_browser_resources("launch")
     engine_selection = resolve_browser_engine(profile_name)
     playwright = None
 
@@ -387,6 +392,9 @@ async def get_browser(GUI=False, network_mode=None, profile_name=None):
 
 async def get_persistent_browser_context(profile_name, GUI=False, root=None, network_mode=None):
     configure_playwright_environment()
+    # Same pre-launch memory gate as get_browser: a persistent profile still
+    # spawns a full Chromium process and must not start under memory pressure.
+    ensure_browser_resources("launch")
 
     profile_dir = browser_profile_root(root) / sanitize_profile_name(profile_name)
     engine_selection = resolve_browser_engine(profile_name)
