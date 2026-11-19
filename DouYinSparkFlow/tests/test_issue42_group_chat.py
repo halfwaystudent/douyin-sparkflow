@@ -19,6 +19,41 @@ SCAN_CONFIG = {
 }
 COOKIE = {"name": "sessionid", "value": "fixture-session", "domain": ".douyin.com", "path": "/"}
 
+# Selectors the sender's variant probe treats as proof of the legacy UI
+# (core.tasks._sender_chat_variant_is_saas -> im_ui.wait_for_saas_ui legacy_probe).
+_LEGACY_VISIBLE_SELECTORS = (
+    '#sub-app li.semi-list-item',
+    '#sub-app [class*="item-header-name-"]',
+    '#sub-app [role="tab"]',
+)
+
+
+def _legacy_ui_locator(selector):
+    """Locator double for the legacy (non-SaaS) creator chat DOM.
+
+    The SaaS viewport marker reports ``count() == 0`` so variant probes resolve
+    to the legacy UI; the legacy row/tab selectors report one visible node so
+    the legacy probe confirms the old page immediately instead of polling.
+    """
+    legacy_row = selector in _LEGACY_VISIBLE_SELECTORS
+    locator = Mock(name=f"locator:{selector}")
+    locator.count = AsyncMock(return_value=1 if legacy_row else 0)
+    locator.is_visible = AsyncMock(return_value=legacy_row)
+    locator.first = locator
+    locator.filter = Mock(return_value=locator)
+    locator.nth = Mock(return_value=locator)
+    locator.all = AsyncMock(return_value=[])
+    locator.get_attribute = AsyncMock(return_value=None)
+    locator.evaluate = AsyncMock(return_value=None)
+    locator.inner_text = AsyncMock(return_value="")
+    locator.wait_for = AsyncMock()
+    return locator
+
+
+def _install_legacy_page_locators(page):
+    """Give a bare Mock page explicit legacy-UI answers per selector."""
+    page.locator = _legacy_ui_locator
+
 
 class _Row:
     def __init__(self, name, *, visible=True):
@@ -450,7 +485,7 @@ class GroupChatTargetTests(unittest.TestCase):
 
     def test_friend_tab_is_clicked_when_a_group_row_is_visible(self):
         page = Mock()
-        page.locator.return_value = Mock()
+        _install_legacy_page_locators(page)
         click = AsyncMock(return_value=True)
 
         with (
@@ -509,7 +544,7 @@ class GroupChatTargetTests(unittest.TestCase):
 
         page = Mock()
         page.get_by_role.return_value = TabLocator()
-        page.locator.return_value = Mock()
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_dismiss_non_login_dialogs", new=AsyncMock(return_value=0)),
@@ -522,6 +557,8 @@ class GroupChatTargetTests(unittest.TestCase):
     def test_group_scan_does_not_click_until_end_confirms_unique_target(self):
         row = _Row("目标群")
         locator = _Locator([row])
+        page = Mock()
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),
@@ -536,7 +573,7 @@ class GroupChatTargetTests(unittest.TestCase):
                 asyncio.run(
                     _collect(
                         tasks.scroll_and_select_group_targets(
-                            Mock(), "demo", ["群聊：目标群"], SCAN_CONFIG
+                            page, "demo", ["群聊：目标群"], SCAN_CONFIG
                         )
                     )
                 )
@@ -548,6 +585,7 @@ class GroupChatTargetTests(unittest.TestCase):
         locator = _Locator([row])
         grid = object()
         page = Mock(evaluate=AsyncMock(return_value=True))
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),
@@ -570,6 +608,7 @@ class GroupChatTargetTests(unittest.TestCase):
         row = _Row("目标群")
         locator = _Locator([row])
         page = Mock(evaluate=AsyncMock(side_effect=RuntimeError("grid detached")))
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),
@@ -592,6 +631,7 @@ class GroupChatTargetTests(unittest.TestCase):
         second = _Row("目标群")
         locator = _Locator([first, second])
         page = Mock(evaluate=AsyncMock(return_value=True))
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),
@@ -613,6 +653,7 @@ class GroupChatTargetTests(unittest.TestCase):
         hidden = _Row("目标群", visible=False)
         locator = _Locator([hidden])
         page = Mock(evaluate=AsyncMock(return_value=True))
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),
@@ -899,6 +940,7 @@ class GroupChatTargetTests(unittest.TestCase):
         row = _Row("目标群")
         locator = _Locator([row])
         page = Mock(evaluate=AsyncMock(return_value=True))
+        _install_legacy_page_locators(page)
 
         with (
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),

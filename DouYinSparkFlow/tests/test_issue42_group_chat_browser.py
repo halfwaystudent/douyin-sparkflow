@@ -350,9 +350,16 @@ class OfflineGroupChatBrowserTests(unittest.TestCase):
         self.assertEqual(0, result["nameClicks"])
 
     def test_hidden_group_row_is_not_a_target(self):
+        # The shared fixture leads with a hidden decoy tab; the sender's legacy
+        # variant probe only inspects each selector's first match, so this test
+        # keeps the decoy hidden but out of the tab role to let the visible
+        # 群消息 tab prove the legacy page.
         result = self._run(
             FIXTURE.replace("HEIGHT", "300").replace("CONTENT_HEIGHT", "210").replace(
                 "ROWS", _row("目标群", hidden=True)
+            ).replace(
+                '<button role="tab" aria-selected="false" class="hidden-copy">',
+                '<button aria-selected="false" class="hidden-copy">',
             )
         )
 
