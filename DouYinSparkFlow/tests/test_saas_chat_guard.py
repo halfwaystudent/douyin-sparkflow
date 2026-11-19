@@ -147,6 +147,32 @@ class SaasChatGuardTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.pw.stop()
 
+    async def test_type2_conversation_cannot_be_selected_as_a_friend(self):
+        group_like = dict(CONV_A, type=2)
+        await self.page.evaluate(SETUP,{'rowConvs':[group_like,CONV_B],'headerConv':group_like,'inputConv':group_like})
+        ok, _ = await self.select()
+        self.assertFalse(ok)
+        self.assertEqual(await self.page.evaluate('window.mousedowns'),0)
+
+    async def test_missing_conversation_type_cannot_authorize_friend_selection(self):
+        unknown = dict(CONV_A);unknown.pop('type')
+        await self.page.evaluate(SETUP,{'rowConvs':[unknown,CONV_B],'headerConv':unknown,'inputConv':unknown})
+        ok, _ = await self.select()
+        self.assertFalse(ok)
+
+    async def test_type_change_after_arm_blocks_enter(self):
+        ok, _ = await self.select()
+        self.assertTrue(ok)
+        ok, _ = await guard.verify_friend(self.page,ACCOUNT,'demo-A',arm=True)
+        self.assertTrue(ok)
+        await self.page.evaluate('''() => {
+          const root=window.saasFiber.root;const stack=[root];
+          while(stack.length){const f=stack.pop();if(f.memoizedProps?.conversation)f.memoizedProps.conversation.type=2;if(f.memoizedProps?.curConversation)f.memoizedProps.curConversation.type=2;if(f.child)stack.push(f.child);if(f.sibling)stack.push(f.sibling)}
+        }''')
+        await self.page.locator('[contenteditable="true"]').press('Enter')
+        self.assertEqual(await self.page.evaluate('window.sent'),0)
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+
     async def select(self, name='demo-A'):
         row = self.page.locator('[data-e2e="conversation-item"]').filter(has_text=name).first
         return await guard.select_friend(self.page, row, ACCOUNT, name)

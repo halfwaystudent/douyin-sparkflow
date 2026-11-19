@@ -216,6 +216,15 @@ const SAAS_INPUT_SEL = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]
 const SAAS_HEADER_SEL = '#sub-app .RightPanelHeaderconvHeader, #sub-app [class*="StackLayoutStackChatHeaderinfoContainer"]';
 const SAAS_TITLE_SEL = '.RightPanelHeadertitle, .StackLayoutStackChatHeadertitle';
 const saasRows = () => Array.from(document.querySelectorAll(SAAS_ROW_SEL)).filter(visible);
+const saasFriendRow = row => {
+  const state=committedFiber(row);
+  if(!state.committed)return false;
+  for(let i=0;i<=3 && i<state.path.length;i++){
+    const c=state.path[i].memoizedProps?.conversation;
+    if(c && typeof c==='object')return c.type===1;
+  }
+  return false;
+};
 const legacyRows = () => Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
 const uiMode = () => {
   const s = saasRows().length, l = legacyRows().length;
@@ -240,6 +249,8 @@ const scopedPaneIdentitySaas = (input, header, cfg) => {
   if (!i.committed || !h.committed || !ip || !hp
       || ip.memoizedProps.curConversation !== hp.memoizedProps.curConversation)
     return {present:true, ok:false, reason:'friend_pane_scope_mismatch'};
+  if(ip.memoizedProps.curConversation.type!==1 || hp.memoizedProps.curConversation.type!==1)
+    return {present:true,ok:false,reason:'friend_conversation_type_mismatch'};
   const identity = conversationIdentity(ip.memoizedProps.curConversation);
   if ((!cfg.conversation && !cfg.thread) || !sameConversation(identity,cfg)
       || !matches(identity,cfg.expected))
@@ -255,6 +266,7 @@ const saasCheck = cfg => {
   if (named.length !== 1) return {ok:false, reason:'friend_identity_ambiguous'};
   const active = rows.filter(row => row.classList.contains('conversationConversationItemcurConversation'));
   if (active.length !== 1 || active[0] !== named[0]) return {ok:false, reason:'friend_chat_not_active'};
+  if(!saasFriendRow(active[0]))return {ok:false,reason:'friend_conversation_type_mismatch'};
   const rowState = committedFiber(active[0]);
   if (rowState.rootKnown && !rowState.committed) return {ok:false, reason:'friend_row_uncommitted'};
   const rowIdentity = read(active[0]);
@@ -377,6 +389,7 @@ if(isSaasRow){
   if(!visible(row) || !srows.includes(row))return {ok:false,reason:'friend_row_unavailable'};
   if(srows.filter(r=>sameName(saasNameOf(r),cfg.name)).length!==1)return {ok:false,reason:'friend_identity_ambiguous'};
   if(!sameName(saasNameOf(row),cfg.name))return {ok:false,reason:'friend_row_name_mismatch'};
+  if(!saasFriendRow(row))return {ok:false,reason:'friend_conversation_type_mismatch'};
   const identity=read(row);
   if(!matches(identity,cfg.expected))return {ok:false,reason:'friend_row_identity_mismatch'};
   const title=row.querySelector('.conversationConversationItemtitle');
