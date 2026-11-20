@@ -472,6 +472,70 @@ class SaasGroupGuardTests(unittest.IsolatedAsyncioTestCase):
     async def _press_enter(self):
         await (await self._input()).press('Enter')
 
+    async def _show_counted_group(self, *, row_name='111', header='111(8)',
+                                  model_name='111', count=8):
+        group = dict(GROUP_A, coreInfo={'name': model_name}, participantCount=count)
+        await self._rebuild([group], group, group,
+                            rows_html=conv_row(row_name, group, active=True),
+                            header_name=header)
+
+    async def test_bundle_counted_group_title_authorizes_one_enter(self):
+        await self._show_counted_group()
+        ok, reason = await guard.verify_open(self.page, await self._input(), BOUND_A)
+        self.assertTrue(ok, reason)
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self._enter_probe()
+        await self._press_enter()
+        await self._press_enter()
+        self.assertEqual(await self._probe_seen(), 1)
+        self.assertTrue(await guard.dispatch_was_allowed(self.page))
+
+    async def test_counted_header_requires_exact_name_and_committed_count(self):
+        for fields in ({'header': '2111(8)'}, {'header': '111(7)'},
+                       {'header': '111(08)'}, {'model_name': 'other'},
+                       {'count': '8'}, {'count': 0}, {'count': None},
+                       {'row_name': 'other'}, {'row_name': '111(9)', 'header': '111(8)'}):
+            with self.subTest(fields=fields):
+                await self._show_counted_group(**fields)
+                ok, _ = await self._arm()
+                self.assertFalse(ok)
+                self.assertIsNone(await self._guard_state())
+
+    async def test_counted_header_literal_parentheses_in_room_name_are_preserved(self):
+        await self._show_counted_group(row_name='111(9)', model_name='111(9)',
+                                       header='111(9)(8)')
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+
+    async def test_counted_header_change_after_arm_blocks_actual_enter(self):
+        await self._show_counted_group()
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self._enter_probe()
+        await self.page.evaluate("document.querySelector('.RightPanelHeadertitle').textContent = '111(9)'")
+        await self._press_enter()
+        self.assertEqual(await self._probe_seen(), 0)
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+
+    async def test_counted_header_model_count_change_after_arm_blocks_actual_enter(self):
+        await self._show_counted_group()
+        ok, reason = await self._arm()
+        self.assertTrue(ok, reason)
+        await self._enter_probe()
+        await self.page.evaluate(
+            "window.saasFiber.panel.child.child.memoizedProps.curConversation.participantCount = 9")
+        await self._press_enter()
+        self.assertEqual(await self._probe_seen(), 0)
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+
+    async def test_selection_title_proof_rejects_a_stale_scan_name(self):
+        await self._show_counted_group()
+        ok, reason = await guard.verify_open(
+            self.page, None, BOUND_A, expected_name='earlier title')
+        self.assertFalse(ok)
+        self.assertEqual(reason, 'group_row_title_changed')
+
     async def test_arm_enter_allows_bound_enter_and_consumes(self):
         ok, reason = await self._arm()
         self.assertTrue(ok, reason)

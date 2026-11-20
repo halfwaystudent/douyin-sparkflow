@@ -1905,10 +1905,9 @@ async def _stable_single_screen_group_list(page, scrollable):
 
 
 async def _confirm_group_chat_header(page, expected_name):
-    """Require the selected chat header to name the exact configured group."""
+    """Require the legacy chat header to name the exact group."""
     if await im_ui.is_saas_ui(page):
-        headers = page.locator('#sub-app .RightPanelHeaderconvHeader:visible .RightPanelHeadertitle:visible')
-        return await headers.count() == 1 and (await headers.inner_text()).replace('\xa0', ' ').strip() == expected_name.replace('\xa0', ' ').strip()
+        return False  # SaaS selection requires the committed, ID-bound proof.
     try:
         await page.wait_for_function(
             """({ selector, expectedName }) => Array.from(document.querySelectorAll(selector))
@@ -2187,18 +2186,24 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
                     errors.append({"target": configured, "category": "group_identity_unavailable", "reason": reason})
                     continue
                 raise FriendListIncompleteError(reason)
-            if not await _confirm_group_chat_header(page, current_name):
-                if errors is not None:
-                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: chat header did not confirm target {configured}"})
-                    continue
-                raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: chat header did not confirm target {configured}")
-            header_id = await _read_group_header_conversation_id(page, bound_id)
-            if header_id is not None and header_id != bound_id:
-                if errors is not None:
-                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: opened chat id changed"})
-                    continue
-                raise FriendListIncompleteError(f"group_identity_unavailable for {account_name}: opened chat id changed")
-            verified, verify_reason = await _verify_open_group_conversation(page, None, bound_id)
+            if saas:
+                # Use the same title/identity rule as the final Enter guard.
+                # Do not fall back to the legacy proof if the shell disappears.
+                verified, verify_reason = await saas_group_guard.verify_open(
+                    page, None, bound_id, expected_name=current_name)
+            else:
+                if not await _confirm_group_chat_header(page, current_name):
+                    if errors is not None:
+                        errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: chat header did not confirm target {configured}"})
+                        continue
+                    raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: chat header did not confirm target {configured}")
+                header_id = await _read_group_header_conversation_id(page, bound_id)
+                if header_id is not None and header_id != bound_id:
+                    if errors is not None:
+                        errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: opened chat id changed"})
+                        continue
+                    raise FriendListIncompleteError(f"group_identity_unavailable for {account_name}: opened chat id changed")
+                verified, verify_reason = await _verify_open_group_conversation(page, None, bound_id)
             if not verified:
                 reason = f"group_identity_unavailable for {account_name}: {verify_reason}"
                 if errors is not None:

@@ -18,7 +18,7 @@ Public API (async, Playwright):
 * ``read_row_id(row)`` -> numeric shortId string or ``None``.
 * ``read_row_metadata(row)`` -> ``{'type', 'name', ...}`` or ``None``.
 * ``select_row(row, bound_id)`` -> ``'clicked'`` or a reason string.
-* ``verify_open(page, chat_input, bound_id)`` -> ``(bool, reason)``.
+* ``verify_open(page, chat_input, bound_id, *, expected_name=None)`` -> ``(bool, reason)``.
 * ``arm_enter(page, chat_input, bound_id)`` -> ``(bool, reason)``.
 * ``dispatch_was_allowed(page)`` -> ``bool`` (consumes the single shot).
 * ``disarm(page)`` -> ``None``.
@@ -112,6 +112,21 @@ const saasGroupFilterActive = () => {
   }
   return false;
 };
+const groupHeaderTitleMatches = (title, rowName, rowConv, headerConv) => {
+  if (title === rowName) return true;
+  // Bundle aab99327 module 94064: list calls formatName(conv, false),
+  // header calls formatName(conv, true) and appends (participantCount).
+  // Reconstruct the exact decoration from the verified model; never strip a
+  // suffix from arbitrary DOM text (parentheses can be part of a room name).
+  const rowModelName = rowConv.coreInfo?.name;
+  const headerModelName = headerConv.coreInfo?.name;
+  const count = headerConv.participantCount;
+  return typeof rowModelName === 'string' && typeof headerModelName === 'string'
+    && normalizeName(rowModelName) === rowName
+    && normalizeName(headerModelName) === rowName
+    && Number.isSafeInteger(count) && count > 0
+    && title === normalizeName(`${headerModelName}(${count})`);
+};
 const groupOpenCheck = cfg => {
   // The armed keydown closure survives React commits: never reuse a fiber
   // graph indexed by an earlier check.
@@ -131,6 +146,8 @@ const groupOpenCheck = cfg => {
   if (!groupConversationOk(rowFound.conversation, bound)) return {ok:false, reason:'group_active_identity_mismatch'};
   const title = rowTitle(activeRow);
   if (!title) return {ok:false, reason:'group_row_title_unavailable'};
+  if (cfg.expectedName != null && (typeof cfg.expectedName !== 'string'
+      || title !== normalizeName(cfg.expectedName))) return {ok:false, reason:'group_row_title_changed'};
   // select_row refuses activation unless exactly one visible row claims the
   // bound id; verify and the armed Enter check hold the same bar.
   let claimants = 0;
@@ -139,12 +156,11 @@ const groupOpenCheck = cfg => {
     if (o.committed && groupConversationOk(o.conversation, bound)) claimants++;
   }
   if (claimants !== 1) return {ok:false, reason:'group_row_ambiguous'};
-  // Header: unique visible convHeader whose single title equals the row title.
+  // Header: unique visible convHeader with a single visible title.
   const headers = Array.from(document.querySelectorAll('#sub-app .RightPanelHeaderconvHeader')).filter(visible);
   if (headers.length !== 1) return {ok:false, reason:'group_header_ambiguous'};
   const titles = Array.from(headers[0].querySelectorAll('.RightPanelHeadertitle')).filter(visible);
-  if (titles.length !== 1 || normalizeName(titles[0].textContent) !== title)
-    return {ok:false, reason:'group_header_title_mismatch'};
+  if (titles.length !== 1) return {ok:false, reason:'group_header_title_mismatch'};
   // Header pane proof: nearest committed curConversation on the header's own
   // current path must be the bound group conversation object.
   const headerState = committedFiber(headers[0]);
@@ -153,6 +169,8 @@ const groupOpenCheck = cfg => {
   if (!headerProvider) return {ok:false, reason:'group_header_conversation_unavailable'};
   const headerConv = headerProvider.memoizedProps.curConversation;
   if (!groupConversationOk(headerConv, bound)) return {ok:false, reason:'group_header_conversation_mismatch'};
+  if (!groupHeaderTitleMatches(normalizeName(titles[0].textContent), title, rowFound.conversation, headerConv))
+    return {ok:false, reason:'group_header_title_mismatch'};
   if (!inputNode)
     return requireInput ? {ok:false, reason:'group_input_node_unavailable'} : {ok:true, reason:'header_only'};
   // Input pane proof: the supplied node must be the single visible SaaS editor.
@@ -355,16 +373,18 @@ async def _anchor_handle(chat_input):
     return chat_input
 
 
-async def verify_open(page, chat_input, bound_id):
+async def verify_open(page, chat_input, bound_id, *, expected_name=None):
     """Prove the opened pane is still the bound group conversation.
 
     Requires the read-only 群聊 filter to be active, exactly one visible
     ``curConversation`` row matching ``bound_id``, a unique convHeader whose
-    title equals the row title, and — when ``chat_input`` is supplied — the
+    title matches the row title (or the exact model-derived member count
+    decoration), and — when ``chat_input`` is supplied — the
     single visible SaaS editor resolving to the *same* committed
     ``curConversation`` object as the header. Header-only mode (``None``)
     proves just the header conversation and is only acceptable before an
-    input exists.
+    input exists. ``expected_name`` optionally pins the name observed in the
+    selection scan, so a stale label cannot be used for a rename notice.
     """
     try:
         if not await im_ui.saas_filter_is_active(page, 'group'):
@@ -372,7 +392,9 @@ async def verify_open(page, chat_input, bound_id):
         anchor = await _anchor_handle(chat_input)
         if chat_input is not None and anchor is None:
             return False, 'group_input_node_unavailable'
-        result = await page.evaluate(_VERIFY_OPEN, {'boundId': str(bound_id or ''), 'input': anchor})
+        result = await page.evaluate(_VERIFY_OPEN, {
+            'boundId': str(bound_id or ''), 'input': anchor, 'expectedName': expected_name,
+        })
     except Exception as exc:
         return False, f'group_identity_unavailable: {type(exc).__name__}'
     if not isinstance(result, dict):

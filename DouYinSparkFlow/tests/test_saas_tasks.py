@@ -108,6 +108,27 @@ class SaasTasksTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await tasks._verify_open_group_conversation(self.page,editor,fixture.BOUND_A))[0])
         self.assertFalse((await tasks._verify_open_group_conversation(self.page,editor,fixture.BOUND_B))[0])
 
+    async def test_bound_saas_group_selection_accepts_model_counted_header(self):
+        from tests import test_saas_group_guard as fixture
+        group = dict(fixture.GROUP_A, coreInfo={'name': '111'}, participantCount=8)
+        row = fixture.conv_row('111', group, active=True)
+        await self.page.set_content(fixture.group_html(row, header_name='111(8)'))
+        await self.page.evaluate(fixture.SETUP, {
+            'rowConvs': [group], 'headerConv': group, 'inputConv': group,
+        })
+        account = {'group_target_bindings': {'群聊：111': fixture.BOUND_A}}
+        config = tasks._normalize_friend_list_scan_config({})
+        config.update(maxScanSeconds=3, scrollDelaySeconds=0)
+        errors = []
+        with patch.object(tasks, '_dismiss_non_login_dialogs', AsyncMock()), \
+             patch.object(tasks, '_persist_group_target_rename_notice') as rename:
+            selected = [target async for target in tasks.scroll_and_select_group_targets(
+                self.page, 'synthetic', ['群聊：111'], config, account, errors=errors)]
+        self.assertEqual(selected, ['群聊：111'], errors)
+        self.assertEqual(errors, [])
+        rename.assert_called_once_with(account, '群聊：111', '111')
+        self.assertEqual(await self.page.evaluate('window.mousedowns'), 1)
+
     async def test_saas_group_row_is_not_a_friend_record(self):
         await self.content('<div data-e2e="conversation-item"><div class="conversationConversationItemtitle">same name</div></div>')
         await self.page.evaluate('''() => {document.querySelector('[data-e2e="conversation-item"]').__reactFiber$test={memoizedProps:{conversation:{type:2,shortId:'7691234567890123401'}}}}''')
