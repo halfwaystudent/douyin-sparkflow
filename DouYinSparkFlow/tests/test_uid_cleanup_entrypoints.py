@@ -22,6 +22,8 @@ class Context(Resource):
         super().__init__()
         self.page = page
         self.add_cookies = AsyncMock()
+        self.route = AsyncMock()
+        self.route_web_socket = AsyncMock()
         self.new_page = AsyncMock(return_value=page)
         self.set_default_navigation_timeout = Mock()
         self.set_default_timeout = Mock()
