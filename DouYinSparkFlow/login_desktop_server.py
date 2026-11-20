@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import time
+import traceback
 import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from core.login import collect_login_result
+from core.login import LoginIdentityPending, LoginRequired, collect_login_result, wait_for_logged_in_identity
 from core.streak_state import AUTH_COOKIE_NAMES
 from core.login_interaction import InteractionError, LoginInteraction
 from core.browser_engine import (
@@ -61,6 +62,7 @@ if LOGIN_DESKTOP_MODE not in {"native", "novnc"}:
 IDLE_TIMEOUT_SECONDS = max(300, int(os.getenv("LOGIN_DESKTOP_IDLE_TIMEOUT_SECONDS", "1800")))
 STOP_AFTER_EXPORT_SECONDS = max(0, int(os.getenv("LOGIN_DESKTOP_STOP_AFTER_EXPORT_SECONDS", "60")))
 STATUS_CACHE_SECONDS = max(1, int(os.getenv("LOGIN_DESKTOP_STATUS_CACHE_SECONDS", "15")))
+STATUS_PROBE_SECONDS = 3
 LOGIN_NETWORK_MODE = str(os.getenv("LOGIN_DESKTOP_PROXY_MODE", "auto")).strip().lower()
 if LOGIN_NETWORK_MODE not in {"auto", "direct", "proxy"}:
     LOGIN_NETWORK_MODE = "auto"
@@ -127,6 +129,22 @@ GENERIC_WWW_NAMES = {
     "海量优质视频内容",
     "抖音精选电脑版",
 }
+
+
+def _is_creator_status_url(url):
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme, parts.netloc) == ("https", "creator.douyin.com")
+    except ValueError:
+        return False
+
+
+def _log_status_probe_error(error):
+    # A raw driver error can contain URLs and input data. Log stack locations,
+    # without the exception text, source lines, or absolute paths.
+    frames = traceback.extract_tb(error.__traceback__, limit=-4)
+    locations = " > ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in frames)
+    logger.warning("Unexpected login status probe failure: %s at %s", type(error).__name__, locations)
 
 
 def _purge_login_data(profile_dir):
@@ -665,8 +683,13 @@ class LoginDesktopManager:
             not self.context or self._context_is_closed()
         ):
             await self._retire_closed_account_profile()
-        if self._status_cache is not None and now - self._status_checked_at < STATUS_CACHE_SECONDS:
-            return dict(self._status_cache)
+        cached = self._status_cache
+        if (cached is not None and now - self._status_checked_at < STATUS_CACHE_SECONDS
+                and not self._page_operation_lock.locked()
+                and ((not cached.get("running") and self.context is None)
+                     or (self.context is not None and self.page is not None
+                         and not self.page.is_closed() and cached.get("current_url") == self.page.url))):
+            return dict(cached)
 
         logged_in = False
         username = ""
@@ -736,27 +759,32 @@ class LoginDesktopManager:
             self._status_checked_at = now
             return dict(payload)
 
+        # A loading/missing page or a different origin cannot prove logout.
+        login_state_known = False
         if page:
             current_url = page.url
-            if not self._page_operation_lock.locked():
-                try:
-                    result = await collect_login_result(page, self.context, timeout_ms=1000)
-                    logged_in = True
-                    username = result["username"]
-                    unique_id = result["unique_id"]
-                except Exception as exc:
-                    # The page may simply not expose the identity yet; reporting
-                    # "logged out" here made a just-finished QR scan look like a
-                    # failure and invited a duplicate save.
-                    login_state_known = False
-                    logger.warning(
-                        "Login state could not be collected from the login page: %s",
-                        type(exc).__name__,
-                    )
-            else:
-                # The page is mid-operation (for example refreshing the QR code),
-                # so its state is genuinely unknown right now.
-                login_state_known = False
+            context = self.context
+            if not self._page_operation_lock.locked() and _is_creator_status_url(current_url):
+                async with self._page_operation_lock:
+                    try:
+                        # Status is a display-only read, not an account export.
+                        unique_id, username = await asyncio.wait_for(
+                            wait_for_logged_in_identity(page, timeout_ms=1000),
+                            timeout=STATUS_PROBE_SECONDS,
+                        )
+                        logged_in = login_state_known = True
+                    except LoginRequired:
+                        login_state_known = True
+                    except (LoginIdentityPending, asyncio.TimeoutError, PlaywrightTimeoutError):
+                        # Cold rendering and a just-finished scan are expected
+                        # to produce an unknown result while the card hydrates.
+                        pass
+                    except Exception as exc:
+                        _log_status_probe_error(exc)
+                    if self.context is not context or self.page is not page or page.is_closed() or page.url != current_url:
+                        # Discard a result from a replaced context or navigation.
+                        logged_in = login_state_known = False
+                        username = unique_id = ""
 
         payload = {
             "running": True,
@@ -772,8 +800,8 @@ class LoginDesktopManager:
             "profile_mode": self._active_profile_mode,
             "network": self._network_payload(),
         }
-        self._status_cache = payload
-        self._status_checked_at = now
+        self._status_cache = payload if login_state_known else None
+        self._status_checked_at = now if login_state_known else 0.0
         return dict(payload)
 
     async def open_login(
