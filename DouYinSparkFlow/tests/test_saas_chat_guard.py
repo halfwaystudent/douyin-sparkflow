@@ -192,6 +192,71 @@ class SaasChatGuardTests(unittest.IsolatedAsyncioTestCase):
         await self.page.locator('[contenteditable]').press('Enter')
         self.assertEqual(await self.page.evaluate('window.sent'), 1)
 
+    async def _select_opaque_alias(self):
+        account = {'target_uid_bindings': {'demo-A': {
+            'uid': 'demo-sec-A', 'secUid': 'demo-sec-A',
+        }}}
+        row = self.page.locator('[data-e2e="conversation-item"]').first
+        return account, await guard.select_friend(self.page, row, account, 'demo-A')
+
+    async def test_saas_old_alias_with_same_sec_and_numeric_peer_allows_enter(self):
+        account, (ok, reason) = await self._select_opaque_alias()
+        self.assertTrue(ok, reason)
+        self.assertEqual(await self.page.evaluate('window.mousedowns'), 1)
+        ok, reason = await guard.verify_friend(self.page, account, 'demo-A', arm=True)
+        self.assertTrue(ok, reason)
+        await self.page.locator('[contenteditable]').press('Enter')
+        self.assertEqual(await self.page.evaluate('window.sent'), 1)
+        self.assertTrue(await guard.dispatch_was_allowed(self.page))
+
+    async def test_saas_old_alias_cannot_use_dom_sec_to_replace_committed_evidence(self):
+        no_sec = dict(CONV_A, firstPageParticipant={'participants': []})
+        await self._rebuild([no_sec, CONV_B], no_sec, no_sec)
+        await self.page.locator('[data-e2e="conversation-item"]').first.evaluate(
+            'node => node.setAttribute("data-sec-uid", "demo-sec-A")')
+        _, (ok, _) = await self._select_opaque_alias()
+        self.assertFalse(ok)
+        self.assertEqual(await self.page.evaluate('window.mousedowns'), 0)
+
+    async def test_saas_old_alias_rejects_another_numeric_peer_at_keydown(self):
+        account, (ok, reason) = await self._select_opaque_alias()
+        self.assertTrue(ok, reason)
+        self.assertTrue((await guard.verify_friend(self.page, account, 'demo-A', arm=True))[0])
+        # Keep the same nickname, secUid and thread, but change which
+        # numeric participant the SDK claims is the peer.
+        other = dict(CONV_A, toParticipantUserId='10000',
+                     firstPageParticipant={'participants': [{'user_id':'10000', 'sec_uid':'demo-sec-A'}]})
+        await self._rebuild([other, CONV_B], other, other)
+        await self.page.locator('[contenteditable]').press('Enter')
+        self.assertEqual(await self.page.evaluate('window.sent'), 0)
+        self.assertFalse(await guard.dispatch_was_allowed(self.page))
+
+    async def test_saas_old_alias_requires_the_same_sec_from_the_current_pane(self):
+        account, (ok, reason) = await self._select_opaque_alias()
+        self.assertTrue(ok, reason)
+        # A correct active row cannot replace missing evidence in the pane.
+        no_sec = dict(CONV_A, firstPageParticipant={'participants': []})
+        await self._rebuild([CONV_A, CONV_B], no_sec, no_sec)
+        ok, reason = await guard.verify_friend(self.page, account, 'demo-A', arm=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, 'friend_current_conversation_mismatch')
+
+    async def test_saas_old_alias_does_not_accept_the_sec_of_the_other_participant(self):
+        wrong_owner = dict(CONV_A, toParticipantSecUserId='demo-sec-A',
+                           firstPageParticipant={'participants': [{'user_id':'10000', 'sec_uid':'demo-sec-A'}]})
+        await self._rebuild([wrong_owner, CONV_B], wrong_owner, wrong_owner)
+        _, (ok, _) = await self._select_opaque_alias()
+        self.assertFalse(ok)
+        self.assertEqual(await self.page.evaluate('window.mousedowns'), 0)
+
+    async def test_saas_old_alias_rejects_conflicting_sec_evidence(self):
+        bad = dict(CONV_A, toParticipantSecUserId='demo-sec-A',
+                   firstPageParticipant={'participants': [{'user_id':'10001', 'sec_uid':'demo-sec-B'}]})
+        await self._rebuild([bad, CONV_B], bad, bad)
+        _, (ok, _) = await self._select_opaque_alias()
+        self.assertFalse(ok)
+        self.assertEqual(await self.page.evaluate('window.mousedowns'), 0)
+
     async def test_saas_explicit_sec_uid_field_is_accepted(self):
         rows = conv_row('demo C', CONV_C, active=True, title_text='demo C')
         await self._rebuild([CONV_C], CONV_C, CONV_C, rows_html=rows, header_name='demo C')

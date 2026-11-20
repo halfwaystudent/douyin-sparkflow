@@ -216,14 +216,58 @@ const SAAS_INPUT_SEL = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]
 const SAAS_HEADER_SEL = '#sub-app .RightPanelHeaderconvHeader, #sub-app [class*="StackLayoutStackChatHeaderinfoContainer"]';
 const SAAS_TITLE_SEL = '.RightPanelHeadertitle, .StackLayoutStackChatHeadertitle';
 const saasRows = () => Array.from(document.querySelectorAll(SAAS_ROW_SEL)).filter(visible);
-const saasFriendRow = row => {
+const saasFriendConversation = row => {
   const state=committedFiber(row);
-  if(!state.committed)return false;
+  if(!state.committed)return null;
   for(let i=0;i<=3 && i<state.path.length;i++){
     const c=state.path[i].memoizedProps?.conversation;
-    if(c && typeof c==='object')return c.type===1;
+    if(c && typeof c==='object')return c.type===1 ? c : null;
   }
-  return false;
+  return null;
+};
+// Historical user_detail sometimes returned the same opaque value for
+// user_id and SecretUseId. That is one secUid, not two independent IDs and
+// not the numeric IM peer from the conversation's participant namespace.
+const hasOpaqueAlias = expected => expected.peer === expected.sec &&
+  typeof expected.sec === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(expected.sec) &&
+  !/^\d+$/.test(expected.sec);
+const proveSaasAlias = (conversation, expected) => {
+  const peer = conversation.toParticipantUserId;
+  if(typeof peer!=='string' || !/^[1-9]\d{0,24}$/.test(peer))return null;
+  const identity = conversationIdentity(conversation);
+  if(!consistent(identity) || identity.peer[0]!==peer || identity.thread.length!==1 ||
+     identity.thread[0].split(':').slice(2).filter(id=>id===peer).length!==1)return null;
+  const links=conversation.firstPageParticipant;
+  const participants=Array.isArray(links) ? links : links?.participants;
+  const matching=new Set();
+  if(conversation.toParticipantSecUserId){
+    if(conversation.toParticipantSecUserId!==expected.sec)return null;
+    matching.add(expected.sec);
+  }
+  if(Array.isArray(participants)){
+    if(participants.length>128)return null;
+    for(const p of participants){
+      if(!p || typeof p!=='object')continue;
+      const isPeer=String(p.user_id)===peer;
+      for(const sec of [p.sec_uid,p.secUid]){
+        if(!sec)continue;
+        if(isPeer){
+          if(sec!==expected.sec)return null;
+          matching.add(sec);
+        }else if(sec===expected.sec)return null;
+      }
+    }
+  }
+  if(matching.size!==1 || identity.sec[0]!==expected.sec)return null;
+  return {peer,sec:expected.sec};
+};
+const matchesSaasAlias = (identity, conversation, proof) =>
+  consistent(identity) && identity.peer[0]===proof.peer &&
+  identity.sec[0]===proof.sec && identity.thread[0]===conversation.id;
+const saasMatches = (identity, conversation, cfg) => {
+  if(!hasOpaqueAlias(cfg.expected))return matches(identity,cfg.expected);
+  const proof=proveSaasAlias(conversation,cfg.expected);
+  return Boolean(proof && proof.peer===cfg.imPeer && matchesSaasAlias(identity,conversation,proof));
 };
 const legacyRows = () => Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
 const uiMode = () => {
@@ -251,9 +295,10 @@ const scopedPaneIdentitySaas = (input, header, cfg) => {
     return {present:true, ok:false, reason:'friend_pane_scope_mismatch'};
   if(ip.memoizedProps.curConversation.type!==1 || hp.memoizedProps.curConversation.type!==1)
     return {present:true,ok:false,reason:'friend_conversation_type_mismatch'};
-  const identity = conversationIdentity(ip.memoizedProps.curConversation);
+  const conversation=ip.memoizedProps.curConversation;
+  const identity=conversationIdentity(conversation);
   if ((!cfg.conversation && !cfg.thread) || !sameConversation(identity,cfg)
-      || !matches(identity,cfg.expected))
+      || !saasMatches(identity,conversation,cfg))
     return {present:true, ok:false, reason:'friend_current_conversation_mismatch'};
   return {present:true, ok:true};
 };
@@ -266,11 +311,12 @@ const saasCheck = cfg => {
   if (named.length !== 1) return {ok:false, reason:'friend_identity_ambiguous'};
   const active = rows.filter(row => row.classList.contains('conversationConversationItemcurConversation'));
   if (active.length !== 1 || active[0] !== named[0]) return {ok:false, reason:'friend_chat_not_active'};
-  if(!saasFriendRow(active[0]))return {ok:false,reason:'friend_conversation_type_mismatch'};
+  const rowConversation=saasFriendConversation(active[0]);
+  if(!rowConversation)return {ok:false, reason:'friend_conversation_type_mismatch'};
   const rowState = committedFiber(active[0]);
   if (rowState.rootKnown && !rowState.committed) return {ok:false, reason:'friend_row_uncommitted'};
   const rowIdentity = read(active[0]);
-  if (!matches(rowIdentity,cfg.expected)) return {ok:false, reason:'friend_active_identity_mismatch'};
+  if (!saasMatches(rowIdentity,rowConversation,cfg)) return {ok:false, reason:'friend_active_identity_mismatch'};
   if (!sameConversation(rowIdentity,cfg)) return {ok:false, reason:'friend_conversation_changed'};
   const headers = Array.from(document.querySelectorAll(SAAS_HEADER_SEL)).filter(visible);
   if (headers.length !== 1) return {ok:false, reason:'friend_header_ambiguous'};
@@ -280,10 +326,11 @@ const saasCheck = cfg => {
   const inputs = Array.from(document.querySelectorAll(SAAS_INPUT_SEL)).filter(visible);
   if (inputs.length !== 1) return {ok:false, reason:'friend_input_ambiguous'};
   const inputIdentity = read(inputs[0],0), headerIdentity = read(headers[0],0);
+  const expected=cfg.imPeer ? {peer:cfg.imPeer,sec:cfg.expected.sec} : cfg.expected;
   for (const identity of [inputIdentity,headerIdentity]) {
     if (!consistent(identity)) return {ok:false, reason:'friend_open_identity_conflict'};
     for (const kind of ['peer','sec']) {
-      if (identity[kind].length && cfg.expected[kind] && identity[kind][0] !== cfg.expected[kind])
+      if (identity[kind].length && expected[kind] && identity[kind][0] !== expected[kind])
         return {ok:false, reason:'friend_open_identity_mismatch'};
     }
     if ((identity.conversation.length && cfg.conversation && identity.conversation[0] !== cfg.conversation)
@@ -327,6 +374,7 @@ const check = cfg => {
   const mode = uiMode();
   if (mode === 'saas') return saasCheck(cfg);
   if (mode === 'mixed') return {ok:false, reason:'friend_ui_ambiguous'};
+  if (cfg.imPeer) return {ok:false, reason:'friend_ui_unavailable'};
   const rows=Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
   const named=rows.filter(row=>nameOf(row)===cfg.name);
   if(named.length!==1)return {ok:false,reason:'friend_identity_ambiguous'};
@@ -389,15 +437,20 @@ if(isSaasRow){
   if(!visible(row) || !srows.includes(row))return {ok:false,reason:'friend_row_unavailable'};
   if(srows.filter(r=>sameName(saasNameOf(r),cfg.name)).length!==1)return {ok:false,reason:'friend_identity_ambiguous'};
   if(!sameName(saasNameOf(row),cfg.name))return {ok:false,reason:'friend_row_name_mismatch'};
-  if(!saasFriendRow(row))return {ok:false,reason:'friend_conversation_type_mismatch'};
+  const rowConversation=saasFriendConversation(row);
+  if(!rowConversation)return {ok:false,reason:'friend_conversation_type_mismatch'};
   const identity=read(row);
-  if(!matches(identity,cfg.expected))return {ok:false,reason:'friend_row_identity_mismatch'};
+  const alias=hasOpaqueAlias(cfg.expected);
+  const expected=alias ? proveSaasAlias(rowConversation,cfg.expected) : cfg.expected;
+  if(!expected || !(alias ? matchesSaasAlias(identity,rowConversation,expected) : matches(identity,expected)))
+    return {ok:false,reason:'friend_row_identity_mismatch'};
   const title=row.querySelector('.conversationConversationItemtitle');
   if(!title)return {ok:false,reason:'friend_name_node_unavailable'};
   // The SaaS row activates on mousedown (verified onMouseDown in the bundle),
   // not click — dispatch the same event a real press produces first.
   row.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true,view:window}));
-  return {ok:true,reason:'',conversation:identity.conversation[0] || '',thread:identity.thread[0] || ''};
+  return {ok:true,reason:'',conversation:identity.conversation[0] || '',
+    thread:identity.thread[0] || '',imPeer:alias ? expected.peer : ''};
 }
 const rows=Array.from(document.querySelectorAll('#sub-app li.semi-list-item')).filter(visible);
 if(!visible(row) || !rows.includes(row))return {ok:false,reason:'friend_row_unavailable'};
@@ -485,6 +538,8 @@ async def _select_friend(page, row, account, target):
         return False, str(reason or 'friend_selection_unavailable')
     cfg['conversation'] = str(result.get('conversation') or '')
     cfg['thread'] = str(result.get('thread') or '')
+    if result.get('imPeer'):
+        cfg['imPeer'] = str(result['imPeer'])
     _SELECTIONS[page] = cfg
     return True, ''
 
