@@ -160,7 +160,7 @@ async def saas_filter_is_active(page, kind) -> bool:
     return False
 
 
-async def activate_saas_filter(page, kind, *, timeout_ms=10000) -> bool:
+async def activate_saas_filter(page, kind, *, timeout_ms=30000) -> bool:
     """Activate the SaaS filter for ``kind`` and verify it took effect.
 
     Returns ``False`` only when the page is not the SaaS UI at all (caller
