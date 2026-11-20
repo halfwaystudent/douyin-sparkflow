@@ -77,6 +77,14 @@ IDENTITY_UNREADABLE_MESSAGE = (
 )
 
 
+class LoginRequired(RuntimeError):
+    """The creator page visibly requests sign-in."""
+
+
+class LoginIdentityPending(RuntimeError):
+    """No complete account identity is currently readable from the page."""
+
+
 def identity_from_card_text(text):
     """Split the creator identity card's text into (nickname, 抖音号).
 
@@ -132,9 +140,9 @@ async def _wait_for_identity_card(page, timeout_ms):
         # A visible login form is a conclusive answer: waiting out the whole
         # budget on a page that is asking for a QR scan only delays it.
         if await _login_form_visible(page):
-            raise RuntimeError(LOGIN_REQUIRED_MESSAGE)
+            raise LoginRequired(LOGIN_REQUIRED_MESSAGE)
         if asyncio.get_running_loop().time() >= deadline:
-            raise RuntimeError(CARD_NOT_READY_MESSAGE)
+            raise LoginIdentityPending(CARD_NOT_READY_MESSAGE)
         await asyncio.sleep(IDENTITY_POLL_SECONDS)
 
 
@@ -171,7 +179,7 @@ async def _read_page_identity(page, timeout_ms):
     unique_id_text = await _wait_for_visible_text(page, (XPATHS["unique_id"],), trailing_ms)
     unique_id = normalize_unique_id(unique_id_text)
     if not unique_id:
-        raise RuntimeError(IDENTITY_UNREADABLE_MESSAGE)
+        raise LoginIdentityPending(IDENTITY_UNREADABLE_MESSAGE)
 
     nickname = await _wait_for_visible_text(
         page,
@@ -181,7 +189,7 @@ async def _read_page_identity(page, timeout_ms):
     if not nickname:
         nickname, _handle = identity_from_card_text(await _first_visible_text(page, (READY_SELECTOR,)))
     if not nickname:
-        raise RuntimeError(IDENTITY_UNREADABLE_MESSAGE)
+        raise LoginIdentityPending(IDENTITY_UNREADABLE_MESSAGE)
     return unique_id, nickname, unique_id_text
 
 
