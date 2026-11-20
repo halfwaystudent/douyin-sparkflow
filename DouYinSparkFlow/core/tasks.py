@@ -42,6 +42,7 @@ from core.identity import same_login_snapshot
 from core.protocol_dispatch import run_protocol_tasks
 from core.profile_cookies import prepare_profile_cookies, publish_profile_cookies
 from core import friend_identity, friend_chat_guard, notifications, streak_state, im_ui, saas_group_guard
+from core import saas_editor
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -705,8 +706,8 @@ def _normalize_message_text(value):
     ).strip()
 
 
-async def _type_browser_message_checked(chat_input, message):
-    """Preserve drafts and require a DOM readback; never dispatch Enter here."""
+async def _type_browser_message_checked(chat_input, message, *, saas_editor_input=False):
+    """Preserve drafts and require an exact readback; never dispatch Enter here."""
     async def read_exact():
         value = await chat_input.evaluate(
             '(node) => node.innerText ?? node.textContent ?? ""'
@@ -715,16 +716,27 @@ async def _type_browser_message_checked(chat_input, message):
             raise RuntimeError("input_read_unavailable")
         return _normalize_message_text(value)
 
-    before = await _run_browser_stage("input_before_type", read_exact())
-    if before:
+    if saas_editor_input:
+        before = await _run_browser_stage("input_before_type", saas_editor.read_state(chat_input))
+        if before == "unknown":
+            raise RuntimeError("input_read_unavailable")
+        nonempty = before != "empty"
+    else:
+        nonempty = bool(await _run_browser_stage("input_before_type", read_exact()))
+    if nonempty:
         raise RuntimeError("input_nonempty_before_type")
     lines = message.split("\n")
     for index, line in enumerate(lines):
         await _run_browser_stage("type_message", chat_input.type(line, delay=50))
         if index < len(lines) - 1:
             await _run_browser_stage("type_newline", chat_input.press("Shift+Enter"))
-    actual = await _run_browser_stage("input_after_type", read_exact())
-    if actual != _normalize_message_text(message):
+    if saas_editor_input:
+        actual = await _run_browser_stage("input_after_type", saas_editor.read_state(chat_input, message))
+        matches = actual == "expected"
+    else:
+        actual = await _run_browser_stage("input_after_type", read_exact())
+        matches = actual == _normalize_message_text(message)
+    if not matches:
         raise RuntimeError("input_mismatch_after_type")
     logger.info("Browser input checked emptyBefore=True exactAfter=True")
 
@@ -1151,7 +1163,9 @@ async def _saas_own_messages_today(page):
         const at=message.createdAt.getTime();if(!(at>=start&&at<end))continue;
         const text=texts[0].innerText.trim();if(!text)continue;
         const r=node.getBoundingClientRect();
-        result.push({text,centerX:r.left+r.width/2,centerY:r.top+r.height/2,top:r.top,bottom:r.bottom,right:r.right,className:row.className.slice(0,240)});
+        const id=message.clientId;
+        const clientId=typeof id==='string' && id.length<=128 ? id : null;
+        result.push({text,clientId,createdMs:at,centerX:r.left+r.width/2,centerY:r.top+r.height/2,top:r.top,bottom:r.bottom,right:r.right,className:row.className.slice(0,240)});
       }
       return result;
     }""", {"start":start.timestamp()*1000,"end":(start+timedelta(days=1)).timestamp()*1000})
@@ -1311,8 +1325,48 @@ async def count_visible_message_matches(page, message, chat_input=None):
     return visible_count
 
 
+_MESSAGE_CONFIRM_BUDGET_SECONDS = 8
+_MESSAGE_CONFIRM_POLL_SECONDS = 1
+
+
+async def _confirm_saas_message(page, chat_input, message, before_snapshot, before_indicator, since_ms):
+    """Require independent evidence for the editor and the new own bubble."""
+    expected = _normalize_message_text(message)
+    previous_id = (before_snapshot or {}).get('clientId')
+    previous_at = (before_snapshot or {}).get('createdMs')
+    if before_indicator is None:
+        before_indicator = await _detect_send_failure_indicator(page)
+    deadline = asyncio.get_running_loop().time() + _MESSAGE_CONFIRM_BUDGET_SECONDS
+    while True:
+        await asyncio.sleep(_MESSAGE_CONFIRM_POLL_SECONDS)
+        editor_state = await _run_browser_stage('read_chat_input', saas_editor.read_state(chat_input))
+        failure = await _detect_send_failure_indicator(page)
+        if failure and failure != before_indicator:
+            return False, 'send failure indicator detected: SaaS page'
+        snapshot = await snapshot_last_own_message(page, chat_input=chat_input)
+        bubble_seen = False
+        if snapshot and expected and _normalize_message_text(snapshot.get('text')) == expected:
+            observed_at = snapshot.get('createdMs')
+            observed_id = snapshot.get('clientId')
+            bubble_seen = bool(
+                observed_id and observed_id != previous_id
+                and isinstance(observed_at, (int, float)) and observed_at >= since_ms
+                and (previous_at is None or observed_at >= previous_at)
+                and (not before_snapshot or previous_id)
+            )
+        if editor_state == 'empty' and bubble_seen:
+            return True, 'last own message matches sent text; chat input cleared'
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.info('SaaS send UI evidence editor=%s newOwnBubble=%s', editor_state, bubble_seen)
+            if editor_state != 'empty':
+                return False, 'SaaS chat input not confirmed clear'
+            return False, 'chat input cleared but no new own message bubble was confirmed'
+
+
 @_bounded_browser_stage("confirm_message", cancel_grace_seconds=.5)
-async def confirm_message_sent(page, chat_input, message, before_snapshot=None, before_indicator=None):
+async def confirm_message_sent(page, chat_input, message, before_snapshot=None, before_indicator=None, *, saas_since_ms=None):
+    if saas_since_ms is not None:
+        return await _confirm_saas_message(page, chat_input, message, before_snapshot, before_indicator, saas_since_ms)
     expected_message = _normalize_message_text(message)
     before_signature = None
     if before_snapshot:
@@ -5180,9 +5234,11 @@ async def _do_user_task_locked(
                 last_own_message_before = None
                 send_receipt = {}
                 group_guard_required = False
+                saas_editor_input = False
                 try:
                     await _run_browser_stage("debug_selected", save_debug_artifacts(page, account_name, target_name, "selected-friend"))
                     chat_input, selector_used = await _run_browser_stage("locate_chat_input", locate_chat_input(page))
+                    saas_editor_input = selector_used == _SAAS_CHAT_INPUT_SELECTOR
                     logger.info("Using chat input selector %s for %s/%s", selector_used, account_name, target_name)
                     if parse_chat_target(target_name)[0] != "group":
                         await _require_friend_chat(page, user, target_name, wait=True)
@@ -5224,7 +5280,7 @@ async def _do_user_task_locked(
                             target_name,
                         )
                         continue
-                    await _type_browser_message_checked(chat_input, message)
+                    await _type_browser_message_checked(chat_input, message, saas_editor_input=saas_editor_input)
 
                     await _run_browser_stage("debug_typed", save_debug_artifacts(page, account_name, target_name, "typed-message"))
 
@@ -5315,6 +5371,12 @@ async def _do_user_task_locked(
                             gate_result.get("waited_ms"),
                             gate_result.get("reports"),
                         )
+                    confirmation_context = {}
+                    if saas_editor_input:
+                        state = await _run_browser_stage('input_before_dispatch', saas_editor.read_state(chat_input, message))
+                        if state != 'expected':
+                            raise RuntimeError('input_mismatch_before_dispatch')
+                        confirmation_context['saas_since_ms'] = time.time_ns() // 1_000_000
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
                     if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input)):
                         cookie_export_safe = False
@@ -5339,6 +5401,7 @@ async def _do_user_task_locked(
                         message,
                         before_snapshot=last_own_message_before,
                         before_indicator=pre_send_indicator,
+                        **confirmation_context,
                     ))
                     im_summary = await _run_browser_stage("read_observer", im_observer_summary())
                     logger.info(
@@ -5410,7 +5473,10 @@ async def _do_user_task_locked(
                 except Exception as exc:
                     sent_ok = False
                     detail = ""
-                    if message:
+                    # The legacy recovery heuristic does not have a pre-Enter
+                    # time boundary or the SaaS model evidence. Keep its absence
+                    # from promoting an unrelated bubble or bypassing the receipt.
+                    if message and not saas_editor_input:
                         sent_ok, detail = await _run_browser_stage("recover_evidence", detect_message_already_sent(
                             page,
                             chat_input,

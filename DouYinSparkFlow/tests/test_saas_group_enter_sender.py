@@ -41,10 +41,24 @@ class GroupEnterSenderTests(unittest.TestCase):
     def test_saas_editor_pins_guard_even_if_shell_disappears_before_arm(self):
         with group_flow(arm_ok=False) as (values,arm,consume,disarm,recovery):
             user,page,context,browser,chat,release,run=values
-            with patch.object(tasks.im_ui,'is_saas_ui',AsyncMock(return_value=False)),patch.object(tasks,'locate_chat_input',AsyncMock(return_value=(chat,'#sub-app [data-e2e="msg-input"] [contenteditable="true"]:visible'))):
+            chat.evaluate.side_effect = ['empty', 'expected']
+            with patch.object(tasks.im_ui,'is_saas_ui',AsyncMock(return_value=False)),patch.object(tasks,'locate_chat_input',AsyncMock(return_value=(chat,tasks._SAAS_CHAT_INPUT_SELECTOR))):
                 asyncio.run(run())
             chat.press.assert_not_awaited()
             arm.assert_awaited_once_with(page,chat,BOUND)
+
+    def test_changed_saas_editor_stops_without_recovering_a_send(self):
+        with group_flow() as (values,arm,consume,disarm,recovery):
+            user,page,context,browser,chat,release,run=values
+            chat.evaluate.side_effect = ['empty', 'expected', 'occupied']
+            with patch.object(tasks, 'locate_chat_input', AsyncMock(return_value=(chat, tasks._SAAS_CHAT_INPUT_SELECTOR))):
+                asyncio.run(run())
+            chat.press.assert_not_awaited()
+            arm.assert_awaited_once_with(page,chat,BOUND)
+            consume.assert_not_awaited()
+            recovery.assert_not_awaited()
+            self.assertTrue(streak_state.is_sent_unverified(user,TARGET,NOW))
+            disarm.assert_awaited_once_with(page)
 
     def test_group_arm_after_barrier_before_gate_and_consume_before_confirm(self):
         with group_flow() as (values,arm,consume,disarm,recovery):
