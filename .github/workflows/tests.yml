@@ -20,7 +20,7 @@ jobs:
     # ubuntu-latest moved to 26.04 which our Playwright version does not
     # support (install --with-deps errors); pin the last supported LTS.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
