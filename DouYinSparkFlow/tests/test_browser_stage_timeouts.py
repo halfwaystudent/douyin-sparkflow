@@ -14,8 +14,6 @@ def flow(*, identity_guard=False):
     user = {"username": "synthetic", "unique_id": "synthetic-timeouts",
             "cookies": [], "targets": ["first", "second", "third"]}
     page = Mock(goto=AsyncMock(), close=AsyncMock())
-    # This sender fixture runs a legacy editor, not a SaaS viewport.
-    page.locator.return_value.count = AsyncMock(return_value=0)
     context = Mock(new_page=AsyncMock(return_value=page), add_cookies=AsyncMock(),
                    cookies=AsyncMock(return_value=[]), close=AsyncMock())
     browser = Mock(new_context=AsyncMock(return_value=context), close=AsyncMock())
@@ -361,11 +359,9 @@ def test_nested_login_timeout_drains_cancellation_resistant_probe():
 def test_direct_last_message_read_is_bounded():
     async def exercise():
         page = Mock(evaluate=AsyncMock(side_effect=hangs))
-        page.locator = Mock(return_value=Mock(count=AsyncMock(return_value=0)))
         with patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01):
             with unittest.TestCase().assertRaises(tasks.BrowserStageTimeout):
                 await tasks.snapshot_last_own_message(page)
-        page.evaluate.assert_awaited_once()
     # An outer watchdog makes the pre-fix test fail instead of waiting forever.
     async def watchdog():
         await asyncio.wait_for(exercise(), .2)

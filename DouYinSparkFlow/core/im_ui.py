@@ -61,6 +61,10 @@ SAAS_FILTER_TAG_LABELS = {
 SAAS_FILTER_KINDS = frozenset({"friend", "group"})
 
 
+class SaasFilterError(RuntimeError):
+    """A SaaS list filter could not be activated and verified."""
+
+
 async def deny_refresh_socket(socket):
     """A read-only list scan must not reconnect queued outbound socket writes."""
     await socket.close()
@@ -76,7 +80,13 @@ async def is_saas_ui(page) -> bool:
     viewport = page.locator(SAAS_VIEWPORT_MARKER)
     if await viewport.count() == 0:
         return False
-    return await viewport.first.is_visible()
+    # A retained hidden shell can precede the current mounted shell during a
+    # micro-frontend transition. Inspect every match, rather than treating the
+    # first hidden node as proof that the active SaaS page is absent.
+    for index in range(await viewport.count()):
+        if await viewport.nth(index).is_visible():
+            return True
+    return False
 
 
 async def wait_for_saas_ui(page, *, timeout_ms=30000, legacy_probe=None, poll_seconds=0.5):
@@ -127,7 +137,7 @@ async def saas_filter_is_active(page, kind) -> bool:
         raise ValueError(f"unknown saas filter kind: {kind!r}")
     if not await is_saas_ui(page):
         return False
-    bar = page.locator(SAAS_FILTER_BAR_SELECTOR)
+    bar = page.locator(SAAS_FILTER_BAR_SELECTOR).filter(visible=True)
     if await bar.count() == 0:
         return False
     group_label, tag_label = await _filter_tag_for_kind(page, kind)
@@ -174,11 +184,11 @@ async def activate_saas_filter(page, kind, *, timeout_ms=30000) -> bool:
         return False
     group_label, tag_label = await _filter_tag_for_kind(page, kind)
 
-    bar = page.locator(SAAS_FILTER_BAR_SELECTOR)
+    bar = page.locator(SAAS_FILTER_BAR_SELECTOR).filter(visible=True)
     try:
         await bar.first.wait_for(state="visible", timeout=timeout_ms)
     except Exception as exc:
-        raise RuntimeError("新版 IM 筛选栏未出现，无法确认列表筛选状态") from exc
+        raise SaasFilterError("新版 IM 筛选栏未出现，无法确认列表筛选状态") from exc
 
     groups = bar.locator(".conversationFilterTagBargroup")
     group_count = await groups.count()
@@ -204,7 +214,7 @@ async def activate_saas_filter(page, kind, *, timeout_ms=30000) -> bool:
         if target is not None:
             break
     if target is None:
-        raise RuntimeError(
+        raise SaasFilterError(
             f"新版 IM 筛选标签未找到: group={group_label!r} tag={tag_label!r}"
         )
 
@@ -214,7 +224,7 @@ async def activate_saas_filter(page, kind, *, timeout_ms=30000) -> bool:
             return True
         await target.click(timeout=timeout_ms)
     except Exception as exc:
-        raise RuntimeError(f"新版 IM 筛选标签点击失败: {tag_label!r}") from exc
+        raise SaasFilterError(f"新版 IM 筛选标签点击失败: {tag_label!r}") from exc
 
     # Verify the tag actually became active; a click that did not change the
     # filter state must not be reported as success. Poll briefly since the
@@ -224,7 +234,7 @@ async def activate_saas_filter(page, kind, *, timeout_ms=30000) -> bool:
         if await saas_filter_is_active(page, kind):
             return True
         await asyncio.sleep(0.1)
-    raise RuntimeError(
+    raise SaasFilterError(
         f"新版 IM 筛选标签点击后未生效: group={group_label!r} tag={tag_label!r}"
     )
 

@@ -377,8 +377,6 @@ class BoundGroupRelocationIsolationTests(unittest.TestCase):
             patch.object(tasks, "_locate_bound_group_row", new=AsyncMock(side_effect=tasks.FriendListUnavailableError("group_not_found for offline: gone"))),
         ):
             page = AsyncMock()
-            from unittest.mock import Mock
-            page.locator = Mock(return_value=Mock(count=AsyncMock(return_value=0)))
             page.evaluate = AsyncMock(return_value=True)
             async def run():
                 return [t async for t in tasks.scroll_and_select_group_targets(

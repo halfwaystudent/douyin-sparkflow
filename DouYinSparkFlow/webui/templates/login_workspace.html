@@ -124,11 +124,12 @@
       </summary>
       <div class="fold-body">
         <p class="muted compact">
-          支持扩展导出的 JSON 数组、<code>name=value; …</code> 请求头原串或单个 Cookie 值。保存前会在真实浏览器里验证，通过后才写入账号。
+          在已登录的抖音页面打开 Cookie-Editor，选择 JSON 或 Header 导出，再粘贴到下方。这里也支持单个 <code>name=value</code>，不接收 Netscape 文本。验证通过后才保存账号。
         </p>
         <label class="field">
           <span>显示名（可选）</span>
-          <input type="text" data-cookie-display-name placeholder="留空则使用抖音昵称">
+          <input type="text" data-cookie-display-name placeholder="留空时优先使用读到的抖音昵称">
+          <small>如果只核实了账号身份、没读到昵称，已有账号保留原显示名；新账号可稍后在账号页改名。</small>
         </label>
         <label class="field">
           <span>Cookie 内容</span>

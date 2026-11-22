@@ -17,7 +17,7 @@
   method="post"
   action="/ops/run-failed"
   data-confirm-title="补发异常目标"
-  data-confirm="将检查可重试的异常目标；显示数量包含待核验和受阻对象，不等于实际发送数。结果不明的目标不会自动重发。确认继续吗？"
+  data-confirm="将重试可重发的异常目标；结果显示不明的不会自动重发。"
   data-confirm-accept="开始补发"
   data-confirm-tone="primary"
 >
@@ -35,7 +35,7 @@
   method="post"
   action="/ops/run-unsent"
   data-confirm-title="补发今日待发送目标"
-  data-confirm="将立即补发 {{ top_summary.today_pending_targets + top_summary.today_unprocessed_targets }} 个尚未强确认且仍可重试的目标。确认继续吗？"
+  data-confirm="将立即补发尚未强确认且仍可重试的 {{ top_summary.today_pending_targets + top_summary.today_unprocessed_targets }} 个目标。"
   data-confirm-accept="开始补发"
   data-confirm-tone="primary"
 >
@@ -56,59 +56,42 @@
 {% set summary = send_console.summary %}
 
 <div data-overview-root>
-  <div
-    class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
-    data-task-banner
-  >
-    <strong>
-      <i data-lucide="{% if ops.task_lock.running %}loader-circle{% elif ops.task_lock.stale %}info{% else %}circle-check{% endif %}"></i>
-      <span data-task-text>
-        {% if ops.task_lock.running %}
-        发送任务运行中，已运行约 {{ ops.task_lock.ageSeconds }} 秒
-        {% elif ops.task_lock.stale %}
-        检测到过期任务锁，下次启动任务时会自动清理
-        {% else %}
-        当前没有发送任务运行
-        {% endif %}
-      </span>
-    </strong>
-  </div>
-
-  <div class="status-banner refresh-notice" data-refresh-notice>
-    <strong><i data-lucide="circle-check"></i><span>任务已结束，刷新后可查看最新目标级结果。</span></strong>
-    <button class="button button-quiet button-sm" type="button" data-refresh-page>
-      <i data-lucide="refresh-cw"></i><span>刷新详情</span>
+  <div class="status-row">
+    <div
+      class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
+      data-task-banner
+    >
+      <strong>
+        <i data-lucide="{% if ops.task_lock.running %}loader-circle{% elif ops.task_lock.stale %}info{% else %}circle-check{% endif %}"></i>
+        <span data-task-text>
+          {% if ops.task_lock.running %}
+          发送任务运行中，已运行约 {{ ops.task_lock.ageSeconds }} 秒
+          {% elif ops.task_lock.stale %}
+          检测到过期任务锁，下次启动任务时会自动清理
+          {% else %}
+          当前没有发送任务运行
+          {% endif %}
+        </span>
+      </strong>
+    </div>
+    <button class="button button-quiet button-sm refresh-notice" type="button" data-refresh-notice data-refresh-page>
+      <i data-lucide="refresh-cw"></i><span>已结束，刷新</span>
     </button>
-  </div>
-
-  {% set summary_warning = summary.today_attention_targets or summary.today_page_echo_targets or summary.today_receipt_only_targets %}
-  <div
-    class="callout {% if not summary_warning %}good{% endif %}"
-    data-today-summary
-    data-summary-state="{{ 'attention' if summary_warning else 'good' }}"
-  >
-    <i data-today-summary-icon data-lucide="{% if summary_warning %}triangle-alert{% else %}circle-check{% endif %}"></i>
-    <p data-today-summary-text>
-      今日结论：强确认 {{ summary.today_confirmed_targets }} · 弱证据（仅页面回显 {{ summary.today_page_echo_targets }} · 仅回执未确认 {{ summary.today_receipt_only_targets }}） ·
-      待核验 {{ summary.today_unconfirmed_targets }} · 失败 {{ summary.today_failed_targets }} ·
-      受账号阻断 {{ summary.today_account_blocked_targets }} · 待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
-      （共 {{ summary.total_targets }} 个目标，{{ summary.enabled_accounts }} 个启用账号）
-    </p>
   </div>
 
   <section class="metric-grid" aria-label="发送状态汇总">
     <article class="metric-card info">
       <div class="metric-label">总目标</div>
       <div class="metric-value" data-overview-value="total">{{ summary.total_targets }}</div>
-      <div class="metric-help">{{ summary.enabled_accounts }} 个启用账号</div>
+      <div class="metric-help">{{ summary.enabled_accounts }} 个账号</div>
     </article>
     <article class="metric-card success">
-      <div class="metric-label">已发送（今日，含弱证据）</div>
+      <div class="metric-label">已确认发送</div>
       <div class="metric-value" data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets + summary.today_receipt_only_targets }}</div>
-      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 弱证据：仅页面回显 <b data-overview-value="pageEcho">{{ summary.today_page_echo_targets }}</b> · 仅回执未确认 <b data-overview-value="receiptOnly">{{ summary.today_receipt_only_targets }}</b></div>
+      <div class="metric-help">强确认 <b data-overview-value="confirmed">{{ summary.today_confirmed_targets }}</b> · 弱证据 <b data-overview-value="weakSent">{{ summary.today_page_echo_targets + summary.today_receipt_only_targets }}</b></div>
     </article>
     <article class="metric-card danger">
-      <div class="metric-label">需要处理</div>
+      <div class="metric-label">需处理</div>
       <div class="metric-value" data-overview-value="attention">{{ summary.today_attention_targets }}</div>
       <div class="metric-help">待核验、失败和账号阻断</div>
     </article>
@@ -117,9 +100,13 @@
       <div class="metric-value" data-overview-value="pending">
         {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
       </div>
-      <div class="metric-help">等待调度或尚未处理</div>
+      <div class="metric-help">等待调度</div>
     </article>
   </section>
+  <details class="explainer">
+    <summary>「强确认 / 弱证据 / 待核验」是什么意思？</summary>
+    <p><b>强确认</b>＝服务端回执且页面有回显，最可靠；<b>弱证据</b>＝只有回显或只有回执，大概率已发出但没拿到服务端确认；<b>待核验</b>＝发送被中断或结果未知，建议重发确认。</p>
+  </details>
 
   <section>
     <div class="section-head">

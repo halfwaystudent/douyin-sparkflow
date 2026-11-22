@@ -114,6 +114,9 @@
             enabled.textContent = data.account.enabled ? "已启用" : "已停用";
             enabled.classList.toggle("success", Boolean(data.account.enabled));
             enabled.classList.toggle("warning", !data.account.enabled);
+            // The enabled marker only shows when the account is paused; enabled
+            // accounts stay pill-free to keep the summary row at two badges.
+            enabled.hidden = Boolean(data.account.enabled);
           }
           const next = form.querySelector("[data-editor-next]");
           if (next) next.hidden = !data.account.target_count;

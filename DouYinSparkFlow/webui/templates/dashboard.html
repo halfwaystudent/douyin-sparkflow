@@ -68,28 +68,26 @@
 {% block content %}
 {% if not accounts %}<p class="callout"><span>第一次使用？跟着引导完成账号和发送设置。</span><a class="button button-primary" href="/setup?restart=1">开始设置</a></p>{% endif %}
 <div data-overview-root>
-  <div
-    class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
-    data-task-banner
-  >
-    <strong>
-      <i data-lucide="{% if ops.task_lock.running %}loader-circle{% else %}info{% endif %}"></i>
-      <span data-task-text>
-        {% if ops.task_lock.running %}
-        发送任务运行中，已运行约 {{ ops.task_lock.ageSeconds }} 秒
-        {% elif ops.task_lock.stale %}
-        检测到过期任务锁，下次启动任务时会自动清理
-        {% else %}
-        当前没有发送任务运行
-        {% endif %}
-      </span>
-    </strong>
-  </div>
-
-  <div class="status-banner refresh-notice" data-refresh-notice>
-    <strong><i data-lucide="circle-check"></i><span>发送任务已结束，刷新可以看到最新的账号进度。</span></strong>
-    <button class="button button-quiet button-sm" type="button" data-refresh-page>
-      <i data-lucide="refresh-cw"></i><span>刷新</span>
+  <div class="status-row">
+    <div
+      class="status-banner {% if ops.task_lock.running %}warning{% elif ops.task_lock.stale %}info{% else %}success{% endif %}"
+      data-task-banner
+    >
+      <strong>
+        <i data-lucide="{% if ops.task_lock.running %}loader-circle{% else %}info{% endif %}"></i>
+        <span data-task-text>
+          {% if ops.task_lock.running %}
+          发送任务运行中，已运行约 {{ ops.task_lock.ageSeconds }} 秒
+          {% elif ops.task_lock.stale %}
+          检测到过期任务锁，下次启动任务时会自动清理
+          {% else %}
+          当前没有发送任务运行
+          {% endif %}
+        </span>
+      </strong>
+    </div>
+    <button class="button button-quiet button-sm refresh-notice" type="button" data-refresh-notice data-refresh-page>
+      <i data-lucide="refresh-cw"></i><span>已结束，刷新</span>
     </button>
   </div>
 

@@ -139,6 +139,12 @@ def account_timeout_seconds():
     return _env_int("SPARKFLOW_PATROL_ACCOUNT_TIMEOUT_SECONDS", 420, 60)
 
 
+# Browser start-up plus a useful readiness wait. Starting another attempt with
+# less budget than this only guarantees a timeout with no verdict, so the
+# route/retry loop stops while the last real error is still reportable.
+MIN_RETRY_BUDGET_SECONDS = 90
+
+
 def _short(text):
     value = " ".join(str(text or "").split())
     return value[:REASON_LIMIT]
@@ -495,26 +501,19 @@ def _group_targets(user):
 async def _collect_patrol_groups(page, user):
     """Read the group list on the already-open chat page: (rows, error).
 
-    Only switches the list tab and scrolls it, never opens a conversation, so
-    nothing is marked read or sent. A failure only affects the group rows.
+    Only switches the list filter/tab and scrolls it, never opens a
+    conversation, so nothing is marked read or sent. A failure only affects the
+    group rows.
     """
     if not _group_targets(user):
         return None, ""
-    from core.groups import _activate_group_tab, collect_group_rows
+    from core.groups import collect_groups_on_chat_page
 
-    previous = ""
     try:
-        previous = await _activate_group_tab(page)
-        return await collect_group_rows(page), ""
+        return await collect_groups_on_chat_page(page), ""
     except Exception as exc:  # noqa: BLE001 - group check must not fail the patrol
         logger.warning("Patrol group list read failed for %s: %s", _account_name(user), _short(str(exc)))
         return None, _short(str(exc)) or type(exc).__name__
-    finally:
-        if previous:
-            try:
-                await page.get_by_role("tab", name=previous, exact=True).click()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _group_target_rows(user, groups, group_error=""):
@@ -557,28 +556,60 @@ def _group_target_rows(user, groups, group_error=""):
 
 
 async def _inspect_account(user, profile_config):
-    """Try each egress route; a proven login failure stops immediately."""
+    """Try each egress route; a proven login failure stops immediately.
+
+    A "structure changed" verdict is usually a page that loaded but never
+    hydrated, not a real layout change, so the same route gets one retry
+    before the next route is tried.
+    """
     last_error = None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + account_timeout_seconds()
     for network_mode in douyin_network_modes():
-        try:
-            return await _inspect_once(user, network_mode, profile_config)
-        except PatrolLoginFailure:
-            raise
-        except Exception as exc:  # noqa: BLE001 - try the next route
-            category = getattr(exc, "category", None) or classify_refresh_error(exc)
-            if category in {CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
+        attempts = 0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining < MIN_RETRY_BUDGET_SECONDS:
+                # The account-level wait_for() would cut the next attempt off
+                # mid-flight, turning a diagnosable failure into "timeout".
+                logger.warning(
+                    "Patrol for %s stops trying after %.0fs left on the account budget",
+                    _account_name(user),
+                    max(remaining, 0),
+                )
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("巡查预算不足，未能开始页面读取")
+            attempts += 1
+            try:
+                return await _inspect_once(user, network_mode, profile_config)
+            except PatrolLoginFailure:
                 raise
-            if category == CATEGORY_LOGIN_REQUIRED and isinstance(exc, FriendRefreshError):
-                raise PatrolLoginFailure(CATEGORY_LOGIN_REQUIRED, _short(str(exc))) from exc
-            last_error = exc
-            logger.warning(
-                "Patrol route=%s failed for %s: %s",
-                network_mode,
-                _account_name(user),
-                _short(str(exc)),
-            )
-            if category == CATEGORY_STRUCTURE_CHANGED:
-                # Another route cannot fix a page that loaded but did not render.
+            except Exception as exc:  # noqa: BLE001 - try the next route
+                category = getattr(exc, "category", None) or classify_refresh_error(exc)
+                if category in {CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
+                    raise
+                if category == CATEGORY_LOGIN_REQUIRED and isinstance(exc, FriendRefreshError):
+                    raise PatrolLoginFailure(CATEGORY_LOGIN_REQUIRED, _short(str(exc))) from exc
+                last_error = exc
+                logger.warning(
+                    "Patrol route=%s attempt=%s failed for %s: %s",
+                    network_mode,
+                    attempts,
+                    _account_name(user),
+                    _short(str(exc)),
+                )
+                if category == CATEGORY_STRUCTURE_CHANGED:
+                    if attempts == 1:
+                        logger.info(
+                            "Patrol retrying %s once on route=%s after a slow render",
+                            _account_name(user),
+                            network_mode,
+                        )
+                        continue
+                    # Only a second structural miss is treated as a real
+                    # structure change; other categories move to the next route.
+                    break
                 break
     raise last_error or RuntimeError("no network route available")
 
@@ -702,6 +733,14 @@ def _persist_patrol(user, record, login_failure=None):
             }
         elif login.get("ok") is True:
             previous = dict(matched.pop(PATROL_LOGIN_FAILURE_KEY, None) or {})
+            # A proven-usable session resolves every flag an earlier check
+            # left behind. The most damaging one is pending_login_verification:
+            # it was set by a single failed background verify, and without a
+            # clear path the preflight kept reporting the account as
+            # login_verification_pending forever even though patrol had just
+            # proven the login is fine.
+            for flag in ("pending_login_verification", "login_required", "needs_relogin"):
+                matched.pop(flag, None)
             health = dict(matched.get("account_health") or {})
             # Only replace a verdict the patrol owns (or none at all): a send
             # failure or a login check recorded elsewhere is not the patrol's to

@@ -1007,9 +1007,6 @@ class RuntimeHardeningTests(unittest.TestCase):
             async def add_cookies(self, cookies):
                 del cookies
 
-            route = AsyncMock()
-            route_web_socket = AsyncMock()
-
             async def new_page(self):
                 return self.page
 
