@@ -4123,13 +4123,13 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
                 requested=category,
                 detail=reason,
             )
-            return
+            return False
         logger.warning(
             "Could not find account to persist browser send failure for user=%s target=%s",
             user.get("username", "unknown"),
             target_name,
         )
-        return
+        return False
 
     queue_entry, matched_account = saved
 
@@ -4149,7 +4149,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         or str(state.get("lastAttemptAt") or "")
         != state_now.isoformat(timespec="seconds")
     ):
-        return
+        return False
     user_queue = dict(user.get("failure_queue") or {})
     user_queue[target_name] = dict(queue_entry)
     user["failure_queue"] = user_queue
@@ -4161,13 +4161,14 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         category,
         reason,
     )
+    return True
 
 
 def _persist_browser_pre_enter_unknown(user, target_name, message, attempted_at):
-    """Durably block a group resend before dispatching Enter.
+    """Durably block an automatic resend before dispatching Enter.
 
     This records a *potential* unknown send, not a claimed delivery.  If the
-    process dies after this write but before Enter is dispatched, the group may
+    process dies after this write but before Enter is dispatched, the target may
     require manual verification even though it was not sent.  That conservative
     false positive is intentional: losing this durable barrier could resend a
     message whose Enter dispatch actually reached the browser or server.
@@ -4363,13 +4364,13 @@ def _persist_browser_send_success(
                     else streak_state.STATE_SENT_UNVERIFIED
                 ),
             )
-            return
+            return False
         logger.warning(
             "Could not find account to persist browser send history for user=%s target=%s",
             user.get("username", "unknown"),
             target_name,
         )
-        return
+        return False
 
     expected_iso = state_now.isoformat(timespec="seconds")
     if strong_receipt:
@@ -4398,7 +4399,7 @@ def _persist_browser_send_success(
             and str(state.get("sentAt") or "") == expected_iso
         )
     if not state_accepted:
-        return
+        return False
     user_history = dict(user.get("message_history") or {})
     user_history[target_name] = dict(strong_entry)
     user["message_history"] = user_history
@@ -4411,6 +4412,7 @@ def _persist_browser_send_success(
         target_name,
         sent_at,
     )
+    return True
 
 
 def _persist_browser_recovery_outcome(
@@ -4422,7 +4424,7 @@ def _persist_browser_recovery_outcome(
     detail="",
     server_receipt=None,
 ):
-    _persist_browser_send_success(
+    return _persist_browser_send_success(
         user,
         target_name,
         message,
@@ -4430,6 +4432,19 @@ def _persist_browser_recovery_outcome(
         server_receipt=server_receipt,
         detail=detail,
     )
+
+
+def _commit_browser_outcome(persist, user, target_name, *args, **kwargs):
+    # Storage errors are not send errors: do not enter the browser's recovery
+    # heuristics or advance to another target when the outcome wasn't saved.
+    try:
+        if persist(user, target_name, *args, **kwargs):
+            return True
+    except Exception:
+        logger.exception("Could not write final browser outcome")
+    logger.error("Stopping browser batch for %s: outcome not recorded for %s",
+                 user.get("username", "unknown"), target_name)
+    return False
 
 
 def _split_sender_modes(active_config, runnable_user_data):
@@ -5316,6 +5331,7 @@ async def _do_user_task_locked(
                 send_receipt = {}
                 group_guard_required = False
                 saas_editor_input = False
+                enter_started = False
                 try:
                     await _run_browser_stage("debug_selected", save_debug_artifacts(page, account_name, target_name, "selected-friend"))
                     chat_input, selector_used = await _run_browser_stage("locate_chat_input", locate_chat_input(page))
@@ -5459,6 +5475,7 @@ async def _do_user_task_locked(
                             raise RuntimeError('input_mismatch_before_dispatch')
                         confirmation_context['saas_since_ms'] = time.time_ns() // 1_000_000
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
+                    enter_started = True
                     if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input, target_name)):
                         cookie_export_safe = False
                         logger.info("Stopping old browser session: saved login changed at dispatch")
@@ -5521,7 +5538,8 @@ async def _do_user_task_locked(
                         raise RuntimeError(detail)
 
                     logger.info("Message send confirmed for %s/%s by server receipt: %s", account_name, target_name, detail)
-                    _persist_browser_send_success(
+                    if not _commit_browser_outcome(
+                        _persist_browser_send_success,
                         user,
                         target_name,
                         message,
@@ -5532,7 +5550,8 @@ async def _do_user_task_locked(
                         # the observer enabled only the former was required, so a
                         # receipt without a visible bubble used to count as success.
                         dom_bubble_seen=bool(sent_ok),
-                    )
+                    ):
+                        return
                     interval = _random_delay_seconds(
                         send_strategy,
                         "messageIntervalSecondsMin",
@@ -5554,10 +5573,11 @@ async def _do_user_task_locked(
                 except Exception as exc:
                     sent_ok = False
                     detail = ""
+                    explicit_refusal = isinstance(exc, BrowserSendRejected)
                     # The legacy recovery heuristic does not have a pre-Enter
                     # time boundary or the SaaS model evidence. Keep its absence
                     # from promoting an unrelated bubble or bypassing the receipt.
-                    if message and not saas_editor_input:
+                    if enter_started and not explicit_refusal and not saas_editor_input:
                         sent_ok, detail = await _run_browser_stage("recover_evidence", detect_message_already_sent(
                             page,
                             chat_input,
@@ -5577,24 +5597,16 @@ async def _do_user_task_locked(
                         verified_at = datetime.now(timezone.utc).isoformat(
                             timespec="seconds"
                         )
-                        if streak_state.receipt_is_strong(send_receipt):
-                            _persist_browser_recovery_outcome(
-                                user,
-                                target_name,
-                                message,
-                                verified_at,
-                                detail=detail,
-                                server_receipt=send_receipt,
-                            )
-                        else:
-                            _persist_browser_recovery_outcome(
-                                user,
-                                target_name,
-                                message,
-                                verified_at,
-                                detail=detail,
-                                server_receipt={},
-                            )
+                        if not _commit_browser_outcome(
+                            _persist_browser_recovery_outcome,
+                            user,
+                            target_name,
+                            message,
+                            verified_at,
+                            detail=detail,
+                            server_receipt=(send_receipt if streak_state.receipt_is_strong(send_receipt) else {}),
+                        ):
+                            return
                         continue
 
                     logger.exception("Send flow failed for %s/%s", account_name, target_name)
@@ -5625,7 +5637,12 @@ async def _do_user_task_locked(
                             affected_targets,
                         )
                         return
-                    _persist_browser_send_failure(
+                    if enter_started and not explicit_refusal:
+                        logger.warning("Stopping browser batch for %s: send outcome unknown for %s",
+                                       account_name, target_name)
+                        return
+                    if not _commit_browser_outcome(
+                        _persist_browser_send_failure,
                         user,
                         target_name,
                         message,
@@ -5633,8 +5650,9 @@ async def _do_user_task_locked(
                         reason,
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         server_receipt=send_receipt,
-                        override_sent_unverified=isinstance(exc, BrowserSendRejected),
-                    )
+                        override_sent_unverified=explicit_refusal,
+                    ):
+                        return
                     interval = _random_delay_seconds(
                         send_strategy,
                         "messageIntervalSecondsMin",
