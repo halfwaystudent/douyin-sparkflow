@@ -17,7 +17,7 @@ LABELS = {'running': '运行中', 'exited': '已停止', 'created': '已创建�
 def inspect_state(name):
     try:
         result = subprocess.run(['docker', 'container', 'inspect', '--format', '{{.State.Status}}', name],
-                                capture_output=True, text=True, check=False, timeout=3,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False, timeout=3,
                                 env={**os.environ, 'LANG': 'C', 'LC_ALL': 'C'})
         if result.returncode == 0:
             state = result.stdout.strip()
@@ -51,7 +51,10 @@ def export_snapshot(output, mappings):
         os.replace(temporary, output)
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     return snapshot
 
 

@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 IDENTITY_SOURCE = "creator_im_user_token"
 IDENTITY_VERSION = 1
 USER_TOKEN_URL = "https://creator.douyin.com/aweme/v1/creator/im/user_token/"
+CREATOR_PROFILE_URLS = (
+    "https://creator.douyin.com/aweme/v1/creator/pc/user/info/",
+    "https://creator.douyin.com/aweme/v1/creator/user/info/",
+)
 CREATOR_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -166,7 +171,7 @@ def _canonical_cookies(cookies) -> list:
     )
 
 
-def candidate_fingerprint(*, uid, username="", display_id="", display_name="", cookies=None) -> str:
+def candidate_fingerprint(*, uid, username="", display_id="", display_name="", cookies=None, profile_name=False) -> str:
     """Server-side digest of the full login candidate a confirmation is bound to.
 
     Covers the platform UID, the nickname/display parameters and every cookie
@@ -180,6 +185,7 @@ def candidate_fingerprint(*, uid, username="", display_id="", display_name="", c
             "display_id": str(display_id or ""),
             "display_name": str(display_name or ""),
             "cookies": _canonical_cookies(cookies),
+            **({"profile_name": True} if profile_name else {}),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -224,6 +230,36 @@ def parse_user_token_response(text) -> str:
     if not is_valid_uid(uid):
         raise IdentityUnavailable("身份接口没有返回合法的账号 UID")
     return uid
+
+
+def creator_identity_cookies(cookies, *, endpoint_url=USER_TOKEN_URL):
+    """Keep credentials actually scoped to an HTTPS creator identity endpoint."""
+    if endpoint_url != USER_TOKEN_URL and endpoint_url not in CREATOR_PROFILE_URLS:
+        raise ValueError("Unexpected creator identity endpoint")
+    endpoint = urllib.parse.urlsplit(endpoint_url)
+    matching = []
+    now = time.time()
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        domain = str(cookie.get("domain") or "").lower()
+        # Playwright's URL filter may include host-only parent cookies even
+        # though Chromium does not send them to subdomains.
+        if not (domain == endpoint.hostname or (domain.startswith(".") and (
+            domain[1:] == endpoint.hostname or endpoint.hostname.endswith(domain)
+        ))):
+            continue
+        path = str(cookie.get("path") or "/")
+        if endpoint.path != path and not endpoint.path.startswith(path if path.endswith("/") else path + "/"):
+            continue
+        try:
+            expires = float(cookie.get("expires", -1))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0 <= expires <= now:
+            continue
+        matching.append(cookie)
+    return sorted(matching, key=lambda cookie: -len(str(cookie.get("path") or "/")))
 
 
 def _cookie_header(cookies):
@@ -345,6 +381,66 @@ def fetch_trusted_identity(cookies, *, routes=None, opener=None, timeout=FETCH_T
             "checkedAt": _now_iso(),
         }
     raise IdentityUnavailable(f"暂时无法核实账号身份：{last_reason}")
+
+
+def _creator_profile_nickname(text, expected_uid):
+    """Read only the creator profile's own nickname, bound to the proven UID."""
+    try:
+        data = json.loads(text or "", parse_int=str, parse_float=lambda _: None)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict) or str(data.get("status_code")) != "0":
+        return ""
+    result = data.get("data", data)
+    if not isinstance(result, dict) or result.get("uid") != expected_uid:
+        return ""
+    profile = result.get("user_profile")
+    if not isinstance(profile, dict):
+        return ""
+    corroborating_uid = profile.get("uid")
+    if corroborating_uid is not None and corroborating_uid != expected_uid:
+        return ""
+    name = profile.get("nick_name")
+    if not isinstance(name, str):
+        return ""
+    name = name.strip()
+    if (not name or len(name) > 128 or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)
+            or name in {"创作者用户昵称", "抖音官网账号", "登录", expected_uid}):
+        return ""
+    return name
+
+
+def fetch_creator_nickname(cookies, expected_uid, *, routes=None, opener=None):
+    """Best-effort read-only lookup; never replace a name without same-UID evidence."""
+    if not is_valid_uid(expected_uid):
+        return ""
+    route_list = list(_default_routes() if routes is None else routes)
+    open_once = opener or _open_once
+    # At most two endpoints per route and a short shared budget.
+    deadline = time.monotonic() + 7
+    for _, proxy in route_list[:2]:
+        for url in CREATOR_PROFILE_URLS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            scoped = creator_identity_cookies(cookies, endpoint_url=url)
+            if not _cookie_header(scoped):
+                continue
+            request = urllib.request.Request(url, method="GET", headers={
+                "Accept": "application/json",
+                "User-Agent": (os.getenv("SPARKFLOW_PROTOCOL_USER_AGENT") or DEFAULT_USER_AGENT).strip(),
+                "Referer": CREATOR_CHAT_URL,
+                "Cookie": _cookie_header(scoped),
+            })
+            try:
+                status, body = open_once(request, proxy, min(3, remaining))
+            except (OSError, ValueError):
+                continue
+            if status == 200:
+                name = _creator_profile_nickname(body, expected_uid)
+                if name:
+                    return name
+    return ""
 
 
 def account_uid(account) -> str:

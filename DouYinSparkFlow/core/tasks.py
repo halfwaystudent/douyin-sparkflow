@@ -61,7 +61,11 @@ CREATOR_HOME_URL = "https://creator.douyin.com/"
 CREATOR_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 
 BROWSER_STAGE_TIMEOUT_SECONDS = 30
-BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS = 60
+BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS = 90
+# How long the sender waits for the IM SaaS micro-frontend to mount before it
+# rejects the page as unrecognized. Slow hydration regularly exceeds the old
+# 30s probe and was misreported as an account-level failure.
+SENDER_SAAS_DETECT_TIMEOUT_MS = 60000
 BROWSER_CLEANUP_TIMEOUT_SECONDS = 5
 # Keep strong references to fail-closed locks: FileLock.__del__ releases them.
 _BLOCKED_BROWSER_LOCKS = {}
@@ -469,6 +473,11 @@ LOGIN_REQUIRED_TEXTS = (
     "安全验证",
     "风险提示",
     "环境异常",
+    # The creator console renders this shell instead of the app when the stored
+    # session is no longer accepted: "页面暂时无法打开 … 请重新登录". It never
+    # mounts #sub-app, so without this marker the reader waited out its whole
+    # page timeout and reported a structure change instead of a dead login.
+    "页面暂时无法打开",
 )
 LOGIN_REQUIRED_SELECTORS = (
     ".login-mask",
@@ -1522,6 +1531,8 @@ def classify_browser_failure(stage, exc):
         return "group_not_found"
     if "group_identity_unavailable" in lowered:
         return "group_identity_unavailable"
+    if "friend_list_empty" in lowered:
+        return "friend_list_empty"
     if "friend_list_unavailable" in lowered:
         return "friend_list_unavailable"
     if "friend_list_incomplete" in lowered:
@@ -1555,6 +1566,14 @@ def classify_browser_failure(stage, exc):
 
 class FriendListUnavailableError(RuntimeError):
     pass
+
+
+class FriendListEmptyError(RuntimeError):
+    """The page proved the filtered list is empty (end/empty marker persisted).
+
+    A genuinely empty list is a complete read, not a page failure: callers end
+    the scan instead of retrying or pausing the whole account.
+    """
 
 
 class FriendListIncompleteError(RuntimeError):
@@ -1734,17 +1753,26 @@ async def _sender_chat_variant_is_saas(page):
         ))
         legacy_confirmed = bool(selector)
         return legacy_confirmed
-    saas = await im_ui.wait_for_saas_ui(page, timeout_ms=30000, legacy_probe=legacy_probe)
+    saas = await im_ui.wait_for_saas_ui(
+        page, timeout_ms=SENDER_SAAS_DETECT_TIMEOUT_MS, legacy_probe=legacy_probe)
     if not saas and not legacy_confirmed:
         raise FriendListUnavailableError('friend_list_unavailable: 未识别到已就绪的新旧私信页面')
     return saas
 
 
+async def _require_saas_filter(page, kind):
+    try:
+        activated = await im_ui.activate_saas_filter(page, kind)
+    except im_ui.SaasFilterError as exc:
+        raise FriendListUnavailableError(f"friend_list_unavailable: SaaS {kind} filter: {exc}") from exc
+    if not activated:
+        raise FriendListUnavailableError(f"friend_list_unavailable: SaaS {kind} filter page changed")
+
+
 async def _open_friends_tab(page, account_name, fallback_selector, target_selectors):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_friends_tab")
     if await _sender_chat_variant_is_saas(page):
-        if not await im_ui.activate_saas_filter(page, "friend"):
-            raise FriendListUnavailableError("friend_list_unavailable: SaaS 页面在筛选激活前发生变化")
+        await _require_saas_filter(page, "friend")
         return "saas_verified"
     # Group and friend rows use the same DOM shape.  A visible row therefore
     # proves neither that the friends tab is active nor that it is safe to
@@ -1835,8 +1863,7 @@ def _dedupe_group_target_aliases(targets):
 async def _open_groups_tab(page, account_name):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_groups_tab")
     if await _sender_chat_variant_is_saas(page):
-        if not await im_ui.activate_saas_filter(page, "group"):
-            raise FriendListUnavailableError("group_list_unavailable: SaaS 页面在筛选激活前发生变化")
+        await _require_saas_filter(page, "group")
         return
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     candidates = [
@@ -2181,10 +2208,10 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
         scrollable_selectors = im_ui.SAAS_SCROLL_SELECTORS
     try:
         active_selector, _ = await _wait_for_friend_list_ready(
-            page, account_name, target_selectors, (), (),
+            page, account_name, target_selectors, ('.LeftPanelEmptywrapper',), (),
             timeout_seconds=min(60, config["maxScanSeconds"]), empty_grace_seconds=0,
         )
-    except FriendListUnavailableError:
+    except (FriendListUnavailableError, FriendListEmptyError):
         # A group without a spark is still a valid empty/nonmatching result.
         return
     _, initial_scrollable = await _first_scrollable_friends_element(page, scrollable_selectors)
@@ -2369,6 +2396,7 @@ async def _wait_for_friend_list_ready(
     started_at = asyncio.get_running_loop().time()
     last_loading_seen_at = None
     last_dialog_dismissed_at = None
+    empty_marker_since = None
     while True:
         dismissed_count = await _dismiss_non_login_dialogs(page, account_name, "friend_list_ready")
         if dismissed_count:
@@ -2385,18 +2413,26 @@ async def _wait_for_friend_list_ready(
 
         no_more_selector = await _selector_visible(page, no_more_selectors)
         if no_more_selector:
-            elapsed = asyncio.get_running_loop().time() - started_at
-            if elapsed > empty_grace_seconds:
-                raise FriendListUnavailableError(
-                    f"friend_list_unavailable for {account_name}: no friend entries visible; "
-                    f"empty/end selector {no_more_selector} is visible after {empty_grace_seconds}s"
+            if empty_marker_since is None:
+                empty_marker_since = asyncio.get_running_loop().time()
+            # The end/empty marker must stay visible for the whole grace window
+            # before the list is accepted as empty; a marker that flickers and
+            # is then replaced by rows is hydration, not an empty list.
+            if asyncio.get_running_loop().time() - empty_marker_since > empty_grace_seconds:
+                raise FriendListEmptyError(
+                    f"friend_list_empty for {account_name}: no friend entries visible; "
+                    f"empty/end selector {no_more_selector} stayed visible for "
+                    f"{empty_grace_seconds}s"
                 )
+            elapsed = asyncio.get_running_loop().time() - started_at
             logger.debug(
                 "Account %s saw empty/end selector %s after %.1fs; waiting within grace window",
                 account_name,
                 no_more_selector,
                 elapsed,
             )
+        else:
+            empty_marker_since = None
 
         loading_selector = await _selector_visible(page, loading_selectors)
         if loading_selector:
@@ -2607,6 +2643,9 @@ async def scroll_and_select_user(
     no_more_selectors = (
         'xpath=//div[contains(@class, "no-more-tip-ftdJnu")]',
         'xpath=//*[@id="sub-app"]//*[contains(text(), "没有更多") or contains(text(), "暂无")]',
+        # SaaS empty panel (verified in the bundle: LeftPanelEmptywrapper),
+        # rendered when the filtered conversation list is genuinely empty.
+        '.LeftPanelEmptywrapper',
     )
     loading_selectors = (
         'xpath=//div[contains(@class, "semi-spin")]',
@@ -2617,11 +2656,12 @@ async def scroll_and_select_user(
     idle_scan_seconds = friend_scan_config["idleScanSeconds"]
     scroll_step_px = friend_scan_config["scrollStepPx"]
     scroll_delay_seconds = friend_scan_config["scrollDelaySeconds"]
-    ready_timeout_seconds = 60
-    empty_grace_seconds = 30
+    ready_timeout_seconds = 90
+    empty_grace_seconds = 45
 
     ready_errors = []
     active_target_selector = ""
+    friend_list_empty = False
     for ready_attempt in range(2):
         logger.debug("Account %s is opening the friends tab attempt=%s", account_name, ready_attempt + 1)
         await _open_friends_tab(page, account_name, friends_tab_selector, target_selectors)
@@ -2636,6 +2676,12 @@ async def scroll_and_select_user(
                 timeout_seconds=ready_timeout_seconds,
                 empty_grace_seconds=empty_grace_seconds,
             )
+            break
+        except FriendListEmptyError as exc:
+            # The page persisted an end/empty marker: the list is a complete
+            # read with no rows, so reloading the chat page cannot change it.
+            logger.info("Account %s friend list proved empty: %s", account_name, exc)
+            friend_list_empty = True
             break
         except FriendListUnavailableError as exc:
             ready_errors.append(str(exc))
@@ -2789,6 +2835,20 @@ async def scroll_and_select_user(
         await asyncio.sleep(min(scroll_delay_seconds, 1))
         return True
 
+    if friend_list_empty:
+        # The empty marker persisted through its grace window: the list is a
+        # complete read with no rows. Every remaining target is missing, but
+        # this is not a page failure and must not pause the account.
+        missing_delivery_targets.update(remaining_targets)
+        remaining_targets.clear()
+        await persist_index(True, reached_end=True)
+        logger.info(
+            "Account %s friend list is empty; skipping %s remaining delivery targets",
+            account_name,
+            len(missing_delivery_targets),
+        )
+        return
+
     await reset_friend_list_scroll()
 
     if uid_collector is not None:
@@ -2817,15 +2877,22 @@ async def scroll_and_select_user(
         await _dismiss_non_login_dialogs(page, account_name, "friend_list_scan")
         selector, target_locator = await _first_non_empty_locator(page, (active_target_selector,) + tuple(target_selectors))
         if not target_locator:
-            active_target_selector, _ = await _wait_for_friend_list_ready(
-                page,
-                account_name,
-                target_selectors,
-                no_more_selectors,
-                loading_selectors,
-                timeout_seconds=30,
-                empty_grace_seconds=15,
-            )
+            try:
+                active_target_selector, _ = await _wait_for_friend_list_ready(
+                    page,
+                    account_name,
+                    target_selectors,
+                    no_more_selectors,
+                    loading_selectors,
+                    timeout_seconds=30,
+                    empty_grace_seconds=15,
+                )
+            except FriendListEmptyError:
+                # Rows vanished and the empty marker persisted: the filtered
+                # list is now a complete empty read, so stop scanning.
+                logger.info("Account %s friend list became empty mid-scan", account_name)
+                friend_list_empty = True
+                break
             continue
         target_elements = await _run_friend_scan_stage(
             "friend_list_read_rows",
@@ -2924,6 +2991,9 @@ async def scroll_and_select_user(
             if remaining_targets:
                 await reset_friend_list_scroll()
             continue
+
+        if friend_list_empty:
+            break
 
         if not remaining_targets and not remaining_index_targets:
             logger.info("Account %s found all delivery and indexed target friends", account_name)
@@ -3050,16 +3120,27 @@ def _normalize_send_window(config):
     else:
         try:
             end_minutes = int(raw.get("endHour", 18)) * 60
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             end_minutes = -1
+    try:
+        start_hour = int(raw.get("startHour", 10))
+    except (TypeError, ValueError, OverflowError):
+        start_hour = -1
+    try:
+        interval = max(1, int(raw.get("scheduleIntervalMinutes", 10)))
+        interval_valid = True
+    except (TypeError, ValueError, OverflowError):
+        interval, interval_valid = 1, False
     normalized = {
         "enabled": bool(raw.get("enabled", False)),
-        "startHour": int(raw.get("startHour", 10)),
+        "startHour": start_hour,
         "endHour": end_minutes // 60 if end_minutes >= 0 else -1,
         "endMinute": end_minutes % 60 if end_minutes >= 0 else -1,
         "endTime": raw_end_time or f"{end_minutes // 60:02d}:{end_minutes % 60:02d}",
-        "scheduleIntervalMinutes": max(1, int(raw.get("scheduleIntervalMinutes", 10))),
+        "scheduleIntervalMinutes": interval,
     }
+    if not interval_valid:
+        normalized["enabled"] = False
     exact_time = str(raw.get("exactTime") or "")
     if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", exact_time):
         normalized["exactTime"] = exact_time
@@ -4412,10 +4493,10 @@ def _browser_login_generation_current(user):
         return False
 
 
-async def _dispatch_browser_enter_if_current(user, chat_input):
+async def _dispatch_browser_enter_if_current(user, chat_input, target_name=None):
     # Read inside the dispatch task, not before it is queued by the stage wrapper.
     from core import automatic_recovery
-    if (not automatic_recovery.dispatch_allowed(user)
+    if (not automatic_recovery.dispatch_allowed(user, target=target_name)
             or send_pause.should_pause_sending() or not personal_streak.authorized(user)
             or not personal_streak.within_send_window(user)
             or not _browser_login_generation_current(user)):
@@ -5378,7 +5459,7 @@ async def _do_user_task_locked(
                             raise RuntimeError('input_mismatch_before_dispatch')
                         confirmation_context['saas_since_ms'] = time.time_ns() // 1_000_000
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
-                    if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input)):
+                    if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input, target_name)):
                         cookie_export_safe = False
                         logger.info("Stopping old browser session: saved login changed at dispatch")
                         return

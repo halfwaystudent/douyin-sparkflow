@@ -95,7 +95,17 @@ def _end(window, now):
                        second=0, microsecond=0)
 
 
-def dispatch_allowed(user, now=None):
+def _ticket_targets(ticket):
+    if not isinstance(ticket, dict):
+        return []
+    targets = ticket.get('targets')
+    if isinstance(targets, list) and targets:
+        return [x for x in targets if isinstance(x, str) and x]
+    single = ticket.get('target')
+    return [single] if isinstance(single, str) and single else []
+
+
+def dispatch_allowed(user, now=None, target=None):
     """Called inside the queued Enter task as well as before browser launch."""
     t = _tasks()
     ticket = user.get(TICKET)
@@ -106,20 +116,28 @@ def dispatch_allowed(user, now=None):
         return False
     if not ticket:
         return True  # Existing explicitly authorized manual semantics remain separate.
-    if not isinstance(ticket, dict) or not ticket.get('reservation'):
+    if not isinstance(ticket, dict):
+        return False
+    ticket_targets = _ticket_targets(ticket)
+    target = (target if isinstance(target, str) and target
+              else (ticket_targets[0] if len(ticket_targets) == 1 else None))
+    reservations = ticket.get('reservations') if isinstance(ticket.get('reservations'), dict) else {}
+    reservation = (reservations.get(target) if target else None)
+    if reservation is None and len(ticket_targets) <= 1:
+        reservation = ticket.get('reservation')
+    if target is None or not isinstance(reservation, dict):
         return False
     fresh = streak_state.find_matching_account(t.get_userData(force_reload=True), user)
     if fresh is None or str(fresh.get('login_generation') or '') != str(user.get('login_generation') or ''):
         return False
-    target = ticket.get('target')
-    if user.get('targets') != [target] or not any(
+    if not any(streak_state.target_keys_match(user, target, x) for x in user.get('targets') or []) or not any(
             streak_state.target_keys_match(fresh, target, x) for x in fresh.get('targets') or []):
         return False
     if (not fresh.get('enabled', True)
             or not streak_state.preflight_account(fresh, now).get('healthy')
             or fresh.get('browser_cleanup_blocked') or Q.account_blocked(fresh, now)):
         return False
-    return Q.reservation_matches(fresh, target, now, ticket.get('runId'), ticket['reservation'])
+    return Q.reservation_matches(fresh, target, now, ticket.get('runId'), reservation)
 
 
 def claim(user, target, run_id):
@@ -127,8 +145,10 @@ def claim(user, target, run_id):
     t = _tasks()
     now = clock()
     ticket = user.get(TICKET) or {}
+    ticket_targets = _ticket_targets(ticket)
     scope_ok, _ = t._sender_scope_timezone(user)
-    if (not scope_ok or ticket.get('runId') != run_id or ticket.get('target') != target
+    if (not scope_ok or ticket.get('runId') != run_id
+            or (ticket_targets and target not in ticket_targets)
             or not Q.allowed_now(now, day=ticket.get('day'))
             or not t.personal_streak.authorized(user)):
         return False
@@ -164,7 +184,9 @@ def claim(user, target, run_id):
         return False
     user['target_states'] = deepcopy(fresh.get('target_states') or {})
     user[Q.KEY] = deepcopy(fresh.get(Q.KEY) or {})
-    user[TICKET] = dict(ticket, reservation=token)
+    reservations = dict(ticket.get('reservations') or {})
+    reservations[target] = token
+    user[TICKET] = dict(ticket, reservation=token, reservations=reservations)
     return True
 
 
@@ -294,15 +316,24 @@ async def run(config, *, reconcile_only=False, close=False):
                 t.logger.info('Recovery local reconciliation completed; browser launches=0 close=%s', close)
             elif choices:
                 candidate, group_config, scoped = min(choices, key=lambda value: value[0])
-                target = candidate[-1]
-                scoped = dict(scoped, targets=[target])
-                scoped[TICKET] = {'day': now.date().isoformat(), 'runId': run_id, 'target': target}
+                # Batch every due target of the winning account into this pass
+                # instead of re-waiting for the next 20-minute tick per target.
+                account_ref = candidate[2]
+                chosen = sorted(
+                    (c for c in choices if c[0][2] == account_ref),
+                    key=lambda value: (value[0][0], value[0][1]),
+                )
+                targets = [c[0][-1] for c in chosen]
+                scoped = dict(scoped, targets=targets)
+                scoped[TICKET] = {'day': now.date().isoformat(), 'runId': run_id,
+                                  'target': targets[0], 'targets': targets}
                 t._ACTIVE_RUN_ID = run_id
-                t.logger.info('Recovery selected one target account=%s target=%s tier=%s',
-                              scoped.get('username'), target, candidate[0])
+                t.logger.info('Recovery selected %d target(s) account=%s targets=%s',
+                              len(targets), scoped.get('username'), targets)
                 attempted = True
-                await t.run_browser_tasks(dict(group_config, multiTask=False, taskCount=1),
-                                          [scoped], run_id=run_id)
+                await t.run_browser_tasks(
+                    dict(group_config, multiTask=False, taskCount=len(targets)),
+                    [scoped], run_id=run_id)
                 status = 'completed'
     except t.TaskRunAlreadyInProgress:
         return 'skipped_task_in_progress'

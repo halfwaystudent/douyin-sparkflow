@@ -167,6 +167,38 @@ def _find(account, target, now):
         return "bad", key, row, context, ident, generation
     if not stable and canonical not in old_refs:
         return "bad", key, row, context, ident, generation
+    if row["state"] == "claimed":
+        # A claimed row survives a crash in storage while its in-flight lease
+        # expires on reconcile.  A dead claim can never be claimed again, yet
+        # no path releases it: keep the row claimed only while the owning run
+        # is live (matching in-flight runId with an unexpired lease) or the
+        # run durably recorded this target's outcome under the same runId
+        # (sent_unverified/confirmed/failed: the recorded outcome itself
+        # decides whether Enter may still be dispatched).  Anything else is
+        # a fossil claim that would starve the day's retry — release it back
+        # to waiting.
+        live_state = streak_state.target_state(account, target, now)
+        if isinstance(live_state, dict):
+            state_run = str(live_state.get("runId") or "")
+            owned = bool(state_run) and state_run == str(row.get("runId") or "")
+            lease = streak_state._parse_time(
+                live_state.get("leaseExpiresAt"), now.tzinfo)
+            live_owner = (owned
+                          and live_state.get("status") == streak_state.STATE_IN_FLIGHT
+                          and lease is not None and lease > now)
+            outcome_owner = owned and live_state.get("status") in {
+                streak_state.STATE_SENT_UNVERIFIED,
+                streak_state.STATE_SEND_CONFIRMED,
+                streak_state.STATE_STREAK_VERIFIED,
+                streak_state.STATE_FAILED_RETRYABLE,
+                streak_state.STATE_FAILED_TERMINAL,
+            }
+        else:
+            live_owner = outcome_owner = False
+        if not live_owner and not outcome_owner:
+            row["state"] = "waiting"
+            row.pop("claimedAt", None)
+            row.pop("runId", None)
     # Preserve every observed stable alias after a verified overlap.  This is
     # what lets a later secUid upgrade find a peerUid-keyed queue row.
     row["identityRefs"] = list(dict.fromkeys(old_refs + refs))

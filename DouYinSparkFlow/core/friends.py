@@ -163,7 +163,12 @@ NON_LOGIN_DIALOG_CLOSE_SELECTORS = (
 )
 FRIEND_LIST_EMPTY_ROUNDS = 6
 FRIEND_LIST_EMPTY_WAIT_SECONDS = 1.5
-FRIEND_LIST_READY_TIMEOUT_SECONDS = 60
+FRIEND_LIST_READY_TIMEOUT_SECONDS = 150
+# A page that proves the session is dead renders an error shell and never
+# mounts #sub-app, so waiting out the whole readiness timeout only delays the
+# verdict and burns the patrol budget. Probe the login prompt this often while
+# waiting, not on every 0.5s tick (the probe reads the page body).
+LOGIN_PROBE_INTERVAL_SECONDS = 5
 # A virtualized list can stop producing rows long before it is exhausted, so
 # these bounds only end the read; they never prove the list was fully read.
 FRIEND_LIST_IDLE_ROUNDS = 5
@@ -173,6 +178,8 @@ FRIEND_LIST_STUCK_ROUNDS = 2
 SAAS_UI_DETECT_TIMEOUT_MS = 20000
 SCROLL_STEP_PX = 800
 SCROLL_SETTLE_SECONDS = 1.5
+SAAS_FRIEND_QUIET_SECONDS = 8
+SAAS_FRIEND_SCAN_BUDGET_SECONDS = 120
 # How long to wait for in-flight user_detail response bodies after the read.
 UID_DRAIN_TIMEOUT_SECONDS = 5
 
@@ -357,6 +364,16 @@ async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY
             logger.debug("Friend list ready via selector %s", selector)
             return selector, locator
 
+        # The SaaS conversation list renders data-e2e rows instead of the
+        # legacy list-item markup; its presence is equally valid readiness.
+        saas_locator = page.locator(SAAS_FRIEND_ROW_SELECTOR).filter(visible=True)
+        if await saas_locator.count() > 0:
+            try:
+                if await saas_locator.first.is_visible(timeout=500):
+                    return SAAS_FRIEND_ROW_SELECTOR, saas_locator
+            except Exception:
+                pass
+
         summary = await _friend_list_dom_summary(page)
         if int(summary.get("nameSpanCount") or 0) > 0:
             selector, locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
@@ -387,14 +404,29 @@ async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY
 async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOUT_SECONDS):
     if not timeout_seconds:
         timeout_seconds = FRIEND_LIST_READY_TIMEOUT_SECONDS
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-    while asyncio.get_running_loop().time() < deadline:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    next_login_probe = loop.time() + LOGIN_PROBE_INTERVAL_SECONDS
+    while loop.time() < deadline:
         await _ensure_logged_in(page)
         try:
             if await page.locator("#sub-app").count() > 0:
                 return
         except Exception:
             pass
+        if loop.time() >= next_login_probe:
+            next_login_probe = loop.time() + LOGIN_PROBE_INTERVAL_SECONDS
+            # Fail fast when the page itself says the session is unusable: the
+            # error shell ("页面暂时无法打开 … 请重新登录") renders no chat UI, so
+            # only this probe can tell a dead login from a slow render.
+            from core.tasks import _page_has_login_required_prompt
+
+            required, detail = await _page_has_login_required_prompt(page)
+            if required:
+                raise FriendRefreshError(
+                    f"私信页显示登录已失效：{detail}",
+                    category=CATEGORY_LOGIN_REQUIRED,
+                )
         await asyncio.sleep(0.5)
     raise FriendRefreshError(
         "chat page did not load within timeout",
@@ -581,117 +613,98 @@ async def _collect_saas_friend_names(page, on_progress=None):
 
     found_names = []
     seen_names = set()
-    idle_rounds = 0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SAAS_FRIEND_SCAN_BUDGET_SECONDS
+    quiet_since = None
+    unresolved_since = None
+    previous_snapshot = None
     stuck_rounds = 0
-    # Passes that produced no new friend AND could not scroll further. A
-    # viewport that fits its content is not proof of completeness — the SaaS
-    # virtual list lazy-renders pages — so completion needs two stable reads.
-    settled_passes = 0
-    unproven_rows = False
+    started_list = False
 
-    while True:
-        rows = await _first_visible_saas_rows(page)
-        if rows is None:
-            if found_names:
-                return FriendScanResult(found_names, reason="读取过程中好友行消失")
-            raise RuntimeError("好友列表已加载但未找到可读取的好友行")
+    while loop.time() < deadline:
+        _, container = await first_scrollable_element(page, SAAS_FRIEND_SCROLL_SELECTORS)
+        if container and not started_list:
+            started_list = True
+            if await container.evaluate("(el) => el.scrollTop > 0"):
+                await container.evaluate("(el) => { el.scrollTop = 0; }")
+                await asyncio.sleep(SCROLL_SETTLE_SECONDS)
+        # ElementHandle selectors are scoped to the scroll container already;
+        # the page-level #sub-app ancestor is outside that search root.
+        rows = await container.query_selector_all(':scope [data-e2e="conversation-item"]') if container else []
+        visible_rows = [row for row in rows if await row.is_visible()]
+        if not visible_rows:
+            empty = page.locator(".LeftPanelEmptywrapper").filter(visible=True)
+            if not seen_names and await empty.count():
+                if quiet_since is not None and previous_snapshot == "empty" and loop.time() - quiet_since >= SAAS_FRIEND_QUIET_SECONDS:
+                    if await im_ui.saas_filter_is_active(page, "friend"):
+                        return FriendScanResult(complete=True)
+                    break
+                if previous_snapshot != "empty":
+                    quiet_since = loop.time()
+                previous_snapshot = "empty"
+                await asyncio.sleep(SCROLL_SETTLE_SECONDS)
+                continue
+            return FriendScanResult(found_names, reason="未找到可读取的好友列表")
 
-        new_names_count = 0
-        for element in rows:
+        row_snapshot = []
+        unresolved = False
+        for element in visible_rows:
             name, conversation_type = await _read_saas_friend_row(element)
-            if conversation_type != 1:
-                # Type 2+ rows are groups/broadcasts — never friends. An
-                # unreadable type means the row might be a friend we cannot
-                # prove, so the scan can no longer claim completeness.
-                if conversation_type is None:
-                    unproven_rows = True
-                continue
-            if not name or name in seen_names:
-                continue
-            seen_names.add(name)
-            found_names.append(name)
-            new_names_count += 1
-
+            row_snapshot.append((conversation_type, name))
+            if conversation_type is None or (conversation_type == 1 and not name):
+                unresolved = True
+            if conversation_type == 1 and name and name not in seen_names:
+                seen_names.add(name)
+                found_names.append(name)
         if on_progress is not None:
             on_progress(len(found_names))
 
-        scrollable_selector, scrollable_element = await first_scrollable_element(
-            page, SAAS_FRIEND_SCROLL_SELECTORS
-        )
-        if not scrollable_element:
-            if found_names:
-                return FriendScanResult(found_names, complete=False,
-                                        reason="未找到好友列表滚动容器")
-            raise RuntimeError("未找到好友列表滚动容器")
-
-        metrics = await page.evaluate(
-            """(element) => ({
-                clientHeight: element.clientHeight,
-                scrollHeight: element.scrollHeight,
-            })""",
-            scrollable_element,
-        )
-        fits_viewport = (
-            int(metrics.get("scrollHeight") or 0)
-            <= int(metrics.get("clientHeight") or 0)
-        )
-        if fits_viewport:
-            if new_names_count == 0 and settled_passes >= 1:
-                return FriendScanResult(
-                    found_names,
-                    complete=not unproven_rows,
-                    reason="" if not unproven_rows else "新版列表存在无法确认类型的会话行",
-                )
-            settled_passes += 1 if new_names_count == 0 else 0
+        # Re-read the same slice before scrolling past a row whose type or
+        # title is still hydrating. Never silently omit it from a finished scan.
+        if unresolved:
+            quiet_since = None
+            unresolved_since = unresolved_since if unresolved_since is not None else loop.time()
+            if loop.time() - unresolved_since >= SAAS_FRIEND_QUIET_SECONDS:
+                return FriendScanResult(found_names, reason="新版列表存在尚未读到类型或昵称的会话行")
             await asyncio.sleep(SCROLL_SETTLE_SECONDS)
             continue
-        settled_passes = 0
+        unresolved_since = None
 
-        before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
-        await page.evaluate(
-            "(element) => element.scrollTop += %d" % SCROLL_STEP_PX,
-            scrollable_element,
+        metrics = await page.evaluate(
+            """(el) => ({top: el.scrollTop, viewport: el.clientHeight, height: el.scrollHeight})""",
+            container,
         )
-        await asyncio.sleep(SCROLL_SETTLE_SECONDS)
-        after_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
-        logger.debug(
-            "SaaS friend list refresh scroll selector=%s before=%s after=%s names=%s",
-            scrollable_selector, before_top, after_top, len(found_names),
-        )
-
-        should_stop, idle_rounds, stuck_rounds = update_collection_progress(
-            new_names_count=new_names_count,
-            no_more_visible=False,
-            scroll_moved=after_top > before_top,
-            idle_rounds=idle_rounds,
-            stuck_rounds=stuck_rounds,
-            idle_limit=FRIEND_LIST_IDLE_ROUNDS,
-            stuck_limit=FRIEND_LIST_STUCK_ROUNDS,
-        )
-        if should_stop:
-            reason = (
-                "列表滚动没有继续推进"
-                if stuck_rounds >= FRIEND_LIST_STUCK_ROUNDS
-                else "连续多轮没有读到新的好友"
-            )
-            return FriendScanResult(found_names, reason=reason)
-
-
-async def _first_visible_saas_rows(page, limit=5):
-    """Return visible SaaS row elements, or None when the list is empty."""
-    locator = page.locator(SAAS_FRIEND_ROW_SELECTOR).filter(visible=True)
-    count = await locator.count()
-    rows = []
-    for index in range(min(count, limit * 4)):
-        item = locator.nth(index)
-        try:
-            if await item.is_visible(timeout=500):
-                rows.append(item)
-        except Exception:
+        top, viewport, height = (metrics[k] for k in ("top", "viewport", "height"))
+        if viewport <= 0:
+            return FriendScanResult(found_names, reason="好友列表滚动容器已隐藏")
+        if top + viewport >= height - 1:
+            # The current page may grow after hitting its bottom. Require both
+            # row contents and geometry to settle for an elapsed quiet period.
+            # This is coverage of the loaded conversation list, not proof of
+            # every friend on the platform.
+            snapshot = (top, viewport, height, row_snapshot)
+            if quiet_since is None or snapshot != previous_snapshot:
+                quiet_since = loop.time()
+                previous_snapshot = snapshot
+            elif loop.time() - quiet_since >= SAAS_FRIEND_QUIET_SECONDS:
+                if await im_ui.saas_filter_is_active(page, "friend"):
+                    return FriendScanResult(found_names, complete=True)
+                break
+            stuck_rounds = 0
+        else:
+            quiet_since = None
+            # A fixed 800px jump can skip rows of a short virtualized viewport.
+            delta = max(1, min(SCROLL_STEP_PX, int(viewport * 0.75)))
+            await container.evaluate("(el, delta) => { el.scrollTop += delta; }", delta)
+            await asyncio.sleep(SCROLL_SETTLE_SECONDS)
+            new_top = await container.evaluate("(el) => el.scrollTop")
+            stuck_rounds = stuck_rounds + 1 if new_top <= top else 0
+            if stuck_rounds >= FRIEND_LIST_STUCK_ROUNDS:
+                return FriendScanResult(found_names, reason="列表未到末尾但滚动没有继续推进")
             continue
-        if len(rows) >= limit * 4:
-            break
-    return rows or None
+        await asyncio.sleep(SCROLL_SETTLE_SECONDS)
+
+    return FriendScanResult(found_names, reason="好友列表在读取时限内未稳定，或好友筛选状态已变化")
 
 
 async def _read_saas_friend_name(element):
@@ -707,8 +720,8 @@ async def _read_saas_friend_name(element):
 async def _wait_for_saas_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY_TIMEOUT_SECONDS):
     started_at = asyncio.get_running_loop().time()
     while asyncio.get_running_loop().time() - started_at < timeout_seconds:
-        rows = await _first_visible_saas_rows(page)
-        if rows:
+        rows = page.locator(SAAS_FRIEND_ROW_SELECTOR).filter(visible=True)
+        if await rows.count():
             return
         # Empty-state markers verified in the bundle: LeftPanelEmptywrapper
         # renders 暂无会话 / 暂无相关陌生人消息.
@@ -723,6 +736,68 @@ async def _wait_for_saas_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY_T
         "saas friend list did not become ready within timeout",
         category=CATEGORY_STRUCTURE_CHANGED,
     )
+
+
+def _is_creator_page(url, *, chat=False):
+    try:
+        parts = urlsplit(url)
+        return (
+            parts.scheme == "https" and parts.hostname == "creator.douyin.com"
+            and parts.port in {None, 443} and not parts.username and not parts.password
+            and (not chat or parts.path.rstrip("/") == urlsplit(CHAT_PAGE_URL).path)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+async def _verify_import_on_chat(page, context):
+    """Read the chat list and identify the isolated browser without opening conversations."""
+    from core.groups import refresh_request_allowed
+    from core.identity import USER_TOKEN_URL, creator_identity_cookies
+
+    async def guard(route):
+        request = route.request
+        if refresh_request_allowed(request.method, request.url) or im_ui.saas_request_allowed(request.method, request.url):
+            await route.continue_()
+        else:
+            await route.abort()
+
+    # A new context blocks workers; the fallback neither opens a conversation
+    # nor lets the page start a new outbound socket or messaging request.
+    await page.route('**/*', guard)
+    await page.route_web_socket('**/*', im_ui.deny_refresh_socket)
+
+    async def read_list():
+        await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=25_000)
+        if not _is_creator_page(page.url, chat=True):
+            raise FriendRefreshError("私信页未停留在创作者中心，未保存本次登录。")
+        await _wait_for_chat_or_login(page, timeout_seconds=20)
+        if await im_ui.wait_for_saas_ui(page, timeout_ms=12_000, legacy_probe=lambda: _legacy_friend_ui_present(page)):
+            if not await im_ui.activate_saas_filter(page, "friend", timeout_ms=12_000):
+                raise FriendRefreshError("未确认新版私信页的会话筛选状态。")
+            await _wait_for_saas_rows_or_empty(page, timeout_seconds=20)
+            if not await im_ui.saas_filter_is_active(page, "friend"):
+                raise FriendRefreshError("新版私信页的会话筛选状态已变化。")
+        else:
+            await _click_friends_tab(page)
+            await _wait_for_friend_rows_or_empty(page, timeout_seconds=20)
+        await _ensure_logged_in(page)
+        if not _is_creator_page(page.url, chat=True):
+            raise FriendRefreshError("私信页发生跳转，未保存本次登录。")
+
+    try:
+        await asyncio.wait_for(read_list(), timeout=45)
+    except asyncio.TimeoutError as exc:
+        raise FriendRefreshError("首页卡片未加载，备用私信页也未在时限内就绪。") from exc
+    browser_cookies = creator_identity_cookies(await context.cookies([USER_TOKEN_URL]))
+    try:
+        trusted = await asyncio.to_thread(fetch_trusted_identity, browser_cookies)
+    except IdentityUnavailable as exc:
+        raise FriendRefreshError(str(exc), category=CATEGORY_IDENTITY_UNVERIFIED) from exc
+    await _ensure_logged_in(page)
+    if not _is_creator_page(page.url, chat=True):
+        raise FriendRefreshError("私信页发生跳转，未保存本次登录。")
+    return {"browser_trusted_uid": trusted["uid"]}
 
 
 async def _fetch_account_friends_once(
@@ -855,6 +930,9 @@ async def _fetch_account_friends_once(
                     if classify_refresh_error(exc) == CATEGORY_LOGIN_REQUIRED:
                         # A visible login form is a real answer, not a slow page.
                         raise _with_category(exc, CATEGORY_LOGIN_REQUIRED) from exc
+                    if fresh_login and str(exc) == CARD_NOT_READY_MESSAGE and _is_creator_page(page.url):
+                        logger.info("Creator card unavailable during Cookie import; checking chat readiness and browser UID")
+                        return await _verify_import_on_chat(page, context)
                     if str(exc) == CARD_NOT_READY_MESSAGE and account_uid(account):
                         # A missing home-page card is not an identity proof.
                         # Existing bound accounts can instead prove the browser
