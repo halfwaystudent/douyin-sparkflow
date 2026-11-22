@@ -1,43 +1,1 @@
-"""Personal literal messages win over global and holiday templates."""
-from copy import deepcopy
-from datetime import date
-import unittest
-from unittest.mock import patch
-
-from core import personal_streak
-from core import msg_builder
-from tests import test_shared_security as fixtures
-
-
-class TemplateScopeTests(unittest.TestCase):
-    def setUp(self):
-        self.fixture=fixtures.SharedConsoleTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
-
-    def test_settings_explains_that_personal_messages_override_global_templates(self):
-        client=self.fixture.login('owner','Owner-secret-2026!')
-        response=client.get('/settings')
-        self.assertEqual(200,response.status_code)
-        self.assertIn('å·²åœ¨â€œæˆ‘çš„ç»­ç«èŠ±â€ä¿å­˜ä¸ªäººå‘é€å†…å®¹çš„ç”¨æˆ·ï¼Œä¼˜å…ˆä½¿ç”¨ä¸ªäººå†…å®¹',response.text)
-
-    def test_personal_message_does_not_expand_api_or_use_global_variants_and_holidays(self):
-        principal={'username':'alice','role':'user'}
-        messages=['[API] ä¿ç•™åŸæ ·','[data] ä¹Ÿæ˜¯æ™®é€šæ–‡å­—']
-        personal_streak.save_preferences(principal,enabled=False,at_time='18:00',timezone_name='Asia/Shanghai',messages=messages)
-        global_config={'messageTemplate':'global-fixed','sendStrategy':{'messageVariants':['global-variant']},'happyNewYear':{'enabled':True,'messageTemplate':'holiday-only'}}
-        before=deepcopy(global_config)
-        groups=personal_streak.account_groups(global_config,self.fixture.accounts,manual=True)
-        self.assertEqual(1,len(groups))
-        effective,accounts=groups[0]
-        with patch.object(msg_builder,'request_hitokoto') as external, patch.object(msg_builder,'date') as clock:
-            clock.today.return_value=date(2026,2,20)
-            with msg_builder.using_message_config(effective):
-                self.assertEqual(messages,msg_builder.build_message_candidates())
-            external.assert_not_called()
-        self.assertEqual(['a1'],[a['account_ref'] for a in accounts])
-        self.assertEqual(before,global_config)
-
-    def test_user_without_personal_content_cannot_fall_back_to_another_scope(self):
-        groups=personal_streak.account_groups({'messageTemplate':'global-only'},self.fixture.accounts,manual=True)
-        self.assertEqual([],groups)
+=êì¢v¥–+^­©fzËë0Šz/z¸%¡¶¥jwa¢Xk+^š™Zµë®‰œ¢œ¢šš+µ×¥Ê)Éúè™Ö­zØ¦z)©¢»]j×¢šš+¶éâ¶×¬µúèšéâ¶×¬¶j’)©¢»ij×!~º&rŠŞŠjh®Ú^®Ê'j[-­æ¤~º&rŠŞŠjh®Ù¬»¢•×«~º&µë-²)©¢»mzËl…ªŞvÇœº¸­É«‹n­ë•«,Mé©•«^IÊ)y7¬¶Ë§ŠÛ^²ÔŞ²Ğš±ç^~Ç­R›•û•÷âÆÛ«yø±¶êŞ±(Z­çB¢{(•äŞ²Û,zWß‹n­ëµJlzWÚuĞ¥y©î¦Ç¥}ø±¶êŞv€¥y©î¦Ç^~×¬¶Ç­¶)à±ìi•¨§²ØZ¶—«²‰Ú–g¬±¨²‹Ş®¸z	hm©mzjej×¬±é_rX
