@@ -70,6 +70,29 @@ def _target_unconfirmed_today(account, target_name):
     )
 
 
+def manual_retry_evidence(account, target_name, run_id):
+    """Read this attempt's send evidence, never a prior same-day success."""
+    state = streak_state.target_state(account, target_name)
+    if not run_id or state.get("runId") != run_id:
+        return "unknown", ""
+    status = state.get("status")
+    if status == streak_state.STATE_SEND_CONFIRMED:
+        # The browser stores receipt-only evidence as a confirmed state to
+        # suppress duplicate sends, but it is not a strong page confirmation.
+        history = streak_state.history_entry(account, target_name)
+        if state.get("strategy") == "browser" and (
+            history.get("status") == "sent_receipt_only"
+            or history.get("confirmationLevel") == "receipt_only"
+        ):
+            return "receipt_only", ""
+        return "confirmed", ""
+    if status == streak_state.STATE_SENT_UNVERIFIED:
+        return "unconfirmed", ""
+    if status in streak_state.FAILED_STATES:
+        return "failed", str(state.get("lastErrorReason") or "")
+    return "unknown", ""
+
+
 def mark_target_unconfirmed(
     account,
     target_name,

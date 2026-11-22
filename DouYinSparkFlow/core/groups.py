@@ -44,7 +44,12 @@ async def _activate_group_tab(page, timeout_ms=20000):
 
     Returns the previously selected tab name so the caller can restore it.
     """
-    old = (await page.locator('[role=tab][aria-selected=true]').first.inner_text()).strip()
+    try:
+        old = (await page.locator('[role=tab][aria-selected=true]').first.inner_text(timeout=timeout_ms)).strip()
+    except Exception as exc:
+        # The new SaaS page has no role tabs at all; callers must not wait the
+        # locator's default 30s before falling back to the 群聊 filter.
+        raise RuntimeError('群消息标签未激活') from exc
     tab = page.get_by_role('tab', name='群消息', exact=True)
     try:
         await tab.wait_for(state='visible', timeout=timeout_ms)
@@ -160,6 +165,56 @@ async def collect_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=
                 raise RuntimeError('未读到群列表')
             return result
 
+async def _legacy_group_ui_present(page):
+    """True once the legacy 群消息 tab or legacy group rows are really there."""
+    try:
+        if await page.get_by_role('tab', name='群消息', exact=True).count() > 0:
+            return True
+        for row in await page.locator(GROUP_ROW_SELECTOR).all():
+            if await row.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _wait_for_visible_rows(page, selector, *, timeout_seconds=20):
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        if any([await row.is_visible() for row in await page.locator(selector).all()]):
+            return
+        await asyncio.sleep(.1)
+    raise RuntimeError('未读到群列表')
+
+
+async def collect_groups_on_chat_page(page, *, timeout_ms=20000):
+    """Read the group list on an already-open creator chat page.
+
+    Routes to the SaaS 群聊 filter on the new IM page and keeps the legacy
+    群消息 tab path for the old one, so a caller never has to guess the page
+    generation. Only switches the list filter and scrolls it; never opens a
+    conversation, so nothing is marked read or sent.
+    """
+    if await im_ui.wait_for_saas_ui(
+        page, timeout_ms=timeout_ms, legacy_probe=lambda: _legacy_group_ui_present(page)
+    ):
+        activated = await im_ui.activate_saas_filter(page, 'group')
+        if not activated:
+            raise RuntimeError('新版 IM 群聊筛选状态无法确认')
+        await _wait_for_visible_rows(page, im_ui.SAAS_ROW_SELECTOR)
+        return await collect_saas_group_rows(page)
+    previous = await _activate_group_tab(page)
+    try:
+        await _wait_for_visible_rows(page, GROUP_ROW_SELECTOR)
+        return await collect_group_rows(page)
+    finally:
+        if previous:
+            try:
+                await page.get_by_role('tab', name=previous, exact=True).click()
+            except Exception:
+                pass
+
+
 async def fetch_account_groups(account):
     """Open the account profile, select 群消息, scan only DOM facts, and restore tab."""
     cookies = list(account.get('cookies') or [])
@@ -199,51 +254,9 @@ async def fetch_account_groups(account):
         await context.route_web_socket('**/*', im_ui.deny_refresh_socket)
         page = await context.new_page(); await page.goto(CHAT_PAGE_URL, wait_until='commit', timeout=60000); await _wait_for_chat_or_login(page)
 
-        async def _legacy_group_ui_present():
-            try:
-                if await page.get_by_role('tab', name='群消息', exact=True).count() > 0:
-                    return True
-                for row in await page.locator(GROUP_ROW_SELECTOR).all():
-                    if await row.is_visible():
-                        return True
-            except Exception:
-                pass
-            return False
-
-        if await im_ui.wait_for_saas_ui(
-            page, timeout_ms=20000, legacy_probe=_legacy_group_ui_present
-        ):
-            # SaaS page: no role tabs; route through the verified 群聊 filter.
-            activated = await im_ui.activate_saas_filter(page, 'group')
-            if not activated:
-                raise RuntimeError('新版 IM 群聊筛选状态无法确认')
-            deadline = asyncio.get_running_loop().time() + 20
-            while asyncio.get_running_loop().time() < deadline:
-                rows = page.locator(im_ui.SAAS_ROW_SELECTOR)
-                if any([await row.is_visible() for row in await rows.all()]):
-                    break
-                await asyncio.sleep(.1)
-            else:
-                raise RuntimeError('未读到群列表')
-            rows = await collect_saas_group_rows(page)
-            # Reading group rows is not an account-identity proof.
-            return rows
-        old = await _activate_group_tab(page)
-        deadline = asyncio.get_running_loop().time() + 20
-        while asyncio.get_running_loop().time() < deadline:
-            rows = page.locator(GROUP_ROW_SELECTOR)
-            if any([await row.is_visible() for row in await rows.all()]):
-                break
-            await asyncio.sleep(.1)
-        else:
-            raise RuntimeError('未读到群列表')
-        rows = await collect_group_rows(page)
-        if old:
-            try: await page.get_by_role('tab', name=old, exact=True).click()
-            except Exception: pass
         # Reading group rows is not an account-identity proof. Do not publish
         # this profile's cookies into the account store from a list-only job.
-        return rows
+        return await collect_groups_on_chat_page(page)
     finally:
         try:
             cancelled = False

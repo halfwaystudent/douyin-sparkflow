@@ -42,37 +42,44 @@
         <span class="account-name">
           <strong data-account-saved-name>{{ account.username }}</strong>
           <small><span data-account-target-count>{{ account.targets|length }}</span> 个发送目标 · {{ account.friends_cache|default([], true)|length }} 个缓存好友</small>
-          {% set ident_ids = identity_view(account) %}
-          <small class="identity-ids">{% if ident_ids.platform_uid %}平台 UID {{ ident_ids.platform_uid }}{% else %}历史 ID {{ account.unique_id }}（类型未知）{% endif %}{% if ident_ids.display_id %} · 页面显示 ID {{ ident_ids.display_id }}{% endif %}</small>
         </span>
       </span>
       <span class="summary-metrics">
         <span class="pill warning" data-account-draft hidden>未保存</span>
-        {% if duplicate_count > 1 %}
-        <span class="pill warning" title="同名账号通常来自重复保存登录态，建议确认后合并或删除多余的记录">同名 {{ duplicate_count }} 个</span>
-        {% endif %}
         {% set check = (account.login_verification or {}).get("state", "") %}
-        {% if check == "verifying" %}<span class="pill" title="保存后正在后台验证登录态并刷新好友列表">登录态验证中</span>
-        {% elif check == "unverified" %}<span class="pill warning" title="{{ (account.login_verification or {}).get('reason', '') }}；定时发送不受影响">登录态未能验证</span>
-        {% elif check == "login_required" %}<span class="pill danger">需重新登录</span>{% endif %}
         {% set ident = identity_view(account) %}
-        <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
         {% set patrol = patrol_view(account) %}
-        {% if patrol.has %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">{% if patrol.conclusion == 'ok' %}巡查正常{% else %}巡查：{{ patrol.conclusionLabel }}{% endif %}</span>{% endif %}
-        <span class="pill {% if enabled %}success{% else %}warning{% endif %}" data-account-enabled>{% if enabled %}已启用{% else %}已停用{% endif %}</span>
+        {# Actionable findings roll into one aggregate pill: duplicates, failed
+           login verification, unverified identity and patrol issues all count,
+           keeping the summary row to at most two badges plus the draft marker. #}
+        {% set issue_bits = [] %}
+        {% if duplicate_count > 1 %}{% set issue_bits = issue_bits + ['同名账号 ' ~ duplicate_count ~ ' 个'] %}{% endif %}
+        {% if check == "unverified" %}{% set issue_bits = issue_bits + ['登录态未能验证'] %}
+        {% elif check == "login_required" %}{% set issue_bits = issue_bits + ['需重新登录'] %}{% endif %}
+        {% if ident.identity_state in ['unverified', 'conflict'] %}{% set issue_bits = issue_bits + [ident.identity_label] %}{% endif %}
+        {% if patrol.has and patrol.conclusion != 'ok' %}{% set issue_bits = issue_bits + ['巡查' ~ patrol.conclusionLabel] %}{% endif %}
+        {% if check == "verifying" %}<span class="pill" title="保存后正在后台验证登录态并刷新好友列表">登录态验证中</span>{% endif %}
+        {% if issue_bits %}
+        <span class="pill {% if ident.identity_state == 'conflict' or check == 'login_required' %}danger{% else %}warning{% endif %}" title="需要处理：{{ issue_bits|join(' · ') }}">需处理 {{ issue_bits|length }} 项</span>
+        {% endif %}
+        <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
+        <span class="pill {% if enabled %}success{% else %}warning{% endif %}" data-account-enabled {% if enabled %}hidden{% endif %}>{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>
     </summary>
     <div class="fold-body">
+      {% set ident_ids = identity_view(account) %}
+      <p class="fold-meta">{% if ident_ids.platform_uid %}平台 UID {{ ident_ids.platform_uid }}{% else %}历史 ID {{ account.unique_id }}（类型未知）{% endif %}{% if ident_ids.display_id %} · 页面显示 ID {{ ident_ids.display_id }}{% endif %}{% if patrol.has %} · 上次巡查 {{ patrol.checkedDisplay or patrol.checkedAt }}（{{ patrol.conclusionLabel }}，{{ patrol.trigger }}）{% endif %}</p>
       {% if account.unique_id not in legacy_anchors.ids and account.unique_id not in visible_record_refs %}
       <span id="account-{{ account.unique_id|urlencode }}" aria-hidden="true"></span>
       {% set legacy_anchors.ids = legacy_anchors.ids + [account.unique_id] %}
       {% endif %}
-      <form method="post" action="/accounts/{{ account.unique_id }}/update" class="form-stack" data-editor-form data-editor-kind="account" data-review-url="/accounts?_anchor=account-{{ account.account_ref|urlencode }}">
+      <form method="post" action="/accounts/{{ account.unique_id }}/update" class="form-stack account-editor" data-editor-form data-editor-kind="account" data-review-url="/accounts?_anchor=account-{{ account.account_ref|urlencode }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
         <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
         <input type="hidden" name="edit_revision" value="{{ account_edit_revision(account) }}">
+        <div class="account-section-heading"><strong>账号设置</strong><span>显示名称与自动发送</span></div>
         <div class="form-grid">
           <label class="field">
             <span>显示名</span>
@@ -108,7 +115,7 @@
           <script type="application/json" id="friends-cache-{{ account.account_ref }}">[]</script>
           <script type="application/json" id="selected-targets-{{ account.account_ref }}">{{ account.targets|default([], true)|tojson }}</script>
         </div>
-        <label class="field">
+        <label class="field account-manual-targets">
           <span>手动补充好友</span>
           <textarea class="targets-textarea" name="targets" rows="3" placeholder="每行一个好友昵称；也可在上面的列表中勾选">{% for target in account.targets|default([], true) %}{% if not target.startswith(('群聊：', '群聊:')) %}{{ target }}
 {% endif %}{% endfor %}</textarea>
@@ -138,7 +145,7 @@
             <textarea class="group-targets-textarea" name="group_targets" rows="3" placeholder="每行一个群名称，例如：同名会话">{% for target in account.targets|default([], true) %}{% if target.startswith(('群聊：', '群聊:')) and target not in (account.group_target_bindings|default({}, true)) %}{{ target.removeprefix('群聊：').removeprefix('群聊:') }}
 {% endif %}{% endfor %}</textarea>
           </label>
-          <p class="group-target-editor-note">保存时会统一为“群聊：群名称”。同名好友与群聊可以同时保留；刷新好友列表不会修改这里的群聊目标。消息发送不代表群火花已成功，仍以发送明细中的结果为准。</p>
+          <p class="group-target-editor-note">好友与群聊分别保存；群火花状态请以发送明细为准。</p>
         </section>
         <div class="form-actions editor-actions" data-editor-actions>
           <button class="button button-primary" type="submit" data-editor-save><i data-lucide="check"></i><span data-editor-save-label>保存这个账号</span></button>

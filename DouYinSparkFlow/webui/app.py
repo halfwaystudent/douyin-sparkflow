@@ -228,6 +228,7 @@ from webui.app_helpers import (
     find_account,
     is_account_enabled,
     manual_retry_config,
+    manual_retry_evidence,
     mark_target_unconfirmed,
 )  # noqa: F401
 
@@ -894,18 +895,24 @@ def save_exported_login_result(
     )
     if not cookies:
         raise RuntimeError("Exported login result is incomplete")
+    # A private-message fallback proves ownership, not the profile nickname.
+    # For pasted credentials preserve the existing label if no name was read
+    # or supplied. New rows may use an explicitly labelled local placeholder.
+    preserve_name = login_result.get("cookie_source") == "pasted" and not username
     if not username:
-        username = display_id or uid
+        username = f"抖音账号（UID {uid}）" if preserve_name else display_id or uid
     # The whole candidate this save belongs to: the UID plus every parameter
     # that would change what gets written (nickname, displayed ID and the full
     # cookie list). A one-time confirmation is bound to this digest, so a
     # different candidate cannot reuse an older confirmation. Server-side only.
+    profile_name = login_result.get("cookie_source") == "pasted" and login_result.get("nickname_from_profile") is True
     candidate = account_identity.candidate_fingerprint(
         uid=uid,
         username=str(login_result.get("username") or ""),
         display_id=display_id,
         display_name=str(display_name or ""),
         cookies=cookies,
+        profile_name=profile_name,
     )
     # Every saved login gets a new generation; a background check started for an
     # older generation must not touch this one (issue #41 A7).
@@ -1035,7 +1042,18 @@ def save_exported_login_result(
     def update_row(target, accounts, method, confirmed_by=""):
         authorize_save(target, accounts)
         capture_login_before_write(target)
-        target["username"] = username
+        current_name = str(target.get("username") or "").strip()
+        if profile_name:
+            # Correct a previous UID placeholder without clobbering an alias
+            # the operator chose. An explicit name always wins.
+            if str(display_name or "").strip() or current_name in {
+                "", uid, f"抖音账号（UID {uid}）", display_id,
+                str(target.get(account_identity.FIELD_DISPLAY_ID) or "").strip(),
+                str(target.get("unique_id") or "").strip(),
+            }:
+                target["username"] = username
+        elif not preserve_name or not current_name:
+            target["username"] = username
         target["cookies"] = cookies
         if display_id:
             target[account_identity.FIELD_DISPLAY_ID] = display_id
@@ -1167,20 +1185,33 @@ async def verify_login_result(login_result, *, relogin_account_ref="", relogin_u
         "_fresh_login_verification": True,
     }
 
+    used_chat_fallback = False
+
     async def verify_candidate():
+        nonlocal used_chat_fallback
         result = await verify_account_session(account, auth_only=True)
         resolved = dict(result.get("identity") or {})
         identity["display_id"] = account_identity.display_id_from_text(
             resolved.get("display_id") or resolved.get("unique_id") or ""
         )
         identity["username"] = str(resolved.get("username") or identity["username"]).strip()
-        trusted = await asyncio.to_thread(account_identity.fetch_trusted_identity, cookies)
+        browser_uid = resolved.get("browser_trusted_uid")
+        used_chat_fallback = browser_uid is not None
+        identity_cookies = cookies
+        if browser_uid is not None:
+            identity_cookies = account_identity.creator_identity_cookies(cookies)
+        trusted = await asyncio.to_thread(account_identity.fetch_trusted_identity, identity_cookies)
+        if browser_uid is not None and browser_uid != trusted["uid"]:
+            raise FriendRefreshError(
+                "私信页验证的账号与本次导入凭证的账号不一致，未保存本次登录。",
+                category=account_identity.CATEGORY_IDENTITY_CONFLICT,
+            )
         identity["trusted"] = trusted
         identity["unique_id"] = trusted["uid"]
         return True, "", identity, ""
 
     try:
-        return await asyncio.wait_for(verify_candidate(), timeout=COOKIE_LOGIN_VERIFICATION_TIMEOUT_SECONDS)
+        verified_result = await asyncio.wait_for(verify_candidate(), timeout=COOKIE_LOGIN_VERIFICATION_TIMEOUT_SECONDS)
     except FriendRefreshError as exc:
         return False, str(exc), identity, exc.category or CATEGORY_STRUCTURE_CHANGED
     except account_identity.IdentityUnavailable as exc:
@@ -1194,6 +1225,21 @@ async def verify_login_result(login_result, *, relogin_account_ref="", relogin_u
     except Exception as exc:  # noqa: BLE001 - an unreadable page is not a logout
         logger.warning("Login verification failed unexpectedly: %s", type(exc).__name__)
         return False, "暂时无法完成登录验证，未保存本次登录，请稍后重试", identity, "verification_error"
+
+    if used_chat_fallback and not identity["username"]:
+        # A nickname is optional: slow or unavailable profile data must not
+        # invalidate an already verified session or block saving it.
+        try:
+            nickname = await asyncio.wait_for(asyncio.to_thread(
+                account_identity.fetch_creator_nickname, cookies, identity["unique_id"],
+            ), timeout=8)
+        except Exception as exc:
+            logger.debug("Cookie import nickname lookup unavailable: %s", type(exc).__name__)
+        else:
+            if nickname:
+                identity["username"] = nickname
+                identity["nickname_from_profile"] = True
+    return verified_result
 
 
 def public_app_settings():
@@ -2611,6 +2657,25 @@ def create_app():
             + ("，并已重建发送索引" if index_updated else ""),
         )
 
+        # A complete friend refresh already proves the saved session is usable;
+        # a stale login_verification marker from an older check would only
+        # contradict that on the account card.
+        def clear_verification(accounts):
+            target = account_by_ref(accounts, account_ref)
+            if not target:
+                return None, False
+            check = dict(target.get("login_verification") or {})
+            if not check:
+                return None, False
+            if check.get("token") != (account.get("login_verification") or {}).get("token"):
+                return None, False
+            target.pop("login_verification", None)
+            return dict(target), True
+
+        await asyncio.to_thread(
+            update_user_data, clear_verification, force_reload=True
+        )
+
     def _launch_friend_refresh_task(runner, normalized_id, account, username, *, account_ref, job):
         """Install cancellation ownership before the coroutine can first run."""
         snapshot = account_identity.login_snapshot(account)
@@ -3658,28 +3723,18 @@ def create_app():
                 )
 
         updated_account = streak_state.find_matching_account(get_userData(force_reload=True), account_copy) or {}
-        if _target_sent_today(updated_account, target_name):
-            flash(request, f"已重试 {account.get('username', 'Account')} / {target_name}，并获得强证据确认。", "success")
-        elif _target_unconfirmed_today(updated_account, target_name):
-            failure_entry = dict(updated_account.get("failure_queue") or {}).get(target_name) or {}
-            reason = str(failure_entry.get("reason") or "Retry ran but did not get strong confirmation.")
-            flash(request, f"已执行 {account.get('username', 'Account')} / {target_name}，但未强确认，已进入待核验/待补发：{reason}", "warning")
+        outcome, reason = manual_retry_evidence(updated_account, target_name, run_id)
+        label = f"{account.get('username', 'Account')} / {target_name}"
+        if outcome == "confirmed":
+            flash(request, f"已重试 {label}，并获得本次发送的强证据确认。", "success")
+        elif outcome == "receipt_only":
+            flash(request, f"{label} 本次已收到服务端回执，但页面尚未确认，请先核对聊天记录。", "warning")
+        elif outcome == "unconfirmed":
+            flash(request, f"{label} 本次发送结果待核验，请先核对聊天记录。", "warning")
+        elif outcome == "failed":
+            flash(request, f"{label} 本次重试失败：{reason or '请查看发送明细。'}", "error")
         else:
-            account_failure = dict(updated_account.get("account_failure") or {})
-            affected_targets = list(account_failure.get("affectedTargets") or [])
-            failure_entry = dict(updated_account.get("failure_queue") or {}).get(target_name) or {}
-            if any(
-                streak_state.target_keys_match(
-                    updated_account,
-                    target_name,
-                    affected_target,
-                )
-                for affected_target in affected_targets
-            ):
-                reason = str(account_failure.get("reason") or "Account-level browser failure.")
-            else:
-                reason = str(failure_entry.get("reason") or "Retry did not confirm a successful send.")
-            flash(request, f"Retry did not succeed for {account.get('username', 'Account')} / {target_name}: {reason}", "error")
+            flash(request, f"{label} 本次没有可归属的发送结果；旧记录仅供参考，请查看发送明细。", "warning")
         return redirect("/ops/send-console")
 
     @app.post("/accounts/{unique_id}/mark-target-unconfirmed")
@@ -4861,11 +4916,17 @@ def create_app():
             cookies = parse_cookie_input(raw_cookies)
             require_auth_cookies(cookies)
         except CookieParseError as exc:
+            category = exc.category
             return JSONResponse(
                 {
                     "ok": False,
                     "error": str(exc),
-                    "category": getattr(exc, "category", "cookie_format_invalid"),
+                    "category": category,
+                    "categoryLabel": {
+                        "cookie_format_invalid": "导出格式有误",
+                        "cookie_auth_missing": "缺少登录 Cookie",
+                        "cookie_auth_expired": "登录 Cookie 已过期",
+                    }.get(category, "Cookie 输入有误"),
                     "retryable": False,
                 },
                 status_code=400,
@@ -4979,6 +5040,7 @@ def create_app():
             "display_id": display_id,
             "cookies": cookies,
             "cookie_source": "pasted",
+            "nickname_from_profile": identity.get("nickname_from_profile") is True,
         }
 
         def persist_cookie_login():

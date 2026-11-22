@@ -307,8 +307,6 @@ class _StubContext:
         self.added = []
         self._auth_cookies = auth_cookies
         self.closed = False
-        self.route = AsyncMock()
-        self.route_web_socket = AsyncMock()
 
     async def add_cookies(self, cookies):
         self.added.extend(cookies)

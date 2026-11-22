@@ -54,7 +54,6 @@ class _Context:
         self.add_cookies = AsyncMock()
         self.close = AsyncMock()
         self.route = AsyncMock()
-        self.route_web_socket = AsyncMock()
         self.cookies = AsyncMock(return_value=[COOKIE])
 
     def set_default_navigation_timeout(self, value):
@@ -230,11 +229,8 @@ class RefreshCookieEntrypointTests(unittest.TestCase):
             gate = asyncio.Event()
             page = _Page()
             rows = Mock(all=AsyncMock(return_value=[Mock(is_visible=AsyncMock(return_value=True))]))
-            absent_viewport = Mock(count=AsyncMock(return_value=0))
-            page.locator = Mock(side_effect=lambda selector: (
-                absent_viewport if selector == '[class*="im-saas-viewport"]' else rows
-            ))
-            page.get_by_role = Mock(return_value=Mock(count=AsyncMock(return_value=1), click=AsyncMock()))
+            page.locator = Mock(return_value=rows)
+            page.get_by_role = Mock(return_value=Mock(click=AsyncMock()))
             context = _Context(page)
             driver = _Driver()
             session = SimpleNamespace(account=dict(ACCOUNT))

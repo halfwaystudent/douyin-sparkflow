@@ -892,10 +892,10 @@
         if (status) {
           const payload = error.payload || {};
           const label = payload.categoryLabel ? `（${payload.categoryLabel}）` : "";
-          const retryHint =
-            payload.retryable === false
-              ? "这类失败重试通常无效，请重新获取 Cookie。"
-              : "可稍后重试。";
+          const inputError = ["cookie_format_invalid", "cookie_auth_missing", "cookie_auth_expired"].includes(payload.category);
+          const retryHint = inputError ? "" : payload.retryable === false
+            ? "请在已登录的抖音页面重新导出。"
+            : "可稍后重试。";
           status.textContent = payload.identityState
             ? `Cookie 登录未保存：${identityFailureText(error)}`
             : `Cookie 登录失败${label}：${error.message}${retryHint}`;
