@@ -247,6 +247,10 @@ dialog .button-danger, .button-danger.solid { background: var(--bad); color: #ff
 .status-banner.warning svg { color: var(--warn); }
 .status-banner.info svg { color: var(--info); }
 .status-banner.success:not(.refresh-notice) { display: none; }
+/* One status row: banner + inline refresh chip. The row appears only when the
+   task just finished (JS adds .visible) so idle pages keep a single banner. */
+.status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+.status-row > .status-banner { flex: 1; margin-bottom: 0; }
 .refresh-notice { display: none; background: var(--info-soft); border-color: transparent; }
 .refresh-notice.visible { display: flex; }
 .callout { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 25%, transparent); }
@@ -476,6 +480,46 @@ fieldset > legend { padding: 0 6px; }
 .group-target-editor-note { margin: 0; }
 .group-targets-textarea { min-height: 82px; }
 
+/* Accounts: retain the outer card and use dividers instead of nested boxes. */
+body[data-page="accounts"] .fold-body { gap: 22px; padding: 22px 24px 24px; }
+body[data-page="accounts"] .fold-body > .form-stack { gap: 20px; }
+body[data-page="accounts"] .friend-picker,
+body[data-page="accounts"] .group-target-editor {
+  border: 0; border-top: 1px solid var(--line); border-radius: 0;
+  padding: 20px 0 0; background: transparent; gap: 12px;
+}
+body[data-page="accounts"] .friend-picker-toolbar strong,
+body[data-page="accounts"] .group-target-editor-heading strong,
+body[data-page="accounts"] .patrol-panel strong { font-size: 15px; }
+body[data-page="accounts"] .friend-picker-status,
+body[data-page="accounts"] .group-target-editor-heading p,
+body[data-page="accounts"] .group-target-editor-note { line-height: 1.6; }
+body[data-page="accounts"] .notice-inline:not(.warning):not(.error):not(.danger) {
+  padding: 2px 0; background: transparent; border-radius: 0;
+}
+body[data-page="accounts"] .account-section-heading { display: grid; gap: 3px; }
+body[data-page="accounts"] .account-section-heading strong { font-size: 15px; }
+body[data-page="accounts"] .account-section-heading span { color: var(--ink-3); font-size: 13px; }
+body[data-page="accounts"] .account-editor { gap: 18px; }
+body[data-page="accounts"] .friend-picker,
+body[data-page="accounts"] .group-target-editor { padding-top: 24px; }
+body[data-page="accounts"] .friend-search-input { background: var(--surface-sunk); }
+body[data-page="accounts"] .friend-option { border-radius: 10px; }
+body[data-page="accounts"] .account-manual-targets { margin-top: 0; }
+body[data-page="accounts"] .summary-metrics .pill.success { background: transparent; padding-inline: 2px; }
+body[data-page="accounts"] .editor-actions { padding: 20px 0 0; }
+body[data-page="accounts"] .patrol-panel { padding-top: 20px !important; }
+@media (max-width: 640px) {
+  body[data-page="accounts"] .fold-body { padding: 18px 16px; gap: 18px; }
+  body[data-page="accounts"] .friend-picker,
+  body[data-page="accounts"] .group-target-editor { padding-top: 20px; }
+  body[data-page="accounts"] .fold > summary { align-items: flex-start; padding: 16px; }
+  body[data-page="accounts"] .fold > summary .summary-metrics { padding-left: 0; gap: 4px 10px; }
+  body[data-page="accounts"] .friend-picker-toolbar,
+  body[data-page="accounts"] .group-target-editor-heading { align-items: center; }
+  body[data-page="accounts"] .editor-actions .button-primary { flex: 1 1 100%; justify-content: center; }
+}
+
 /* ---------- login workspace ---------- */
 .login-layout { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 18px; align-items: start; }
 .login-layout:not(:has(.desktop-frame-wrap)) { grid-template-columns: minmax(0, 560px); }
@@ -508,11 +552,29 @@ fieldset > legend { padding: 0 6px; }
 .step-list li::before { counter-increment: step; content: counter(step); flex: none; width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 12px; font-weight: 700; background: var(--spark-soft); color: var(--flame-deep); }
 
 /* ---------- settings ---------- */
-.settings-layout { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 28px; align-items: start; }
-.settings-nav { position: sticky; top: 24px; display: grid; gap: 2px; }
-.settings-nav a { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 10px; color: var(--ink-2); text-decoration: none; font-size: 14px; font-weight: 500; }
+.settings-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 28px; align-items: start; }
+.settings-panels { min-width: 0; }
+.settings-nav { position: sticky; top: 24px; display: grid; gap: 18px; }
+.settings-nav-group h2 { margin: 0 12px 6px; color: var(--ink-2); font-size: 12px; font-weight: 700; }
+.settings-nav a { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 8px 12px; border-radius: 10px; color: var(--ink-2); text-decoration: none; font-size: 14px; font-weight: 500; }
+.settings-nav a > svg { width: 17px; height: 17px; flex: none; }
+.settings-nav-copy { min-width: 0; }
+.settings-nav-copy small, .settings-nav .settings-nav-chevron { display: none; }
 .settings-nav a:hover { background: var(--surface); color: var(--ink); }
-.settings-nav a.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }
+.settings-nav a.active { background: var(--spark-soft); color: var(--flame-deep); font-weight: 700; }
+.settings-back { display: inline-flex; align-items: center; gap: 4px; min-height: 44px; padding: 0 8px; margin: -8px 0 8px; color: var(--flame-deep); font-weight: 600; text-decoration: none; border-radius: 8px; }
+.settings-back > span { font-size: 22px; line-height: 1; }
+.settings-back:hover { text-decoration: underline; text-underline-offset: 3px; }
+#messages { max-width: 760px; }
+#messages > .card-head { margin-bottom: 6px; }
+.settings-message-rules { margin-bottom: 20px; color: var(--ink-2); font-size: 13px; }
+.settings-message-rules summary { width: fit-content; padding: 8px 0; cursor: pointer; color: var(--flame-deep); }
+.settings-message-rules p + p { margin-top: 6px; }
+.settings-message-form { gap: 18px; }
+.settings-message-group { display: grid; gap: 12px; padding-top: 16px; border-top: 1px solid var(--line); }
+.settings-message-group h3 { font-size: 15px; }
+.settings-message-group .field > span small { margin-inline-start: 4px; font-weight: 500; }
+.settings-intervals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .settings-section { scroll-margin-top: 16px; }
 .settings-section + .settings-section { margin-top: 18px; }
 .settings-layout[data-settings-tabs] .settings-section { margin-top: 0; }
@@ -602,9 +664,15 @@ fieldset > legend { padding: 0 6px; }
   .target-record { grid-template-columns: minmax(0, 1fr) auto; }
   .target-record .target-reason, .target-record .target-message { grid-column: 1 / -1; order: 3; }
   .login-layout { grid-template-columns: 1fr; }
-  .settings-layout { grid-template-columns: 1fr; }
-  .settings-nav { position: static; display: flex; overflow-x: auto; gap: 4px; padding-bottom: 2px; scrollbar-width: none; }
-  .settings-nav a { white-space: nowrap; }
+  .settings-layout { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .settings-nav { position: static; gap: 18px; }
+  .settings-nav-group h2 { margin: 0 0 4px; }
+  .settings-nav a { min-height: 55px; padding: 6px 2px; gap: 12px; border-radius: 0; }
+  .settings-nav a + a { border-top: 1px solid var(--line); }
+  .settings-nav a > svg:first-child { color: var(--flame-deep); }
+  .settings-nav-copy { flex: 1; display: grid; gap: 1px; color: var(--ink); font-weight: 650; }
+  .settings-nav-copy small { display: block; color: var(--ink-2); font-weight: 400; font-size: 12px; overflow-wrap: anywhere; }
+  .settings-nav .settings-nav-chevron { display: block; color: var(--ink-3); width: 16px; height: 16px; }
   .segment-button { min-height: 40px; }
 }
 
@@ -657,9 +725,8 @@ fieldset > legend { padding: 0 6px; }
   .fold-body { padding: 16px; }
   .section-head { margin-top: 30px; }
   .settings-section { scroll-margin-top: 12px; }
-  .settings-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: visible; gap: 6px; }
-  .settings-nav a { min-height: 44px; padding: 8px 6px; gap: 6px; justify-content: center; font-size: 13px; }
-  .settings-nav svg { width: 16px; height: 16px; flex-shrink: 0; }
+  body[data-page="settings"] .page-head > .actions:empty { display: none; }
+  .settings-message-form > .form-actions > .button { width: 100%; }
   .desktop-frame-wrap { min-height: 280px; min-width: 0; }
   .desktop-frame { height: 64vh; height: 64dvh; }
   .tabbar {
@@ -720,3 +787,13 @@ fieldset > legend { padding: 0 6px; }
 .interaction-viewport img { display: block; width: 100%; height: auto; touch-action: none; user-select: none; }
 .interaction-viewport img[hidden] { display: none; }
 .login-interaction.interaction-expanded { position: fixed; inset: 8px; z-index: 120; overflow: auto; box-shadow: 0 0 0 100vmax #0009; }
+
+/* ---------- restrained-density additions ---------- */
+/* Aggregate warning badge on account rows: everything actionable rolls into
+   "需处理 N 项" so a summary shows at most two pills beside the draft marker. */
+.fold-meta { color: var(--ink-3); font-size: 12px; margin: -8px 0 0; }
+/* Collapsed glossary: explanations exist on demand, not on screen. */
+.explainer { font-size: 13px; color: var(--ink-2); }
+.explainer > summary { width: fit-content; cursor: pointer; color: var(--ink-3); padding: 4px 0; }
+.explainer > summary:hover { color: var(--flame-deep); }
+.explainer > p { padding: 6px 0 0; }

@@ -15,7 +15,9 @@ Cookie values are credentials: callers must never log or echo them.
 from __future__ import annotations
 
 import json
+import math
 import re
+import time
 
 from core.streak_state import AUTH_COOKIE_NAMES
 
@@ -56,12 +58,15 @@ def normalize_cookie(entry):
     if not name:
         raise CookieParseError("cookie entry is missing its name")
     if "value" not in entry:
-        raise CookieParseError(f"cookie {name!r} is missing its value")
+        raise CookieParseError("Cookie 条目缺少 value 字段。")
     value = str(entry.get("value") or "")
 
     domain = str(entry.get("domain") or "").strip()
+    host_only = entry.get("hostOnly")
     if not domain:
         domain = DEFAULT_COOKIE_DOMAIN
+    if host_only is True:
+        domain = domain.lstrip(".")
     elif not domain.startswith(".") and "." in domain:
         domain = f".{domain}"
 
@@ -87,7 +92,7 @@ def normalize_cookie(entry):
         expires = float(expiry) if expiry is not None else -1
     except (TypeError, ValueError):
         expires = -1
-    cookie["expires"] = expires if expires > 0 else -1
+    cookie["expires"] = expires if math.isfinite(expires) and expires >= 0 else -1
 
     for flag in ("httpOnly", "secure"):
         if flag in entry:
@@ -106,7 +111,7 @@ def normalize_cookie(entry):
         }.get(same_site.strip().casefold())
         if normalized_same_site is None:
             raise CookieParseError(
-                f"cookie {name!r} has an unsupported sameSite value",
+                "Cookie 条目的 sameSite 格式不受支持，请重新导出 JSON。",
                 category="cookie_format_invalid",
             )
         cookie["sameSite"] = normalized_same_site
@@ -170,6 +175,10 @@ def parse_cookie_input(raw):
     entries = None
     if text[0] in "[{":
         entries = _parse_json_cookies(text)
+        if entries is None:
+            raise CookieParseError("JSON 格式有误，请重新导出并粘贴完整的 Cookie-Editor JSON。")
+    elif text.startswith("# Netscape HTTP Cookie File") or any(line.count("\t") >= 6 for line in text.splitlines()):
+        raise CookieParseError("请在 Cookie-Editor 中选择 JSON 或 Header 导出；这里不接收 Netscape 文本。")
     if entries is None:
         if "=" not in text:
             raise CookieParseError(
@@ -178,20 +187,17 @@ def parse_cookie_input(raw):
             )
         entries = _parse_header_cookies(text)
 
-    cookies = []
-    seen = set()
+    by_key = {}
+    now = time.time()
     for entry in entries:
         cookie = normalize_cookie(entry)
         key = (cookie["name"], cookie["domain"], cookie["path"])
-        if key in seen:
-            continue
-        seen.add(key)
-        cookies.append(cookie)
-    if not cookies:
+        previous = by_key.get(key)
+        if previous is None or (_expired(previous, now) and not _expired(cookie, now)):
+            by_key[key] = cookie
+    if not by_key:
         raise CookieParseError("cookie input does not contain any usable cookie")
-    if len(cookies) > _MAX_COOKIES:
-        cookies = cookies[:_MAX_COOKIES]
-    return cookies
+    return list(by_key.values())[:_MAX_COOKIES]
 
 
 def auth_cookie_names(cookies):
@@ -206,13 +212,28 @@ def auth_cookie_names(cookies):
     return names
 
 
+def _expired(cookie, now):
+    try:
+        value = float(cookie.get("expires", -1))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 0 <= value <= now
+
+
 def require_auth_cookies(cookies):
-    """Raise when the pasted cookies carry no known authentication cookie."""
-    names = auth_cookie_names(cookies)
+    """Require at least one present, non-empty, non-expired authentication cookie."""
+    auth = [item for item in cookies or [] if isinstance(item, dict)
+            and str(item.get("name") or "").strip() in AUTH_COOKIE_NAMES and item.get("value")]
+    now = time.time()
+    names = auth_cookie_names(item for item in auth if not _expired(item, now))
     if not names:
+        if auth:
+            raise CookieParseError(
+                "导出的抖音登录 Cookie 已过期，请在已登录的页面重新导出。",
+                category="cookie_auth_expired",
+            )
         raise CookieParseError(
-            "cookie input has no Douyin authentication cookie "
-            f"(expected one of: {', '.join(sorted(AUTH_COOKIE_NAMES))})",
+            "导出内容缺少有效的抖音登录 Cookie，请确认扩展在已登录的抖音页面导出。",
             category="cookie_auth_missing",
         )
     return names
